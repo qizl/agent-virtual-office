@@ -250,7 +250,10 @@ if (ONCE) {
 let alive = true
 while (alive) {
   alive = await publish(beat)
+  // The calm tail beat dwells 5x so the walk back to the meeting room is visible
+  // before the next storyline loop starts.
+  const dwell = beat % BEATS.length === 0 ? EVERY * 5 : EVERY
   beat += 1
-  if (alive) await new Promise((r) => setTimeout(r, EVERY))
+  if (alive) await new Promise((r) => setTimeout(r, dwell))
 }
 process.exit(0)
