@@ -218,6 +218,41 @@ The hook supports capturing raw hook events for fixture generation and schema va
 
 The capture path is fully `try/catch`'d — enabling or disabling it has zero effect on normal hook behavior.
 
+## MAW mode — visualize a Multi-Agent-Workflow collaboration
+
+`?mode=maw` turns the office into a live view of a running
+[Multi-Agent-Workflow](../../Qizl/aiengineeringkit) collaboration: `manager /
+decision-maker / executor / reviewer` members take the stage from the SAME
+`.runtime` task files the MAW Dashboard reads — no extra setup, no writes to
+the target project.
+
+```bash
+# 1. start the office (either entry)
+npm run dev                                   # http://localhost:5173
+# or: node server.mjs --port=5174
+
+# 2. open the MAW view (separate from the default channels)
+open "http://localhost:5173/?mode=maw"
+
+# 3. start the bridge — explicit start only, read-only, loopback-only
+python3.12 scripts/maw-office.py --serve --project-root /path/to/your-maw-project
+```
+
+- The bridge polls the target's `.agents/plugins/ai-engineering-kit/skills/
+  multi-agent-workflow/.runtime/` (task ordering as the Dashboard: newest
+  manifest first; `--task-id` pins one) and pushes full-team snapshots to
+  `/api/maw/status` — an isolated in-memory channel; the classic
+  `/api/status` pipeline is untouched.
+- Every member keeps its own status, round and review verdict; terminal
+  outcomes (completed / cancelled / completed-with-findings) always win over
+  in-flight states, and cancelled work never renders as running.
+- Useful flags: `--task-id`, `--office-url` (loopback only), `--poll-seconds`,
+  `--refresh-seconds`, `--idle-timeout-minutes` (auto-stop with no office
+  consumer, default 30, `0` disables), `--once`. Auth uses the `OFFICE_API_TOKEN`
+  environment variable only — never a CLI flag.
+- No snapshot for 120s? The office shows the stale/empty state — the bridge
+  proves freshness; SSE being alive alone proves nothing.
+
 ## Embedding & language
 
 ```
