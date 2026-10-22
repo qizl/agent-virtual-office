@@ -9,6 +9,7 @@ import {
   wanderPoint,
   planChoreography,
   MANAGER_GATE,
+  clampToMemberZone,
 } from '../src/systems/mawChoreography.js'
 
 // Zone rules (owner, 2026-10-22): the manager may enter every area; other
@@ -56,10 +57,11 @@ describe('maw choreography planning', () => {
     expect(violatesMemberZone(MANAGER_GATE)).toBe(true)
   })
 
-  it('wander points stay inside the two bottom rooms', () => {
-    for (let i = 0; i < 30; i++) {
+  it('wander points stay inside the rest areas (meeting room, lounge, research)', () => {
+    for (let i = 0; i < 40; i++) {
       const p = wanderPoint(() => (i % 7) / 7)
-      expect(inRect(p, LOUNGE) || inRect(p, RESEARCH)).toBe(true)
+      const inRest = inRect(p, MEETING) || inRect(p, LOUNGE) || inRect(p, RESEARCH)
+      expect(inRest).toBe(true)
       expect(violatesMemberZone(p)).toBe(false)
     }
   })
@@ -110,6 +112,15 @@ describe('maw choreography planning', () => {
       // manager's rest is also the meeting room per the owner rule (all roles rest there)
       expect(meeting || gate).toBe(true)
     }
+  })
+
+  it('clampToMemberZone folds entrance points back into the main office band', () => {
+    for (const bad of [{ x: 120, y: 110 }, { x: 300, y: 50 }, { x: 540, y: 60 }]) {
+      const fixed = clampToMemberZone(bad)
+      expect(violatesMemberZone(fixed)).toBe(false)
+      expect(fixed.y).toBeGreaterThanOrEqual(175)
+    }
+    expect(clampToMemberZone({ x: 340, y: 364 })).toEqual({ x: 340, y: 364 })
   })
 
   it('manager gate seat is the documented position', () => {

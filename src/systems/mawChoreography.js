@@ -23,12 +23,15 @@ import { MEETING_CHAIRS, HOME_POSITIONS, OVERFLOW_POSITIONS, ZONE_FLOOR_RECTS, c
 export const MANAGER_GATE = { x: 100, y: 80 }
 const HANDOVER_DWELL_MS = 3000
 const STAGGER_MS = 1500
-const WANDER_INTERVAL_MS = 60_000
+const WANDER_INTERVAL_MS = 15_000
+const LONG_WORK_MS = 90_000 // a member on the same work stretch this long may take a break
 const ARRIVAL_POLL_MS = 400
 const ARRIVE_TIMEOUT_MS = 20_000
 
-// Members' walkable rects for idle wander: the two bottom rooms only.
-const WANDER_RECTS = [ZONE_FLOOR_RECTS.lounge, ZONE_FLOOR_RECTS.research].filter(Boolean)
+// Rest areas (owner, 2026-10-22): the meeting room, research and the bottom
+// lounge are ALL rest areas — members may enter and leave them freely. Wander
+// points sample across the whole rest area.
+const WANDER_RECTS = [ZONE_FLOOR_RECTS.meetingRoom, ZONE_FLOOR_RECTS.lounge, ZONE_FLOOR_RECTS.research].filter(Boolean)
 
 export const MAW_ROLE_WORK_BEHAVIOR = { manager: 'gantt-chart', 'decision-maker': 'whiteboard', executor: 'typing', reviewer: 'magnifier' }
 
@@ -73,6 +76,20 @@ export function workSeatFor(role, perRoleCount) {
 /** True when a walk target would break a member's zone rules. */
 export function violatesMemberZone(point) {
   return inRect(point, ENTRANCE_RECT)
+}
+
+/**
+ * Clamp any point into member-allowed space. avoidOverlap/clampToFloor may snap
+ * pushed candidates into the entrance floor rect (it is a floor zone too) — the
+ * member rules forbid that, so a violating point is folded back into the main
+ * office band.
+ */
+export function clampToMemberZone(point) {
+  if (!violatesMemberZone(point)) return { x: point.x, y: point.y }
+  return {
+    x: Math.min(585, Math.max(25, point.x)),
+    y: Math.min(388, Math.max(175, point.y)),
+  }
 }
 
 export function phaseOf(status) {
@@ -154,7 +171,9 @@ export function startMawChoreography(store) {
   const handoverQueue = []
   const pendingTimers = new Set()
   let managerBusy = false
-  let lastWanderAt = Date.now()
+  const workingSince = new Map() // memberId -> start of the current working stretch
+  const restingSince = new Map() // memberId -> start of the current resting stretch
+  let lastWanderAt = 0
 
   function later(fn, ms) {
     if (torn) return
@@ -168,11 +187,12 @@ export function startMawChoreography(store) {
   function walk(agentId, target, { behavior, expression = 'normal', bubble = null }) {
     const s = store.getState()
     if (!s.agents[agentId]) return
+    const safe = agentId.endsWith('~manager') ? { x: target.x, y: target.y } : clampToMemberZone(target)
     s.setAgentGroupEvent(agentId, {
       behavior,
       expression,
       bubble,
-      groupTarget: { x: target.x, y: target.y },
+      groupTarget: safe,
     })
   }
 
@@ -250,35 +270,31 @@ export function startMawChoreography(store) {
     }
   }
 
-  function maybeWander() {
-    if (torn) return
-    const s = store.getState()
-    if (s.mode !== 'maw') return
-    const candidates = Object.values(s.agents).filter((a) => a?.mawMember && a.maw?.role !== 'manager' && (a.status === 'working' || a.status === 'idle' || a.status === 'done'))
-    const pick = candidates[Math.floor(Math.random() * candidates.length)]
-    if (!pick) return
-    const point = wanderPoint()
-    if (!point) return
-    const returnSeat = { ...pick.position }
-    walk(pick.id, point, { behavior: 'idle', expression: 'normal', bubble: null })
-    arriveThen(pick.id, 6000 + Math.random() * 6000, () => {
-      const current = store.getState().agents[pick.id]
-      if (!current || current.status !== pick.status) return
-      const back = pick.status === 'working'
-        ? { behavior: MAW_ROLE_WORK_BEHAVIOR[current.maw?.role] || 'typing', expression: 'normal', bubble: null }
-        : { behavior: 'idle', expression: current.status === 'done' ? 'happy' : 'normal', bubble: null }
-      walk(pick.id, returnSeat, back)
-    })
-  }
-
   let wanderTimer = null
   if (typeof setInterval === 'function') {
     wanderTimer = setInterval(() => {
       if (Date.now() - lastWanderAt >= WANDER_INTERVAL_MS) {
+        const candidates = wanderCandidates()
+        if (candidates.length === 0) return
         lastWanderAt = Date.now()
-        maybeWander()
+        const pick = candidates[Math.floor(Math.random() * candidates.length)]
+        const point = wanderPoint()
+        if (!point) return
+        const home = pick.home
+        const working = pick.agent.status === 'working'
+        walk(pick.agent.id, point, { behavior: 'idle', expression: 'normal', bubble: null })
+        arriveThen(pick.agent.id, 8000 + Math.random() * 8000, () => {
+          const current = store.getState().agents[pick.agent.id]
+          if (!current || current.status !== pick.agent.status) return
+          const back = working
+            ? { behavior: MAW_ROLE_WORK_BEHAVIOR[current.maw?.role] || 'typing', expression: 'normal', bubble: null }
+            : { behavior: 'idle', expression: current.status === 'done' ? 'happy' : 'normal', bubble: null }
+          walk(pick.agent.id, home, back)
+          if (working) workingSince.set(pick.agent.id, Date.now())
+          else restingSince.set(pick.agent.id, Date.now())
+        })
       }
-    }, 15_000)
+    }, 5_000)
     if (typeof wanderTimer.unref === 'function') wanderTimer.unref()
   }
 
@@ -290,8 +306,16 @@ export function startMawChoreography(store) {
     const manager = members.find((a) => a.maw?.role === 'manager')
 
     // member transitions (manager handled by the handover queue only)
+    const now = Date.now()
     for (const member of members) {
       if (member.maw?.role === 'manager') continue
+      if (phaseOf(member.status) === 'task') {
+        if (!workingSince.has(member.id)) workingSince.set(member.id, now)
+        restingSince.delete(member.id)
+      } else {
+        if (!restingSince.has(member.id)) restingSince.set(member.id, now)
+        workingSince.delete(member.id)
+      }
       const phase = phaseOf(member.status)
       const previous = prevPhase[member.id]
       if (phase === previous) continue
