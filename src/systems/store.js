@@ -14,7 +14,7 @@ import { PET_TYPES, nextPetType } from './petState.js'
 import { pruneRecentPicks } from './behaviorEngine.js'  // AVO-180: prune on eviction
 import { isValidTheme, DEFAULT_THEME } from './theme.js'
 import { recordEpisode, isNewBlockedEpisode } from './recurringFailure.js'
-import { workSeatFor } from './mawChoreography.js' // shared MAW seat planner (store and choreography must agree)
+import { workSeatFor, clampToMemberZone } from './mawChoreography.js' // shared MAW seat planner (store and choreography must agree)
 import { AGENT_CARRY_FIELDS } from '../utils/statusFields.js'
 import {
   createDoorClaimState,
@@ -805,6 +805,12 @@ export const useOfficeStore = create((set) => ({
         // desk (nightly soak catch 2026-06-10: an event participant standing 23px from a
         // non-participant at dev's chair for the whole event — a full visual stack).
         gt = avoidOverlap(clampToFloor(groupTarget), claimed)
+        // MAW zone rules bind the FINAL published target: avoidOverlap clamps to the
+        // floor, not to member zones, so it can side-step a walk target into the
+        // entrance rect. The member band wins over non-overlap — fold it back after
+        // the push (the manager is exempt: gate duty lives inside the entrance).
+        const actor = s.agents[id]
+        if (actor.mawMember && actor.maw?.role !== 'manager') gt = clampToMemberZone(gt)
       } else {
         // React-in-place participant (spiller, caller, dog-reactor): the event FREEZES them
         // wherever they stand, so that spot has to survive the event's duration on two axes —
@@ -850,13 +856,15 @@ export const useOfficeStore = create((set) => ({
       }
     }),
 
-  clearAgentGroupEvent: (id) =>
+  // `patch` lets the walk owner restore the status presentation in the same
+  // unlock (mawChoreography); single-argument callers keep the plain unlock.
+  clearAgentGroupEvent: (id, patch) =>
     set((s) => {
       if (!s.agents[id]) return s
       return {
         agents: {
           ...s.agents,
-          [id]: { ...s.agents[id], inGroupEvent: false, groupTarget: null },
+          [id]: { ...s.agents[id], inGroupEvent: false, groupTarget: null, ...(patch || {}) },
         },
       }
     }),

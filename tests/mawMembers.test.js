@@ -86,6 +86,22 @@ describe('applyMawSnapshot', () => {
     expect(updated.status).toBe('awaiting-approval')
     expect(updated.behavior).toBe('await-approval')
 
+    // While the choreography owns the walk (inGroupEvent), a snapshot refresh must
+    // NOT reset the transit animation — the walk release restores it instead.
+    useOfficeStore.setState({ agents: { ...useOfficeStore.getState().agents, 'walk01~executor': { ...updated, inGroupEvent: true, behavior: 'idle', expression: 'normal', bubble: null } } })
+    useOfficeStore.getState().applyMawSnapshot(envelope(1, [member('walk01', 'executor', 'awaiting-approval', '已交付待评审')], { seq: 3 }))
+    const walking = useOfficeStore.getState().agents['walk01~executor']
+    expect(walking.inGroupEvent).toBe(true)
+    expect(walking.behavior).toBe('idle')
+    expect(walking.expression).toBe('normal')
+
+    // The unlock may restore the presentation in the same call (patch argument).
+    useOfficeStore.getState().clearAgentGroupEvent('walk01~executor', { behavior: 'await-approval', expression: 'normal', bubble: '已交付待评审' })
+    const released = useOfficeStore.getState().agents['walk01~executor']
+    expect(released.inGroupEvent).toBe(false)
+    expect(released.groupTarget).toBeNull()
+    expect(released.behavior).toBe('await-approval')
+
     useOfficeStore.getState().applyMawSnapshot(envelope(2, []))
     expect(Object.keys(useOfficeStore.getState().agents)).toEqual([])
   })

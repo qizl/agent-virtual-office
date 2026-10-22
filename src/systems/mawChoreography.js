@@ -515,15 +515,16 @@ export function startMawChoreography(store) {
     }
 
     // handover triggers: any member entering awaiting-approval (same-phase or not —
-    // the manager handover must fire even when the member never left the task phase)
+    // the manager handover must fire even when the member never left the task phase).
+    // Keyed by the plain agent id — pruneGoneMembers sweeps this map by id, so a
+    // decorated key would be pruned every tick and re-enqueue the handover forever.
     for (const member of members) {
       if (member.maw?.role === 'manager') continue
-      const key = `${member.id}:handover`
-      if (member.status === 'awaiting-approval' && prevHandover.get(key) !== true) {
-        prevHandover.set(key, true)
-        enqueueHandover(member.id, stableWorkSeat(member), member.label)
-      } else if (member.status !== 'awaiting-approval' && prevHandover.get(key) === true) {
-        prevHandover.set(key, false)
+      if (member.status === 'awaiting-approval' && prevHandover.get(member.id) !== true) {
+        prevHandover.set(member.id, true)
+        enqueueHandover(member.id, stableWorkSeat(member), member.bubble ?? member.label)
+      } else if (member.status !== 'awaiting-approval' && prevHandover.get(member.id) === true) {
+        prevHandover.set(member.id, false)
       }
     }
   })
