@@ -27,12 +27,23 @@ function member(id, role, status) {
 }
 
 describe('maw choreography planning', () => {
-  it('rest seats land inside the meeting room and are stable per member', () => {
+  it('rest seats land inside the rest areas, stay stable and seat everyone uniquely', () => {
+    const inRest = (p) => inRect(p, MEETING) || inRect(p, LOUNGE) || inRect(p, RESEARCH)
     for (const id of ['aaa001', 'bbb002', 'ccc003']) {
       const { seat } = restSeatFor(id)
-      expect(inRect(seat, MEETING)).toBe(true)
-      expect(restSeatFor(id).seat).toEqual(seat)
+      expect(inRest(seat)).toBe(true)
+      expect(violatesMemberZone(seat)).toBe(false)
+      expect(restSeatFor(id).seat).toEqual(seat) // stable per member
     }
+    // the pool seats a full 50-member snapshot without sharing a chair
+    const taken = new Set()
+    const seen = new Set()
+    for (let i = 0; i < 50; i++) {
+      const assigned = restSeatFor(`m${i}`, taken)
+      taken.add(assigned.index)
+      seen.add(`${assigned.seat.x},${assigned.seat.y}`)
+    }
+    expect(seen.size).toBe(50)
   })
 
   it('work seats land in the main office; extras use overflow seats', () => {
@@ -118,10 +129,10 @@ describe('maw choreography planning', () => {
     const restActions = planChoreography({ prevPhase, members: resting })
     expect(restActions).toHaveLength(3)
     for (const action of restActions) {
-      const meeting = inRect(action.target, MEETING)
-      const gate = action.target.x === MANAGER_GATE.x && action.target.y === MANAGER_GATE.y
-      // manager's rest is also the meeting room per the owner rule (all roles rest there)
-      expect(meeting || gate).toBe(true)
+      // all three rooms are rest areas per the owner rule; nobody rests at the gate
+      const inRest = inRect(action.target, MEETING) || inRect(action.target, LOUNGE) || inRect(action.target, RESEARCH)
+      expect(inRest).toBe(true)
+      expect(violatesMemberZone(action.target)).toBe(false)
     }
   })
 

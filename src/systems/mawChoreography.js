@@ -5,32 +5,41 @@
 // status transitions, so real bridge data and the mock producer animate the
 // same way. Movement reuses setAgentGroupEvent (clamp + avoidOverlap +
 // calculateJourney with door claims); while inGroupEvent the ambient scheduler
-// yields, so nothing fights the choreography.
+// yields, so nothing fights the choreography. EVERY choreography walk ends with
+// a lock release (clearAgentGroupEvent + status presentation) — a walk that
+// never releases would pin the transit animation onto the member forever.
 //
 // Position rules (owner, 2026-10-22):
 //   - default rest area = the meeting room above research; every member has a
-//     stable chair there;
+//     stable chair there; overflow rest seats extend into the lounge and
+//     research rooms (all three are rest areas per the owner);
 //   - manager working seat = the gate booth (100, 80);
-//   - other members' working seats = the main-office MAW desks (+ overflow);
-//   - handover: when a member reaches awaiting-approval the manager walks from
-//     the gate to that member, dwells ~3s, and returns to the gate;
+//   - other members' working seats = the main-office MAW desks (+ a 56-seat
+//     unique overflow pool);
+//   - handover: when a member reaches awaiting-approval the member returns to
+//     their STABLE work seat first, then the manager walks from the gate to
+//     that seat, dwells ~3s, and returns to the gate;
 //   - zones: the manager may enter every area; other members may enter the
 //     meeting room, the main office and BOTH bottom rooms (lounge, research) —
-//     the entrance area (gate room) is forbidden to everyone but the manager.
+//     the entrance area (gate room) is forbidden to everyone but the manager,
+//     and the store re-clamps final walk targets so avoidOverlap can never
+//     push a member back in.
 
-import { MEETING_CHAIRS, HOME_POSITIONS, OVERFLOW_POSITIONS, ZONE_FLOOR_RECTS, clampToFloor } from './movementSystem.js'
+import { MEETING_CHAIRS, HOME_POSITIONS, ZONE_FLOOR_RECTS, clampToFloor } from './movementSystem.js'
 
 export const MANAGER_GATE = { x: 100, y: 80 }
 const HANDOVER_DWELL_MS = 3000
 const STAGGER_MS = 1500
 const WANDER_INTERVAL_MS = 15_000
-const LONG_WORK_MS = 90_000 // a member on the same work stretch this long may take a break
+const LONG_WORK_MS = 90_000 // a member on the same work/rest stretch this long may take a walk
 const ARRIVAL_POLL_MS = 400
 const ARRIVE_TIMEOUT_MS = 20_000
 
 // Rest areas (owner, 2026-10-22): the meeting room, research and the bottom
 // lounge are ALL rest areas — members may enter and leave them freely. Wander
-// points sample across the whole rest area.
+// points sample across the whole rest area; rest SEATS fill the meeting room
+// first and overflow into the two bottom rooms (plan: overflow handling —
+// never re-deal an occupied chair).
 const WANDER_RECTS = [ZONE_FLOOR_RECTS.meetingRoom, ZONE_FLOOR_RECTS.lounge, ZONE_FLOOR_RECTS.research].filter(Boolean)
 
 export const MAW_ROLE_WORK_BEHAVIOR = { manager: 'gantt-chart', 'decision-maker': 'whiteboard', executor: 'typing', reviewer: 'magnifier' }
@@ -47,15 +56,34 @@ function inRect(point, rect) {
   return point.x >= rect.x1 && point.x <= rect.x2 && point.y >= rect.y1 && point.y <= rect.y2
 }
 
-/** Stable chair in the meeting room for one member id. */
+function seatKey(point) {
+  return `${point.x},${point.y}`
+}
+
+// Deterministic rest grids inside the two bottom rooms (both rest areas).
+// lounge floor: x 15..451 / y 424..545; research floor: x 469..785.
+const LOUNGE_REST_SEATS = []
+for (let col = 0; col < 8; col++) {
+  for (let row = 0; row < 4; row++) LOUNGE_REST_SEATS.push({ x: 40 + col * 55, y: 442 + row * 33 })
+}
+const RESEARCH_REST_SEATS = []
+for (let col = 0; col < 6; col++) {
+  for (let row = 0; row < 4; row++) RESEARCH_REST_SEATS.push({ x: 490 + col * 55, y: 442 + row * 33 })
+}
+// 8 meeting chairs + 32 lounge + 24 research = 64 unique rest seats — a full
+// 50-member snapshot can always rest without sharing a chair.
+export const REST_SEATS = [...MEETING_CHAIRS, ...LOUNGE_REST_SEATS, ...RESEARCH_REST_SEATS]
+
+/** Stable rest seat for one member id: meeting room first, bottom rooms on overflow. */
 export function restSeatFor(memberId, taken = new Set()) {
   const ordered = []
-  let index = hashIndex(memberId, MEETING_CHAIRS.length)
-  while (taken.has(index) && ordered.length < MEETING_CHAIRS.length) {
-    index = (index + 1) % MEETING_CHAIRS.length
+  let index = hashIndex(memberId, REST_SEATS.length)
+  while (taken.has(index) && ordered.length < REST_SEATS.length) {
+    index = (index + 1) % REST_SEATS.length
     ordered.push(index)
   }
-  return { index, seat: { ...MEETING_CHAIRS[index] } }
+  if (ordered.length >= REST_SEATS.length) index = hashIndex(memberId, REST_SEATS.length) // pool exhausted — unreachable for valid snapshots
+  return { index, seat: { ...REST_SEATS[index] } }
 }
 
 // Extra working seats for same-role members beyond the first — all inside the
@@ -130,22 +158,67 @@ export function wanderPoint(rng = Math.random) {
 }
 
 /**
- * Pure planner: given the previous phase map and the current member list,
- * return the ordered walk actions. Pure — the caller applies them via
- * setAgentGroupEvent with its own stagger/timers.
+ * Pure picker for the occasional leg-stretch walk. A member may wander when
+ * they have sat out their current stretch (LONG_WORK_MS): working/planning
+ * members earn a break from WORK, idle/done members may stretch after a long
+ * REST. Blocked / awaiting-approval members and the manager (handover duty)
+ * never wander; neither does anyone mid-walk.
  */
-export function planChoreography({ prevPhase, members, workSeatsTaken }) {
+export function wanderCandidates({ members, workingSince, restingSince, now = Date.now() }) {
+  const out = []
+  for (const agent of members) {
+    if (!agent || agent.maw?.role === 'manager') continue
+    if (agent.isMoving || agent.journeyTarget || agent.inGroupEvent) continue
+    const working = agent.status === 'working' || agent.status === 'planning'
+    const resting = agent.status === 'idle' || agent.status === 'done'
+    if (!working && !resting) continue
+    const since = working ? workingSince.get(agent.id) : restingSince.get(agent.id)
+    if (since === undefined || now - since < LONG_WORK_MS) continue
+    out.push(agent)
+  }
+  return out
+}
+
+/**
+ * Pure planner: given the previous phase map and the current member list,
+ * return the ordered walk actions. Seat maps are caller-owned and mutated in
+ * place (like prevPhase) so the SAME member keeps the SAME seat across calls.
+ * Pure — the caller applies them via setAgentGroupEvent with its own
+ * stagger/timers.
+ */
+export function planChoreography({ prevPhase, members, workSeatsByMember = new Map(), occupiedWorkSeats = new Set(), restSeatsByMember = new Map(), restSeatsTaken = new Set() }) {
   const actions = []
-  const counts = {}
   let staggerIndex = 0
+  const assignWork = (member) => {
+    const bound = workSeatsByMember.get(member.id)
+    if (bound) return bound
+    let seat = null
+    const base = HOME_POSITIONS[member.role]
+    if (base && !occupiedWorkSeats.has(seatKey(base))) seat = { ...base }
+    else {
+      for (const candidate of MAW_EXTRA_WORK_SEATS) {
+        if (!occupiedWorkSeats.has(seatKey(candidate))) { seat = { ...candidate }; break }
+      }
+    }
+    if (!seat) seat = { ...MAW_EXTRA_WORK_SEATS[0] } // unreachable for valid snapshots
+    occupiedWorkSeats.add(seatKey(seat))
+    workSeatsByMember.set(member.id, seat)
+    return seat
+  }
+  const assignRest = (member) => {
+    const bound = restSeatsByMember.get(member.id)
+    if (bound) return bound
+    const assigned = restSeatFor(member.id, restSeatsTaken)
+    restSeatsTaken.add(assigned.index)
+    restSeatsByMember.set(member.id, assigned)
+    return assigned
+  }
   for (const member of members) {
     const phase = phaseOf(member.status)
     const previous = prevPhase[member.id]
-    const roleCount = counts[member.role] || 0
-    counts[member.role] = roleCount + 1
     if (phase === previous) continue
     if (phase === 'task') {
-      const seat = workSeatFor(member.role, roleCount + (workSeatsTaken?.[member.role] || 0))
+      const seat = assignWork(member)
       // Delivering members (awaiting-approval) return IMMEDIATELY and wait at the
       // work seat for the manager's handover; planning/working enter staggered.
       const immediate = member.status === 'awaiting-approval'
@@ -158,7 +231,7 @@ export function planChoreography({ prevPhase, members, workSeatsTaken }) {
         kind: immediate ? 'deliver' : 'enter',
       })
     } else {
-      const { seat } = restSeatFor(member.id)
+      const { seat } = assignRest(member)
       actions.push({
         id: member.id,
         agentId: `${member.id}~${member.role}`,
@@ -181,9 +254,11 @@ export function planChoreography({ prevPhase, members, workSeatsTaken }) {
 export function startMawChoreography(store) {
   let torn = false
   const prevPhase = {}
-  const restSeatTaken = new Set()
-  const restSeatByMember = new Map()
-  const handoverQueue = []
+  const prevHandover = new Map()
+  const restSeatsByMember = new Map() // memberId -> { index, seat }
+  const restSeatsTaken = new Set()
+  const workSeatsByMember = new Map() // memberId -> seat — STABLE binding, never recomputed from live counts
+  const occupiedWorkSeats = new Set()
   const pendingTimers = new Set()
   let managerBusy = false
   const workingSince = new Map() // memberId -> start of the current working stretch
@@ -211,6 +286,19 @@ export function startMawChoreography(store) {
     })
   }
 
+  /** Release the walk lock and dress the member in their CURRENT status animation. */
+  function restorePresentation(agentId) {
+    const s = store.getState()
+    const a = s.agents[agentId]
+    if (!a) return
+    const pseudo = { id: agentId, role: a.maw?.role, status: a.status }
+    s.clearAgentGroupEvent(agentId, {
+      behavior: behaviorFor(pseudo),
+      expression: a.status === 'done' ? 'happy' : a.status === 'blocked' ? 'confused' : 'normal',
+      bubble: a.bubble ?? null,
+    })
+  }
+
   /** Poll until the agent's walk settles, then run `fn` (after an optional dwell). */
   function arriveThen(agentId, afterMs, fn) {
     const startedAt = Date.now()
@@ -226,24 +314,66 @@ export function startMawChoreography(store) {
     setTimeout(poll, ARRIVAL_POLL_MS)
   }
 
-  function restoreWorkAnimation(memberId) {
-    const s = store.getState()
-    const id = Object.keys(s.agents).find((k) => k.startsWith(`${memberId}~`))
-    if (!id) return
-    const a = s.agents[id]
-    const pseudo = { id, role: a.maw?.role, status: a.status }
-    s.setAgentGroupEvent(id, {
-      behavior: behaviorFor(pseudo),
-      expression: a.status === 'done' ? 'happy' : a.status === 'blocked' ? 'confused' : 'normal',
-      bubble: a.label || null,
-      groupTarget: a.groupTarget ? { ...a.groupTarget } : undefined,
-    })
+  /** Stable work seat for a member: assigned ONCE, never recomputed from live counts. */
+  function stableWorkSeat(member) {
+    const bound = workSeatsByMember.get(member.id)
+    if (bound) return bound
+    const role = member.maw?.role
+    if (role === 'manager') return MANAGER_GATE // the gate booth is the manager's work seat
+    let seat = null
+    const base = HOME_POSITIONS[role]
+    if (base && !occupiedWorkSeats.has(seatKey(base))) seat = { ...base }
+    else {
+      for (const candidate of MAW_EXTRA_WORK_SEATS) {
+        if (!occupiedWorkSeats.has(seatKey(candidate))) { seat = { ...candidate }; break }
+      }
+    }
+    if (!seat) seat = { ...MAW_EXTRA_WORK_SEATS[0] } // unreachable for valid snapshots (56+4 seats ≥ 50)
+    occupiedWorkSeats.add(seatKey(seat))
+    workSeatsByMember.set(member.id, seat)
+    return seat
   }
 
-  function enqueueHandover(memberAgent) {
-    handoverQueue.push(memberAgent)
+  /** Stable rest seat for a member: assigned ONCE. */
+  function stableRestSeat(member) {
+    const bound = restSeatsByMember.get(member.id)
+    if (bound) return bound.seat
+    const assigned = restSeatFor(member.id, restSeatsTaken)
+    restSeatsTaken.add(assigned.index)
+    restSeatsByMember.set(member.id, assigned)
+    return assigned.seat
+  }
+
+  /** Drop every per-member trace of members that left the snapshot. */
+  function pruneGoneMembers(memberIds) {
+    for (const id of [...workSeatsByMember.keys()]) {
+      if (!memberIds.has(id)) {
+        occupiedWorkSeats.delete(seatKey(workSeatsByMember.get(id)))
+        workSeatsByMember.delete(id)
+      }
+    }
+    for (const id of [...restSeatsByMember.keys()]) {
+      if (!memberIds.has(id)) {
+        restSeatsTaken.delete(restSeatsByMember.get(id).index)
+        restSeatsByMember.delete(id)
+      }
+    }
+    for (const map of [prevHandover, workingSince, restingSince]) {
+      for (const id of [...map.keys()]) {
+        if (!memberIds.has(id)) map.delete(id)
+      }
+    }
+    for (const id of Object.keys(prevPhase)) {
+      if (!memberIds.has(id)) delete prevPhase[id]
+    }
+  }
+
+  function enqueueHandover(memberId, workSeat, label) {
+    handoverQueue.push({ id: memberId, workSeat, label })
     processHandoverQueue()
   }
+
+  const handoverQueue = []
 
   function processHandoverQueue() {
     if (torn || managerBusy || handoverQueue.length === 0) return
@@ -253,63 +383,72 @@ export function startMawChoreography(store) {
     const item = handoverQueue.shift()
     if (!item) return
     managerBusy = true
-    const memberAgent = s.agents[item.id]
-    // The member walks straight back to the work seat and waits there; the
-    // manager departs once the member has settled at the seat.
-    const at = item.workSeat || (memberAgent ? { x: memberAgent.position?.x ?? MANAGER_GATE.x, y: memberAgent.position?.y ?? MANAGER_GATE.y } : null)
-    if (!at) { managerBusy = false; return later(processHandoverQueue, 200) }
+    // The MEMBER returns to their stable work seat first (they may be mid-wander
+    // or resting when the snapshot promotes them to awaiting-approval); the
+    // manager departs only once the member has settled there.
     const proceed = () => {
       const current = store.getState()
       const manager = current.agents[managerId]
       if (!manager || manager.status !== 'working') { managerBusy = false; return }
-      walk(managerId, at, { behavior: 'chat', expression: 'normal', bubble: `任务交接 · ${item.label || ''}` })
+      walk(managerId, item.workSeat, { behavior: 'chat', expression: 'normal', bubble: `任务交接 · ${item.label || ''}` })
       arriveThen(managerId, HANDOVER_DWELL_MS, () => {
+        restorePresentation(managerId)
         walk(managerId, MANAGER_GATE, { behavior: 'gantt-chart', expression: 'normal', bubble: null })
         arriveThen(managerId, 0, () => {
+          restorePresentation(managerId)
           managerBusy = false
           processHandoverQueue()
         })
       })
     }
-    if (memberAgent && (memberAgent.isMoving || memberAgent.journeyTarget)) {
-      arriveThen(item.id, 0, proceed) // wait for the member to settle at the seat
-    } else {
+    const memberAgent = s.agents[item.id]
+    const at = item.workSeat
+    const settled = memberAgent && !memberAgent.isMoving && !memberAgent.journeyTarget &&
+      Math.hypot((memberAgent.position?.x ?? 0) - at.x, (memberAgent.position?.y ?? 0) - at.y) < 12
+    if (settled) {
       proceed()
-    }
-  }
-
-  function restoreWorkAnimationIfIdleAtGate(managerId) {
-    const a = store.getState().agents[managerId]
-    if (a && a.status === 'working') {
-      store.getState().setAgentGroupEvent(managerId, { behavior: 'gantt-chart', expression: 'normal', bubble: null, groupTarget: { ...MANAGER_GATE } })
+    } else {
+      walk(item.id, at, { behavior: 'idle', expression: 'normal', bubble: null })
+      arriveThen(item.id, 0, () => {
+        restorePresentation(item.id) // await-approval animation at the seat
+        proceed()
+      })
     }
   }
 
   let wanderTimer = null
   if (typeof setInterval === 'function') {
     wanderTimer = setInterval(() => {
-      if (store.getState().mawMeta?.quality === 'stale') return // channel stale — hold positions
-      if (Date.now() - lastWanderAt >= WANDER_INTERVAL_MS) {
-        const candidates = wanderCandidates()
-        if (candidates.length === 0) return
-        lastWanderAt = Date.now()
-        const pick = candidates[Math.floor(Math.random() * candidates.length)]
-        const point = wanderPoint()
-        if (!point) return
-        const home = pick.home
-        const working = pick.agent.status === 'working'
-        walk(pick.agent.id, point, { behavior: 'idle', expression: 'normal', bubble: null })
-        arriveThen(pick.agent.id, 8000 + Math.random() * 8000, () => {
-          const current = store.getState().agents[pick.agent.id]
-          if (!current || current.status !== pick.agent.status) return
-          const back = working
-            ? { behavior: MAW_ROLE_WORK_BEHAVIOR[current.maw?.role] || 'typing', expression: 'normal', bubble: null }
-            : { behavior: 'idle', expression: current.status === 'done' ? 'happy' : 'normal', bubble: null }
-          walk(pick.agent.id, home, back)
-          if (working) workingSince.set(pick.agent.id, Date.now())
-          else restingSince.set(pick.agent.id, Date.now())
-        })
-      }
+      if (torn) return
+      const s = store.getState()
+      if (s.mawMeta?.quality === 'stale') return // channel stale — hold positions
+      if (Date.now() - lastWanderAt < WANDER_INTERVAL_MS) return
+      const candidates = wanderCandidates({
+        members: Object.values(s.agents).filter((a) => a?.mawMember),
+        workingSince,
+        restingSince,
+      })
+      if (candidates.length === 0) return
+      lastWanderAt = Date.now()
+      const agent = candidates[Math.floor(Math.random() * candidates.length)]
+      const point = wanderPoint()
+      if (!point) return
+      const statusAtDeparture = agent.status
+      const working = statusAtDeparture === 'working' || statusAtDeparture === 'planning'
+      walk(agent.id, point, { behavior: 'idle', expression: 'normal', bubble: null })
+      arriveThen(agent.id, 8000 + Math.random() * 8000, () => {
+        const current = store.getState().agents[agent.id]
+        if (!current) return
+        if (current.status !== statusAtDeparture) return restorePresentation(agent.id) // the transition owns the new walk
+        const home = working ? stableWorkSeat(current) : stableRestSeat(current)
+        const back = working
+          ? { behavior: MAW_ROLE_WORK_BEHAVIOR[current.maw?.role] || 'typing', expression: 'normal', bubble: null }
+          : { behavior: 'idle', expression: current.status === 'done' ? 'happy' : 'normal', bubble: null }
+        walk(agent.id, home, back)
+        arriveThen(agent.id, 0, () => restorePresentation(agent.id))
+        if (working) workingSince.set(agent.id, Date.now())
+        else restingSince.set(agent.id, Date.now())
+      })
     }, 5_000)
     if (typeof wanderTimer.unref === 'function') wanderTimer.unref()
   }
@@ -325,6 +464,7 @@ export function startMawChoreography(store) {
     if (s.mawMeta?.quality === 'stale') return
     const members = Object.values(s.agents).filter((a) => a?.mawMember)
     const manager = members.find((a) => a.maw?.role === 'manager')
+    pruneGoneMembers(new Set(members.map((m) => m.id)))
 
     // member transitions (manager handled by the handover queue only)
     const now = Date.now()
@@ -342,79 +482,52 @@ export function startMawChoreography(store) {
       if (phase === previous) continue
       prevPhase[member.id] = phase
       const agentId = member.id
-      if (phase === 'task') {
-        const taken = {}
-        for (const other of members) {
-          if (other.id === member.id) continue
-          if (phaseOf(other.status) === 'task') taken[other.maw?.role] = (taken[other.maw?.role] || 0) + 1
-        }
-        const seat = workSeatFor(member.maw?.role, taken[member.maw?.role] || 0)
-        // Delivering members hurry back to the work seat and wait for the manager.
-        const delay = member.status === 'awaiting-approval' ? 0 : staggerCount() * STAGGER_MS
-        later(() => {
-          walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null })
-          arriveThen(agentId, 0, () => restoreWorkAnimation(member.id))
-        }, delay)
-        bumpStagger()
-      } else {
-        let seat = restSeatByMember.get(member.id)
-        if (!seat) {
-          const assigned = restSeatFor(member.id, restSeatTaken)
-          restSeatTaken.add(assigned.index)
-          restSeatByMember.set(member.id, assigned.seat)
-          seat = assigned.seat
-        }
-        later(() => {
-          walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null })
-        }, staggerCount() * STAGGER_MS)
-        bumpStagger()
-      }
+      // Stable seat binding: the seat was assigned when the member FIRST entered
+      // this phase; recomputing from live counts would stack same-role members
+      // and send the manager to someone else's desk.
+      const seat = phase === 'task' ? stableWorkSeat(member) : stableRestSeat(member)
+      // Delivering members hurry back to the work seat and wait for the manager.
+      const delay = member.status === 'awaiting-approval' ? 0 : staggerCount() * STAGGER_MS
+      later(() => {
+        walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null })
+        arriveThen(agentId, 0, () => restorePresentation(agentId))
+      }, delay)
+      bumpStagger()
     }
 
-    // manager: working seat = gate; handovers driven by awaiting-approval transitions
+    // manager: working seat = gate; rest seat = stable meeting-room chair
     if (manager) {
       const mphase = phaseOf(manager.status)
       if (prevPhase[manager.id] !== mphase) {
         prevPhase[manager.id] = mphase
         if (mphase === 'task') {
           walk(manager.id, MANAGER_GATE, { behavior: 'gantt-chart', expression: 'normal', bubble: null })
+          arriveThen(manager.id, 0, () => {
+            const a = store.getState().agents[manager.id]
+            if (a && a.status === 'working') restorePresentation(manager.id)
+          })
         } else {
-          let seat = restSeatByMember.get(manager.id)
-          if (!seat) {
-            const assigned = restSeatFor(manager.id, restSeatTaken)
-            restSeatTaken.add(assigned.index)
-            restSeatByMember.set(manager.id, assigned.seat)
-            seat = assigned.seat
-          }
+          const seat = stableRestSeat(manager)
           walk(manager.id, seat, { behavior: 'idle', expression: 'normal', bubble: null })
+          arriveThen(manager.id, 0, () => restorePresentation(manager.id))
         }
       }
     }
 
-    // handover triggers: any member entering awaiting-approval
+    // handover triggers: any member entering awaiting-approval (same-phase or not —
+    // the manager handover must fire even when the member never left the task phase)
     for (const member of members) {
       if (member.maw?.role === 'manager') continue
       const key = `${member.id}:handover`
       if (member.status === 'awaiting-approval' && prevHandover.get(key) !== true) {
         prevHandover.set(key, true)
-        const taken = {}
-        for (const other of members) {
-          if (other.id === member.id) continue
-          if (phaseOf(other.status) === 'task') taken[other.maw?.role] = (taken[other.maw?.role] || 0) + 1
-        }
-        handoverQueue.push({
-          id: member.id,
-          workSeat: workSeatFor(member.maw?.role, taken[member.maw?.role] || 0),
-          label: member.label,
-        })
-        processHandoverQueue()
+        enqueueHandover(member.id, stableWorkSeat(member), member.label)
       } else if (member.status !== 'awaiting-approval' && prevHandover.get(key) === true) {
         prevHandover.set(key, false)
       }
     }
   })
 
-  const prevHandover = new Map()
   let staggerCounter = 0
   const staggerCount = () => staggerCounter
   const bumpStagger = () => { staggerCounter += 1 }
