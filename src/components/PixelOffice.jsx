@@ -794,6 +794,7 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
   // MAW mode: desk labels resolve from the seated roster characters (plan §4.1.3), and an
   // empty stage shows the waiting notice instead of pretending anyone is working.
   const projectMode = useOfficeStore((s) => s.mode)
+  const mawMeta = useOfficeStore(useShallow((s) => s.mawMeta))
   const isMaw = projectMode === 'maw'
   const mawDeskData = useMemo(() => {
     if (!isMaw) return DESK_DATA
@@ -1474,10 +1475,30 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
     </div>
   ) : null
 
+  // Stale channel (producer lease expired server-side): the figures rest (store side),
+  // and the scene says WHY plus when the last real sample was taken — the plan forbids
+  // a live-looking office once freshness is gone.
+  const mawStaleNotice = isMaw && mawMeta?.quality === 'stale' ? (
+    <div
+      style={{
+        position: 'absolute', left: 0, right: 0, top: '6%', textAlign: 'center',
+        fontSize: 12, color: '#a06a00', pointerEvents: 'none', fontFamily: 'monospace',
+        textShadow: '0 1px 0 rgba(255,255,255,0.6)',
+      }}
+    >
+      <div>{t('maw.stale')}</div>
+      <div style={{ fontSize: 11, color: '#8a8a8a', marginTop: 2 }}>
+        {mawMeta.quality_detail ? `${mawMeta.quality_detail} · ` : ''}
+        {t('maw.lastSample')}: {Number.isFinite(mawMeta.sampled_at) && mawMeta.sampled_at > 0 ? new Date(mawMeta.sampled_at).toLocaleTimeString() : '—'}
+      </div>
+    </div>
+  ) : null
+
   if (isPanel) {
     return (
       <div ref={containerRef} style={{ flex: 1, minHeight: 0, overflow: 'hidden', position: 'relative' }}>
         {mawEmptyNotice}
+        {mawStaleNotice}
         {svgElement}
       </div>
     )
@@ -1494,6 +1515,7 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
   ) : (
     <div ref={containerRef} className="w-full flex-1 overflow-hidden min-h-0 flex items-center justify-center" style={{ position: 'relative' }}>
       {mawEmptyNotice}
+      {mawStaleNotice}
       {svgElement}
     </div>
   )

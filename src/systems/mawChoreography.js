@@ -60,17 +60,32 @@ export function restSeatFor(memberId, taken = new Set()) {
 
 // Extra working seats for same-role members beyond the first — all inside the
 // main office (the OVERFLOW_POSITIONS hallway is in the entrance area, which is
-// forbidden to members).
-export const MAW_EXTRA_WORK_SEATS = [
+// forbidden to members). The pool is sized for the worst valid snapshot: 50
+// members of ONE role need 49 extras, so 6 hand-placed + 50 generated = 56 seats
+// keeps every member on a unique spot without wrap-around collisions.
+const HAND_EXTRA_WORK_SEATS = [
   { x: 450, y: 300 }, { x: 520, y: 300 }, { x: 200, y: 330 },
   { x: 270, y: 330 }, { x: 450, y: 360 }, { x: 520, y: 360 },
 ]
+// Deterministic grid inside the member-allowed band (y ≥ 175 keeps it out of the
+// entrance rect; x ≤ 585 / y ≤ 380 stays on the floor). Unique against the
+// hand-placed seats above by construction (disjoint x/y values).
+const GENERATED_EXTRA_WORK_SEATS = []
+for (let row = 0; row < 5; row++) {
+  for (let col = 0; col < 10; col++) {
+    GENERATED_EXTRA_WORK_SEATS.push({ x: 40 + col * 55, y: 200 + row * 45 })
+  }
+}
+export const MAW_EXTRA_WORK_SEATS = [...HAND_EXTRA_WORK_SEATS, ...GENERATED_EXTRA_WORK_SEATS]
 
 /** Working seat in the main office: base chair per role, main-office extras after. */
 export function workSeatFor(role, perRoleCount) {
   const base = HOME_POSITIONS[role]
   if (perRoleCount === 0 && base) return { ...base }
-  return { ...MAW_EXTRA_WORK_SEATS[(perRoleCount - 1) % MAW_EXTRA_WORK_SEATS.length] }
+  // Clamp only as a defensive bound — a valid snapshot (≤ 50 members, ≤ 49 extras
+  // of one role) can never reach it, so no two members ever share a seat.
+  const index = Math.min(perRoleCount - 1, MAW_EXTRA_WORK_SEATS.length - 1)
+  return { ...MAW_EXTRA_WORK_SEATS[index] }
 }
 
 /** True when a walk target would break a member's zone rules. */
@@ -273,6 +288,7 @@ export function startMawChoreography(store) {
   let wanderTimer = null
   if (typeof setInterval === 'function') {
     wanderTimer = setInterval(() => {
+      if (store.getState().mawMeta?.quality === 'stale') return // channel stale — hold positions
       if (Date.now() - lastWanderAt >= WANDER_INTERVAL_MS) {
         const candidates = wanderCandidates()
         if (candidates.length === 0) return
@@ -302,6 +318,11 @@ export function startMawChoreography(store) {
     if (torn) return
     const s = store.getState()
     if (s.mode !== 'maw') return
+    // Channel stale (producer lease expired): the snapshot already rests the figures
+    // (buildMawMember), so no NEW walks — members hold where they are until a fresh
+    // snapshot restores quality. prevPhase is intentionally kept: on recovery the
+    // accumulated status diffs replay exactly once.
+    if (s.mawMeta?.quality === 'stale') return
     const members = Object.values(s.agents).filter((a) => a?.mawMember)
     const manager = members.find((a) => a.maw?.role === 'manager')
 

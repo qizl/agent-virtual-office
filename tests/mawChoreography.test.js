@@ -46,6 +46,17 @@ describe('maw choreography planning', () => {
     }
   })
 
+  it('the extra-seat pool seats a whole 50-member role uniquely and zone-safe', () => {
+    const seats = []
+    for (let n = 1; n <= 49; n++) seats.push(workSeatFor('executor', n)) // 49 extras = worst valid snapshot
+    const keys = seats.map((s) => `${s.x},${s.y}`)
+    expect(new Set(keys).size).toBe(seats.length) // no wrap-around collisions
+    for (const seat of seats) {
+      expect(violatesMemberZone(seat)).toBe(false) // never in the entrance area
+      expect(inRect(seat, MAIN)).toBe(true)
+    }
+  })
+
   it('member targets never violate the entrance zone (gate room)', () => {
     for (let i = 0; i < 40; i++) {
       expect(violatesMemberZone(restSeatFor(`m${i}`).seat)).toBe(false)

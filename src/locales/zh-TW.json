@@ -17,7 +17,9 @@
     "reviewer": { "name": "審查者", "personality": "獨立復驗證據；只寫 pass 或 fail" }
   },
   "maw": {
-    "empty": "等待 MAW 快照資料——執行 scripts/maw-office.py --serve 讓團隊進場。"
+    "empty": "等待 MAW 快照資料——執行 scripts/maw-office.py --serve 讓團隊進場。",
+    "stale": "MAW 快照已過期（生產者租約失效）——動畫已暫停。",
+    "lastSample": "上次取樣"
   },
   "behaviorLabels": {
     "typing": "打字中",

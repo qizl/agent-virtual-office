@@ -98,6 +98,27 @@ describe('applyMawSnapshot', () => {
     expect(s.mawMeta.sampled_at).toBeNull()
   })
 
+  it('a stale snapshot rests the figures but keeps their honest status text', () => {
+    useOfficeStore.getState().applyMawSnapshot(envelope(1, [
+      member('stale1', 'executor', 'working', 'slice-001'),
+      member('stale2', 'reviewer', 'blocked', 'needs recheck'),
+    ], { quality: 'stale', quality_detail: 'producer-lease-expired' }))
+    const a = useOfficeStore.getState().agents
+    expect(a['stale1~executor'].behavior).toBe('idle') // work animation stopped
+    expect(a['stale1~executor'].expression).toBe('normal')
+    expect(a['stale1~executor'].status).toBe('working') // facts stay honest
+    expect(a['stale2~reviewer'].status).toBe('blocked')
+    expect(useOfficeStore.getState().mawMeta.quality).toBe('stale')
+  })
+
+  it('a full 50-member same-role snapshot seats every member on a unique spot', () => {
+    const members = Array.from({ length: 50 }, (_, i) => member(`full${String(i).padStart(2, '0')}`, 'executor'))
+    useOfficeStore.getState().applyMawSnapshot(envelope(1, members))
+    const positions = Object.values(useOfficeStore.getState().agents).map((a) => `${a.position.x},${a.position.y}`)
+    expect(positions).toHaveLength(50)
+    expect(new Set(positions).size).toBe(50)
+  })
+
   it('ignores snapshots in non-maw modes (default office stays organic)', () => {
     useOfficeStore.setState({ mode: 'agentcortex' })
     useOfficeStore.getState().applyMawSnapshot(envelope(1, [member('leak01', 'executor')]))

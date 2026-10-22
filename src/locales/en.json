@@ -17,7 +17,9 @@
     "reviewer": { "name": "Reviewer", "personality": "Independent verifier; only ever writes pass or fail" }
   },
   "maw": {
-    "empty": "Waiting for MAW snapshot data — run scripts/maw-office.py --serve to bring the team on stage."
+    "empty": "Waiting for MAW snapshot data — run scripts/maw-office.py --serve to bring the team on stage.",
+    "stale": "MAW snapshot is stale (producer lease expired) — animations paused.",
+    "lastSample": "last sample"
   },
   "behaviorLabels": {
     "typing": "Typing",

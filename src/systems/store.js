@@ -14,6 +14,7 @@ import { PET_TYPES, nextPetType } from './petState.js'
 import { pruneRecentPicks } from './behaviorEngine.js'  // AVO-180: prune on eviction
 import { isValidTheme, DEFAULT_THEME } from './theme.js'
 import { recordEpisode, isNewBlockedEpisode } from './recurringFailure.js'
+import { workSeatFor } from './mawChoreography.js' // shared MAW seat planner (store and choreography must agree)
 import { AGENT_CARRY_FIELDS } from '../utils/statusFields.js'
 import {
   createDoorClaimState,
@@ -587,7 +588,7 @@ function mawExpression(member) {
   return 'normal'
 }
 
-function buildMawMember(member, seat) {
+function buildMawMember(member, seat, stale = false) {
   const style = MAW_ROSTER_BY_ID.get(member.role) || {}
   const agentId = `${member.id}~${member.role}`
   return {
@@ -595,8 +596,11 @@ function buildMawMember(member, seat) {
     id: agentId,
     name: member.label || style.name || member.role,
     color: style.color || '#888888',
-    behavior: mawBehavior(member),
-    expression: mawExpression(member),
+    // Stale channel (producer lease expired): keep the honest status/label but drop
+    // the active work animation — the figure rests, the stale banner explains why
+    // (ADR-008 degrade-to-honest-neutral; plan: stale 停止活跃工作动画).
+    behavior: stale ? 'idle' : mawBehavior(member),
+    expression: stale ? 'normal' : mawExpression(member),
     bubble: member.label || null,
     status: member.status,
     returnHomeOnIdle: false,
@@ -623,6 +627,7 @@ function buildMawMember(member, seat) {
 function applyMawSnapshotImpl(s, envelope) {
   if (s.mode !== 'maw' || !envelope || typeof envelope !== 'object') return {}
   const snapshot = envelope.snapshot
+  const stale = snapshot ? snapshot.quality === 'stale' : false
   const meta = {
     server_epoch: envelope.server_epoch ?? null,
     seq: envelope.seq ?? null,
@@ -636,15 +641,15 @@ function applyMawSnapshotImpl(s, envelope) {
   const desired = new Map()
   if (snapshot && Array.isArray(snapshot.members)) {
     const perRoleCount = {}
-    let overflowIndex = 0
     for (const member of snapshot.members) {
       if (!member || typeof member.id !== 'string' || !MAW_ROSTER_BY_ID.get(member.role)) continue
       const agentId = `${member.id}~${member.role}`
       const roleCount = perRoleCount[member.role] || 0
       perRoleCount[member.role] = roleCount + 1
-      const baseSeat = HOME_POSITIONS[member.role]
-      const seat = roleCount === 0 && baseSeat ? baseSeat : OVERFLOW_POSITIONS[overflowIndex++ % OVERFLOW_POSITIONS.length]
-      desired.set(agentId, { member, seat })
+      // Same seat planner the choreography uses — base chair first, then the unique
+      // extra-seat pool (a 50-member snapshot never stacks two members on one spot,
+      // and no member is ever seated in the forbidden entrance area).
+      desired.set(agentId, { member, seat: workSeatFor(member.role, roleCount) })
     }
   }
   // Remove members absent from this snapshot (every submission is the FULL member set).
@@ -662,7 +667,7 @@ function applyMawSnapshotImpl(s, envelope) {
         ? { behavior: existing.behavior, expression: existing.expression, bubble: existing.bubble }
         : {}
       agents[agentId] = {
-        ...buildMawMember(member, seat),
+        ...buildMawMember(member, seat, stale),
         ...preserved,
         position: existing.position,
         targetPosition: existing.targetPosition,
@@ -673,7 +678,7 @@ function applyMawSnapshotImpl(s, envelope) {
         groupTarget: existing.groupTarget,
       }
     } else {
-      agents[agentId] = buildMawMember(member, seat)
+      agents[agentId] = buildMawMember(member, seat, stale)
     }
   }
   return { agents, mawMeta: meta }

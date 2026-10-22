@@ -2,15 +2,30 @@
 //
 // In maw mode this is the ONLY status source: the default SSE/poll/hash/postMessage/
 // BroadcastChannel/global channels are never wired (startStatusIntegration gates before
-// them). Each server envelope carries { server_epoch, seq, snapshot }; the store's
-// applyMawSnapshot treats every snapshot as the FULL member set, so stale deliveries are
-// neutralized by comparing the server epoch before applying.
+// them). Each server envelope carries { server_epoch, seq, snapshot }; stale deliveries
+// are neutralized by the (epoch, seq) order in envelopeIsNewer, and the store's
+// applyMawSnapshot treats every accepted snapshot as the FULL member set.
 
 import { detectProjectMode } from '../systems/platformDetect'
 import { startMawChoreography } from '../systems/mawChoreography.js'
 
 const POLL_INTERVAL_MS = 2000
 const SSE_RETRY_MS = 30_000
+
+/**
+ * Total order on (server_epoch, seq): the server epoch is boot-unique, so a delayed
+ * bootstrap GET (or a poll response racing SSE) with a lower seq can never overwrite
+ * newer state, and envelopes from a previous server lifetime can never re-activate
+ * the view. Equal keys re-apply harmlessly — every snapshot is the full member set.
+ */
+export function envelopeIsNewer(envelope, lastKey) {
+  if (!envelope || typeof envelope !== 'object') return false
+  const epoch = envelope.server_epoch
+  const seq = envelope.seq
+  if (typeof epoch !== 'number' || typeof seq !== 'number') return true // malformed — let the validator handle it
+  if (!lastKey) return true
+  return epoch > lastKey[0] || (epoch === lastKey[0] && seq >= lastKey[1])
+}
 
 export function startMawIntegration(store) {
   let torn = false
@@ -19,13 +34,14 @@ export function startMawIntegration(store) {
   let eventSource = null
   let pollTimer = null
   let retryTimer = null
-  let lastEpoch = null
+  let lastKey = null // [server_epoch, seq] of the last applied envelope
 
   function applyEnvelope(envelope) {
-    if (torn || !envelope || typeof envelope !== 'object') return
-    // An older epoch is a delayed delivery from a cleared channel — never re-activate it.
-    if (typeof envelope.server_epoch === 'number' && typeof lastEpoch === 'number' && envelope.server_epoch < lastEpoch) return
-    if (typeof envelope.server_epoch === 'number') lastEpoch = envelope.server_epoch
+    if (torn) return
+    if (!envelopeIsNewer(envelope, lastKey)) return
+    if (typeof envelope?.server_epoch === 'number' && typeof envelope?.seq === 'number') {
+      lastKey = [envelope.server_epoch, envelope.seq]
+    }
     store.getState().applyMawSnapshot(envelope)
   }
 
