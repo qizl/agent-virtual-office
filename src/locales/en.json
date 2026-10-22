@@ -10,7 +10,14 @@
     "designer": { "name": "Designer", "personality": "Earrings, iPad in hand, 1px and color-temperature purist; 35mm film and vinyl collector, believes beauty is structural truth breathing naturally" },
     "planner": { "name": "Planner", "personality": "Loves sticky notes, always discussing with others" },
     "worker": { "name": "Worker", "personality": "Wears headphones, focused typing, scratches head sometimes" },
-    "checker": { "name": "Checker", "personality": "Wears glasses, compares carefully, always checking off items" }
+    "checker": { "name": "Checker", "personality": "Wears glasses, compares carefully, always checking off items" },
+    "manager": { "name": "Manager", "personality": "Schedules, dispatches and seals scope; speaks in slice boundaries" },
+    "decision-maker": { "name": "Decision-Maker", "personality": "Weighs trade-offs at the whiteboard; answers in scope or new-task" },
+    "executor": { "name": "Executor", "personality": "Heads down implementing; runs the acceptance commands before delivering" },
+    "reviewer": { "name": "Reviewer", "personality": "Independent verifier; only ever writes pass or fail" }
+  },
+  "maw": {
+    "empty": "Waiting for MAW snapshot data — run scripts/maw-office.py --serve to bring the team on stage."
   },
   "behaviorLabels": {
     "typing": "Typing",

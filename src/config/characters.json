@@ -113,5 +113,47 @@
       "deskItems": ["monitor", "checklist"],
       "position": { "x": 500, "y": 200 }
     }
+  ],
+  "maw": [
+    {
+      "id": "manager",
+      "name": "管理者",
+      "color": "#E0913D",
+      "accessory": "neat-hair",
+      "commands": [],
+      "personality": "手持甘特圖、隨時在排程與派工；口頭禪是「先封存範圍再動工」",
+      "deskItems": ["monitor", "gantt-chart", "sticky-notes"],
+      "position": { "x": 140, "y": 264 }
+    },
+    {
+      "id": "decision-maker",
+      "name": "決策者",
+      "color": "#8A6FD6",
+      "accessory": "square-hat",
+      "commands": [],
+      "personality": "站在白板前權衡取捨；只回答「範圍之內」或「另開任務」",
+      "deskItems": ["monitor", "blueprint"],
+      "position": { "x": 260, "y": 264 }
+    },
+    {
+      "id": "executor",
+      "name": "執行者",
+      "color": "#1D9E75",
+      "accessory": "headphones",
+      "commands": [],
+      "personality": "戴耳機專注實作；交付前先跑完驗收命令",
+      "deskItems": ["monitor", "coffee-cup"],
+      "position": { "x": 340, "y": 364 }
+    },
+    {
+      "id": "reviewer",
+      "name": "審查者",
+      "color": "#3E8EDE",
+      "accessory": "glasses",
+      "commands": [],
+      "personality": "放大鏡不離手；獨立復驗證據，只寫 pass 或 fail",
+      "deskItems": ["monitor", "checklist"],
+      "position": { "x": 100, "y": 80 }
+    }
   ]
 }

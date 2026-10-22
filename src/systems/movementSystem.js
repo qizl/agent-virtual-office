@@ -195,6 +195,9 @@ export const HOME_POSITIONS = {
   gate: WAYPOINTS.gate,
   designer: { x: 140, y: 384 },
   planner: { x: 200, y: 274 }, worker: { x: 400, y: 304 }, checker: { x: 500, y: 254 },
+  // MAW base roles: first member of each role takes the named seat; extra same-role
+  // members fan out through OVERFLOW_POSITIONS (independent extra seats).
+  manager: { x: 140, y: 264 }, 'decision-maker': { x: 260, y: 264 }, executor: { x: 340, y: 364 }, reviewer: { x: 400, y: 244 },
 }
 
 // ─── Subagent helper-huddle placement ───────────────────────────────

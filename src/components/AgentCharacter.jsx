@@ -318,6 +318,10 @@ const CHAR_STYLES = {
   worker:   { hair: '#2a5a3a', hairStyle: 'bangs',      clothes: '#1D9E75', gender: 'female' },
   checker:  { hair: '#5a4a3a', hairStyle: 'neat',       clothes: '#BA7517', gender: 'male' },
   designer: { hair: '#4a1a2a', hairStyle: 'long',       clothes: '#E8688A', gender: 'female' },
+  manager:  { hair: '#3a2a1a', hairStyle: 'neat',       clothes: '#E0913D', gender: 'male' },
+  'decision-maker': { hair: '#5a4a8a', hairStyle: 'beret',      clothes: '#8A6FD6', gender: 'male' },
+  executor: { hair: '#2a5a3a', hairStyle: 'bangs',      clothes: '#1D9E75', gender: 'female' },
+  reviewer: { hair: '#3a5a7a', hairStyle: 'neat',       clothes: '#3E8EDE', gender: 'male' },
 }
 
 // ─── Expression modifiers ──────────────────────────────────────────────

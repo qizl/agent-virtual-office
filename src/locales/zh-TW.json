@@ -10,7 +10,14 @@
     "designer": { "name": "設計師", "personality": "戴耳環、拿 iPad、對 1px 與色溫極度敏感的完美主義；底片相機與黑膠收藏，相信美不是裝飾而是結構自然流露的呼吸感" },
     "planner": { "name": "規劃師", "personality": "愛寫便利貼、常跟人討論" },
     "worker": { "name": "執行者", "personality": "戴耳機、專注打字、偶爾抓頭" },
-    "checker": { "name": "檢查員", "personality": "戴眼鏡、仔細對比、常打勾" }
+    "checker": { "name": "檢查員", "personality": "戴眼鏡、仔細對比、常打勾" },
+    "manager": { "name": "管理者", "personality": "排程、派工與封存範圍；開口閉口都是切片邊界" },
+    "decision-maker": { "name": "決策者", "personality": "在白板前權衡取捨；只回答「範圍之內」或「另開任務」" },
+    "executor": { "name": "執行者", "personality": "埋首實作；交付前先跑完驗收命令" },
+    "reviewer": { "name": "審查者", "personality": "獨立復驗證據；只寫 pass 或 fail" }
+  },
+  "maw": {
+    "empty": "等待 MAW 快照資料——執行 scripts/maw-office.py --serve 讓團隊進場。"
   },
   "behaviorLabels": {
     "typing": "打字中",

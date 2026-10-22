@@ -16,6 +16,8 @@ import { pushEventBatch, setMoodOverride, resetMood } from '../systems/moodEngin
 import { VALID_ROLES, VALID_STATUSES, VALID_MOODS, EFFORT_LEVELS, STATUS_POLL_INTERVAL } from '../systems/constants.js'
 import { sanitizeCarryFields } from '../utils/statusFields.js'
 import { sanitizeObservedActivity } from '../utils/statusContract.mjs'
+import { startMawIntegration } from './mawIntegration.js'
+import { detectProjectMode } from '../systems/platformDetect'
 
 // Only this module's actual same-origin API callbacks can mint this capability.
 // It is deliberately not represented by a payload field or source string.
@@ -740,6 +742,10 @@ const DEBOUNCE_MS = 150  // keep low — tool calls are 1-2s apart, debounce mus
  * @returns {Function} cleanup function
  */
 export function startStatusIntegration(store) {
+  // MAW mode is fully isolated: it consumes only /api/maw/status and never the default
+  // channels (source plan §4.1.3). The mood engine is not driven by maw snapshots.
+  // Guarded: detectProjectMode reads browser globals that are absent in node tests.
+  if (typeof document !== 'undefined' && detectProjectMode() === 'maw') return startMawIntegration(store)
   // Reset mood state in case of HMR or React Strict Mode double-invoke
   resetMood()
   let torn = false  // set on cleanup; guards late callbacks after teardown

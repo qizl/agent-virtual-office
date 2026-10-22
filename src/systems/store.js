@@ -532,6 +532,10 @@ function collectClaimedSpots(agents, excludeIds) {
 
 
 const initAgents = (mode) => {
+  // MAW mode: the four roster entries are STYLE TEMPLATES only — the stage is populated
+  // exclusively by dynamic applyMawSnapshot members (<key>~<base-role>), never by the
+  // static characters themselves (source plan §4.1.1).
+  if (mode === 'maw') return {}
   const roster = characters[mode] || characters.agentcortex
   const agents = {}
   for (const c of roster) {
@@ -557,6 +561,113 @@ const initAgents = (mode) => {
     }
   }
   return agents
+}
+
+// ─── MAW snapshot members (multi-agent-workflow-office-animation §4.1.1) ───
+// Members arrive as opaque instance keys + one of the four MAW base roles. They render
+// as dynamic `<key>~<role>` agents styled by the maw roster; absent members are removed
+// on every snapshot, an epoch bump is a full replace, and NO tool activity is fabricated
+// (status/label only — the bridge never reports tool calls).
+const MAW_ROSTER_BY_ID = new Map((characters.maw || []).map((c) => [c.id, c]))
+const MAW_WORK_BEHAVIOR = { manager: 'gantt-chart', 'decision-maker': 'whiteboard', executor: 'typing', reviewer: 'magnifier' }
+
+function mawBehavior(member) {
+  switch (member.status) {
+    case 'working': return MAW_WORK_BEHAVIOR[member.role] || 'typing'
+    case 'planning': return 'gantt-chart'
+    case 'blocked': return 'scratch-head'
+    case 'awaiting-approval': return 'await-approval'
+    default: return 'idle' // idle and done stand calm; done carries a happy expression
+  }
+}
+
+function mawExpression(member) {
+  if (member.status === 'done') return 'happy'
+  if (member.status === 'blocked') return 'confused'
+  return 'normal'
+}
+
+function buildMawMember(member, seat) {
+  const style = MAW_ROSTER_BY_ID.get(member.role) || {}
+  const agentId = `${member.id}~${member.role}`
+  return {
+    ...style,
+    id: agentId,
+    name: member.label || style.name || member.role,
+    color: style.color || '#888888',
+    behavior: mawBehavior(member),
+    expression: mawExpression(member),
+    bubble: member.label || null,
+    status: member.status,
+    returnHomeOnIdle: false,
+    deskItemCount: { coffee: 0, sticky: 0, books: 0 },
+    position: { ...seat },
+    targetPosition: { ...seat },
+    isMoving: false,
+    facing: 'down',
+    inGroupEvent: false,
+    groupTarget: null,
+    mawMember: true,
+    maw: {
+      key: member.id,
+      role: member.role,
+      round: member.round ?? null,
+      task_kind: member.task_kind ?? null,
+      verdict: member.verdict ?? null,
+      terminate: member.terminate ?? null,
+      stalled: member.stalled === true,
+    },
+  }
+}
+
+function applyMawSnapshotImpl(s, envelope) {
+  if (s.mode !== 'maw' || !envelope || typeof envelope !== 'object') return {}
+  const snapshot = envelope.snapshot
+  const meta = {
+    server_epoch: envelope.server_epoch ?? null,
+    seq: envelope.seq ?? null,
+    sampled_at: snapshot ? snapshot.sampled_at : null,
+    workflow: snapshot ? snapshot.workflow : null,
+    quality: snapshot ? snapshot.quality : null,
+    quality_detail: snapshot ? snapshot.quality_detail : null,
+    terminal: snapshot ? snapshot.terminal : null,
+  }
+  const agents = { ...s.agents }
+  const desired = new Map()
+  if (snapshot && Array.isArray(snapshot.members)) {
+    const perRoleCount = {}
+    let overflowIndex = 0
+    for (const member of snapshot.members) {
+      if (!member || typeof member.id !== 'string' || !MAW_ROSTER_BY_ID.get(member.role)) continue
+      const agentId = `${member.id}~${member.role}`
+      const roleCount = perRoleCount[member.role] || 0
+      perRoleCount[member.role] = roleCount + 1
+      const baseSeat = HOME_POSITIONS[member.role]
+      const seat = roleCount === 0 && baseSeat ? baseSeat : OVERFLOW_POSITIONS[overflowIndex++ % OVERFLOW_POSITIONS.length]
+      desired.set(agentId, { member, seat })
+    }
+  }
+  // Remove members absent from this snapshot (every submission is the FULL member set).
+  for (const id of Object.keys(agents)) {
+    if (agents[id]?.mawMember && !desired.has(id)) delete agents[id]
+  }
+  for (const [agentId, { member, seat }] of desired) {
+    const existing = agents[agentId]
+    if (existing) {
+      // Preserve live motion state; refresh only the projected facts.
+      agents[agentId] = {
+        ...buildMawMember(member, seat),
+        position: existing.position,
+        targetPosition: existing.targetPosition,
+        isMoving: existing.isMoving,
+        facing: existing.facing,
+        journeyTarget: existing.journeyTarget,
+      }
+    } else {
+      agents[agentId] = buildMawMember(member, seat)
+    }
+  }
+  return { agents, mawMeta: meta }
 }
 
 export const useOfficeStore = create((set) => ({
@@ -1129,6 +1240,9 @@ export const useOfficeStore = create((set) => ({
       ? {} : { observedActivity: next }
   }),
   externalStatus: {},          // { [agentId]: { status, task, label, expiresAt, reasonCode, activeFile, activeFileAt } }
+  // MAW snapshot projection meta (maw mode only): { server_epoch, seq, sampled_at, workflow, quality, quality_detail, terminal }.
+  // Transient — never persisted.
+  mawMeta: null,
   // AVO-106: pair-overlay — { a, b, file } when two distinct agents are co-EDITING the byte-identical
   // file (derived by officeLife from externalStatus), else null. PURE OVERLAY: the renderer draws a
   // faint desk-to-desk link; it NEVER moves an agent or touches status/behavior (R1 — a tracked desk
@@ -1635,6 +1749,11 @@ export const useOfficeStore = create((set) => ({
         ...(evictedSelected ? { selectedAgent: null } : {}),
       }
     }),
+
+  // MAW snapshot projection (maw mode only). Each submission replaces the FULL member
+  // set; a server-epoch change and a null snapshot are both full clears. Ignores the
+  // legacy externalStatus pipeline entirely.
+  applyMawSnapshot: (envelope) => set((s) => applyMawSnapshotImpl(s, envelope)),
 
   // ─── Mood system ───
   mood: 'normal',  // normal | rushing | frustrated | stuck | smooth | intense | idle (transient, not persisted)

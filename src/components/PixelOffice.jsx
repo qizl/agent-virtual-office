@@ -791,6 +791,18 @@ function FramedArt({ x, y, w = 24, h = 16, hue = '#8888AA', o = 1 }) {
 }
 
 export default function PixelOffice({ animationQuality = 'full', mode = 'full' }) {
+  // MAW mode: desk labels resolve from the seated roster characters (plan §4.1.3), and an
+  // empty stage shows the waiting notice instead of pretending anyone is working.
+  const projectMode = useOfficeStore((s) => s.mode)
+  const isMaw = projectMode === 'maw'
+  const mawDeskData = useMemo(() => {
+    if (!isMaw) return DESK_DATA
+    const labelBySeat = { '140,240': 'manager', '260,240': 'decision-maker', '400,220': 'reviewer', '340,340': 'executor' }
+    return DESK_DATA.map((d) => {
+      const rosterId = labelBySeat[`${d.x},${d.y}`]
+      return rosterId ? { ...d, label: t(`characters.${rosterId}.name`) } : { ...d, label: '' }
+    })
+  }, [isMaw])
   // Only re-render PixelOffice when agent IDs change, not on every property update.
   // AgentCharacter subscribes to its own agent state independently.
   const agentOrderSignature = useOfficeStore(useShallow((s) => getAgentOrderSignature(s.agents)))
@@ -1198,7 +1210,7 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
       <path d="M392 314.5h16" stroke={SIGNS.accent} strokeWidth="1.5" opacity={SIGNS.signatureOpacity} />
 
       {/* Personalized desks */}
-      {DESK_DATA.map((d) => (
+      {(isMaw ? mawDeskData : DESK_DATA).map((d) => (
         <PersonalDesk
           key={d.id}
           x={d.x} y={d.y}
@@ -1450,9 +1462,22 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
     </svg>
   )
 
+  const mawEmptyNotice = isMaw && agentOrderSignature.length === 0 ? (
+    <div
+      style={{
+        position: 'absolute', left: 0, right: 0, top: '38%', textAlign: 'center',
+        fontSize: 13, color: '#8a8a8a', pointerEvents: 'none', fontFamily: 'monospace',
+        textShadow: '0 1px 0 rgba(255,255,255,0.6)',
+      }}
+    >
+      {t('maw.empty')}
+    </div>
+  ) : null
+
   if (isPanel) {
     return (
-      <div ref={containerRef} style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
+      <div ref={containerRef} style={{ flex: 1, minHeight: 0, overflow: 'hidden', position: 'relative' }}>
+        {mawEmptyNotice}
         {svgElement}
       </div>
     )
@@ -1467,7 +1492,8 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
       <NarrowRoster />
     </div>
   ) : (
-    <div ref={containerRef} className="w-full flex-1 overflow-hidden min-h-0 flex items-center justify-center">
+    <div ref={containerRef} className="w-full flex-1 overflow-hidden min-h-0 flex items-center justify-center" style={{ position: 'relative' }}>
+      {mawEmptyNotice}
       {svgElement}
     </div>
   )

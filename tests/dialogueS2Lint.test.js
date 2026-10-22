@@ -251,10 +251,13 @@ describe('AC-O2 scope asymmetry — licensed status echo pools are exempt from l
   })
 })
 
-// ─── AC-S2a: 8-role → archetype map ───────────────────────────────────────────
+// ─── AC-S2a: role → archetype map ────────────────────────────────────────────
+// agentcortex 8 roles + the four MAW base roles (maw-mode style templates; the
+// dynamic `key~role` members strip to these via extractBaseRole).
 
-describe('AC-S2a — ROLE_ARCHETYPE: 8 VALID_ROLES each map to one of 5 archetypes', () => {
+describe('AC-S2a — ROLE_ARCHETYPE: 8 VALID_ROLES + 4 MAW base roles each map to one of 5 archetypes', () => {
   const VALID_ROLES = ['pm', 'arch', 'dev', 'qa', 'ops', 'res', 'gate', 'designer']
+  const MAW_BASE_ROLES = ['manager', 'decision-maker', 'executor', 'reviewer']
 
   it('every VALID_ROLE has an archetype entry', () => {
     for (const role of VALID_ROLES) {
@@ -275,8 +278,14 @@ describe('AC-S2a — ROLE_ARCHETYPE: 8 VALID_ROLES each map to one of 5 archetyp
     }
   })
 
-  it('exactly 8 roles in the map (same as VALID_ROLES set size)', () => {
-    expect(Object.keys(ROLE_ARCHETYPE)).toHaveLength(8)
+  it('every MAW base role has an archetype entry', () => {
+    for (const role of MAW_BASE_ROLES) {
+      expect(ROLE_ARCHETYPE, `missing maw role: ${role}`).toHaveProperty(role)
+    }
+  })
+
+  it('exactly 12 roles in the map (8 VALID_ROLES + 4 MAW base roles)', () => {
+    expect(Object.keys(ROLE_ARCHETYPE)).toHaveLength(12)
   })
 
   it('Sprinter = dev + ops', () => {

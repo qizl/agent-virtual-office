@@ -347,6 +347,11 @@ const ROLE_BEHAVIOR_OVERRIDES = Object.freeze({
   worker:   {},  // generalist like dev
   checker:  { [FAMILIES.EXECUTE]: 'magnifier',  [FAMILIES.READ]:   'magnifier',   [FAMILIES.SEARCH]: 'magnifier' },
   dev:      {},  // generalist baseline
+  // MAW base roles (maw mode; dynamic members are <key>~<base-role>)
+  manager:        { [FAMILIES.CREATE]: 'gantt-chart', [FAMILIES.UPDATE]: 'gantt-chart' },
+  'decision-maker': { [FAMILIES.CREATE]: 'whiteboard', [FAMILIES.UPDATE]: 'whiteboard' },
+  executor:       {},  // generalist like dev
+  reviewer:       { [FAMILIES.EXECUTE]: 'magnifier',  [FAMILIES.READ]:   'magnifier',   [FAMILIES.SEARCH]: 'magnifier' },
 })
 
 // Workflow → family → animation. Keys here may include or omit the leading `/`
@@ -375,6 +380,10 @@ const ROLE_FAMILIES = Object.freeze({
   planner:  'orchestrator',
   worker:   'builder',
   checker:  'verifier',
+  manager:  'orchestrator',
+  'decision-maker': 'orchestrator',
+  executor: 'builder',
+  reviewer: 'verifier',
 })
 
 // Extract the BASE role from a possibly-composite agentId like `slug~role`.

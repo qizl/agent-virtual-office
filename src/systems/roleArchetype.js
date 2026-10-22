@@ -21,6 +21,10 @@ export const ROLE_ARCHETYPE = {
   res:      'Sage',
   pm:       'Coordinator',
   designer: 'Aesthete',
+  manager:  'Coordinator',
+  'decision-maker': 'Sage',
+  executor: 'Sprinter',
+  reviewer: 'Skeptic',
 }
 
 export const ARCHETYPES = ['Sprinter', 'Skeptic', 'Sage', 'Coordinator', 'Aesthete']
