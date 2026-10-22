@@ -122,6 +122,7 @@ function jitter(pos, amount = 20) {
 // event was still "available" to the second event's picker.
 export function isAgentAvailable(id, agents, externalStatus) {
   const es = (externalStatus || {})[id]
+  if (agents[id]?.mawMember) return false // MAW members never join organic theater
   return (!es || es.status === 'done' || es.status === 'idle') && !agents[id]?.inGroupEvent
 }
 

@@ -1339,6 +1339,13 @@ function AgentCharacter({ agent }) {
       // effect, not a per-agent rate). Read-only; keeping an agent at its desk is honest + R1-safe.
       const outTripCount = Object.values(store.agents).filter((a) => a && a.journeyTarget).length
       const next = getNextBehavior(id, agent.status || 'idle', new Date().getHours(), store.mood || 'normal', teamPulse, outTripCount)
+      if (agent.mawMember) {
+        // Snapshot-owned member (multi-agent-workflow-office-animation §1.1.5): never
+        // retarget the animation, never speak ambient dialogue. Keep the timing loop.
+        next.behaviorId = agent.behavior
+        next.expression = agent.expression
+        next.bubble = null
+      }
       // Guard the re-schedule delay: a non-finite or non-positive duration would make
       // setTimeout(doSchedule, nextDelay) fire on the next tick, spinning the behavior
       // chain in a tight CPU loop. Fall back to the 8s default if the value is unusable.
