@@ -43,6 +43,16 @@ function m(key, role, status, label, extra = {}) {
 // pass → evaluate → shutdown → completed → (loop).
 const BEATS = [
   {
+    workflow: null,
+    members: [
+      m(M.mgr, 'manager', 'idle', null),
+      m(M.dm, 'decision-maker', 'idle', null),
+      m(M.exe1, 'executor', 'idle', null),
+      m(M.exe2, 'executor', 'idle', null),
+      m(M.rev, 'reviewer', 'idle', null),
+    ],
+  },
+  {
     workflow: 'MAW 执行与审核流程 · team',
     members: [
       m(M.mgr, 'manager', 'working', '晨会 · 团队就绪'),

@@ -7,12 +7,14 @@
 // neutralized by comparing the server epoch before applying.
 
 import { detectProjectMode } from '../systems/platformDetect'
+import { startMawChoreography } from '../systems/mawChoreography.js'
 
 const POLL_INTERVAL_MS = 2000
 const SSE_RETRY_MS = 30_000
 
 export function startMawIntegration(store) {
   let torn = false
+  const choreographyCleanup = startMawChoreography(store)
   let source = null // 'sse' | 'poll'
   let eventSource = null
   let pollTimer = null
@@ -88,6 +90,7 @@ export function startMawIntegration(store) {
 
   return function cleanup() {
     torn = true
+    choreographyCleanup()
     teardownSource()
     teardownPoll()
     if (retryTimer) clearTimeout(retryTimer)

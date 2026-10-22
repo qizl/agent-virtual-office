@@ -594,7 +594,7 @@ function routeWithinMainOffice(from, to) {
 }
 
 // Convex floor rect per zone — matches FLOOR_ZONES' room rects (not the door passages).
-const ZONE_FLOOR_RECTS = {
+export const ZONE_FLOOR_RECTS = {
   entrance:    { x1: 15,  y1: 15,  x2: 593, y2: 133 },
   mainOffice:  { x1: 15,  y1: 168, x2: 593, y2: 394 },
   meetingRoom: { x1: 628, y1: 15,  x2: 785, y2: 413 },

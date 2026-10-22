@@ -654,14 +654,23 @@ function applyMawSnapshotImpl(s, envelope) {
   for (const [agentId, { member, seat }] of desired) {
     const existing = agents[agentId]
     if (existing) {
-      // Preserve live motion state; refresh only the projected facts.
+      // Preserve live motion state; refresh only the projected facts. While the
+      // choreography owns a walk (inGroupEvent) its behavior/expression/bubble are
+      // authoritative — a snapshot refresh must not reset the transit animation
+      // (mawChoreography restores the status animation on arrival).
+      const preserved = existing.inGroupEvent
+        ? { behavior: existing.behavior, expression: existing.expression, bubble: existing.bubble }
+        : {}
       agents[agentId] = {
         ...buildMawMember(member, seat),
+        ...preserved,
         position: existing.position,
         targetPosition: existing.targetPosition,
         isMoving: existing.isMoving,
         facing: existing.facing,
         journeyTarget: existing.journeyTarget,
+        inGroupEvent: existing.inGroupEvent,
+        groupTarget: existing.groupTarget,
       }
     } else {
       agents[agentId] = buildMawMember(member, seat)
