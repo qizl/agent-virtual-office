@@ -73,15 +73,20 @@ def log(message: str) -> None:
 
 def safe_resolve(root: Path, relative: str) -> Path:
     """Resolve `relative` under `root`, refusing absolute paths, traversal and
-    non-regular files. Symlinks are rejected: the watched tree is plain files."""
+    non-regular files. Symlinks are rejected per component BEFORE resolving:
+    checking after resolve() would inspect the link TARGET (a real file) and let
+    a link pointing anywhere inside the project bypass the read boundary."""
     if os.path.isabs(relative):
         raise BridgeError("path-outside-root", f"absolute runtime reference rejected: {relative}", EXIT_REFUSED)
-    candidate = (root / relative).resolve()
     root_resolved = root.resolve()
+    current = root_resolved
+    for part in Path(relative).parts:
+        current = current / part
+        if current.is_symlink():
+            raise BridgeError("unsafe-file-type", f"symlink in runtime rejected: {relative}", EXIT_REFUSED)
+    candidate = current.resolve()
     if candidate != root_resolved and root_resolved not in candidate.parents:
         raise BridgeError("path-outside-root", f"runtime reference escapes the project root: {relative}", EXIT_REFUSED)
-    if candidate.is_symlink():
-        raise BridgeError("unsafe-file-type", f"symlink in runtime rejected: {relative}", EXIT_REFUSED)
     if candidate.exists() and not (candidate.is_file() or candidate.is_dir()):
         raise BridgeError("unsafe-file-type", f"non-regular file in runtime: {relative}", EXIT_REFUSED)
     return candidate
@@ -564,7 +569,11 @@ def read_with_consistency(project_root: Path, task_id: str, stall_minutes: int) 
 
 def assert_loopback(url: str) -> tuple[str, str]:
     """Parse and resolve the office URL; only loopback origins are accepted.
-    Returns (base_url, host). Proxies and redirects are never followed."""
+    Returns (base_url, host). base_url is bound to a VALIDATED literal address —
+    requests must never re-resolve the hostname, or DNS rebinding could retarget
+    the connection (and the OFFICE_API_TOKEN) after validation. `host` is the
+    original hostname, echoed back as the Host header. Proxies and redirects are
+    never followed."""
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https") or parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise BridgeError("host-not-allowed", f"office url must be a bare http(s) origin: {url}", EXIT_REFUSED)
@@ -576,6 +585,7 @@ def assert_loopback(url: str) -> tuple[str, str]:
         infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
     except socket.gaierror:
         raise BridgeError("host-not-allowed", f"office host does not resolve: {host}", EXIT_REFUSED)
+    literal = None
     for info in infos:
         address = info[4][0]
         try:
@@ -583,7 +593,18 @@ def assert_loopback(url: str) -> tuple[str, str]:
                 raise BridgeError("host-not-allowed", f"office host must be loopback, got {address}", EXIT_REFUSED)
         except ValueError:
             raise BridgeError("host-not-allowed", f"unparseable office address {address}", EXIT_REFUSED)
-    return f"{parsed.scheme}://{host}:{parsed.port}" if parsed.port else f"{parsed.scheme}://{host}", host
+        literal = literal or address
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    host_for_uri = f"[{literal}]" if ":" in literal else literal
+    return f"{parsed.scheme}://{host_for_uri}:{port}", host
+
+
+def host_header_for(host: str, port: int, scheme: str) -> str:
+    """Host header matching the ORIGINAL origin (brackets preserved for IPv6);
+    the port is omitted only when it is the scheme's default."""
+    host_part = f"[{host}]" if ":" in host else host
+    default = 443 if scheme == "https" else 80
+    return host_part if port == default else f"{host_part}:{port}"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -591,17 +612,24 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise BridgeError("host-not-allowed", "redirects are disabled", EXIT_REFUSED)
 
 
-def post_snapshot(base_url: str, payload: dict, token: str | None):
+def post_snapshot(base_url: str, payload: dict, token: str | None, host_header: str | None = None):
     """Single POST. Returns the parsed ACK dict. Network/429/5xx raise
-    TransportRetry; 4xx protocol failures raise BridgeError."""
+    TransportRetry; 4xx protocol failures raise BridgeError. The connection goes
+    to the validated literal address in base_url; `host_header` keeps the original
+    origin visible to the server's Host allowlist. Proxies are always disabled —
+    env proxy config must not redirect the snapshot (or the token)."""
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         f"{base_url}/api/maw/status",
         data=data,
         method="POST",
-        headers={"Content-Type": "application/json", **({"X-Office-Token": token} if token else {})},
+        headers={
+            "Content-Type": "application/json",
+            **({"Host": host_header} if host_header else {}),
+            **({"X-Office-Token": token} if token else {}),
+        },
     )
-    opener = urllib.request.build_opener(NoRedirect) if not os.environ.get("OFFICE_MAW_ALLOW_PROXY") else urllib.request.build_opener()
+    opener = urllib.request.build_opener(NoRedirect, urllib.request.ProxyHandler({}))
     try:
         with opener.open(request, timeout=HTTP_TIMEOUT_S) as response:
             return json.loads(response.read().decode("utf-8"))
@@ -661,7 +689,9 @@ def run(args) -> int:
         raise BridgeError("invalid-argument", "--refresh-seconds must be 1..60", EXIT_USAGE)
     if args.idle_timeout_minutes < 0:
         raise BridgeError("invalid-argument", "--idle-timeout-minutes must be >= 0", EXIT_USAGE)
-    base_url, _host = assert_loopback(args.office_url)
+    base_url, office_host = assert_loopback(args.office_url)
+    _parsed = urllib.parse.urlparse(args.office_url)
+    office_host_header = host_header_for(office_host, _parsed.port or (443 if _parsed.scheme == "https" else 80), _parsed.scheme)
     token = os.environ.get("OFFICE_API_TOKEN", "").strip() or None
 
     project_root = pick_project(args)
@@ -697,7 +727,7 @@ def run(args) -> int:
             if delay:
                 time.sleep(delay)
             try:
-                ack = post_snapshot(base_url, payload, token)
+                ack = post_snapshot(base_url, payload, token, host_header=office_host_header)
                 break
             except TransportRetry as error:
                 log(f"transport retry {attempt + 1}/3: {error}")

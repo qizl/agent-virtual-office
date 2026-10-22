@@ -109,8 +109,19 @@ class PathSafetyTest(unittest.TestCase):
         os.symlink(real, link)
         with self.assertRaises(maw_office.BridgeError) as ctx:
             maw_office.read_runtime_state(root, "maw-synth-002")
-        # The symlink resolves outside the watched root — refused either way.
-        self.assertEqual(ctx.exception.code, "path-outside-root")
+        # Symlinks are rejected per component BEFORE resolving — wherever they point.
+        self.assertEqual(ctx.exception.code, "unsafe-file-type")
+
+    def test_intra_root_symlink_is_rejected_too(self):
+        # A link to a task dir INSIDE the project used to pass the containment
+        # check (resolve() followed it first); the per-component check refuses it.
+        root = fixtures.build_runtime(fixtures.uuid_tmp())
+        real = root / RUNTIME_REL / "maw-synth-001"
+        link = root / RUNTIME_REL / "maw-synth-003"
+        os.symlink(real, link)
+        with self.assertRaises(maw_office.BridgeError) as ctx:
+            maw_office.read_runtime_state(root, "maw-synth-003")
+        self.assertEqual(ctx.exception.code, "unsafe-file-type")
 
     def test_absolute_plan_ref_is_refused(self):
         root = fixtures.build_runtime(fixtures.uuid_tmp())
