@@ -81,6 +81,16 @@ describe('maw choreography planning', () => {
     expect(behaviorFor(member('m', 'executor', 'idle'))).toBe('idle')
   })
 
+  it('delivering members return immediately; group entry stays staggered', () => {
+    const prevPhase = {}
+    const members = [member('e1xxxx', 'executor', 'awaiting-approval'), member('r1xxxx', 'reviewer', 'working')]
+    const actions = planChoreography({ prevPhase, members })
+    const deliver = actions.find((a) => a.id === 'e1xxxx')
+    expect(deliver.staggerMs).toBe(0)
+    expect(deliver.kind).toBe('deliver')
+    expect(inRect(deliver.target, MAIN)).toBe(true)
+  })
+
   it('plans staggered enter walks from rest to task, then rest walks back', () => {
     const prevPhase = {}
     const members = [member('e1xxxx', 'executor', 'working'), member('r1xxxx', 'reviewer', 'working'), member('m1xxxx', 'manager', 'working')]

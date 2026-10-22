@@ -114,13 +114,16 @@ export function planChoreography({ prevPhase, members, workSeatsTaken }) {
     if (phase === previous) continue
     if (phase === 'task') {
       const seat = workSeatFor(member.role, roleCount + (workSeatsTaken?.[member.role] || 0))
+      // Delivering members (awaiting-approval) return IMMEDIATELY and wait at the
+      // work seat for the manager's handover; planning/working enter staggered.
+      const immediate = member.status === 'awaiting-approval'
       actions.push({
         id: member.id,
         agentId: `${member.id}~${member.role}`,
         target: seat,
         behavior: 'idle', // transit; restored to the status animation on arrival
-        staggerMs: staggerIndex * STAGGER_MS,
-        kind: previous === undefined ? 'enter' : 'enter',
+        staggerMs: immediate ? 0 : staggerIndex * STAGGER_MS,
+        kind: immediate ? 'deliver' : 'enter',
       })
     } else {
       const { seat } = restSeatFor(member.id)
@@ -212,18 +215,32 @@ export function startMawChoreography(store) {
     const s = store.getState()
     const managerId = Object.keys(s.agents).find((k) => k.endsWith('~manager'))
     if (!managerId) { handoverQueue.length = 0; return }
-    const memberAgent = handoverQueue.shift()
-    if (!memberAgent || !s.agents[memberAgent.id]) return later(processHandoverQueue, 200)
+    const item = handoverQueue.shift()
+    if (!item) return
     managerBusy = true
-    const at = { x: memberAgent.position?.x ?? MANAGER_GATE.x, y: memberAgent.position?.y ?? MANAGER_GATE.y }
-    walk(managerId, at, { behavior: 'chat', expression: 'normal', bubble: `任务交接 · ${memberAgent.label || memberAgent.maw?.role || ''}` })
-    arriveThen(managerId, HANDOVER_DWELL_MS, () => {
-      walk(managerId, MANAGER_GATE, { behavior: 'gantt-chart', expression: 'normal', bubble: null })
-      arriveThen(managerId, 0, () => {
-        managerBusy = false
-        processHandoverQueue()
+    const memberAgent = s.agents[item.id]
+    // The member walks straight back to the work seat and waits there; the
+    // manager departs once the member has settled at the seat.
+    const at = item.workSeat || (memberAgent ? { x: memberAgent.position?.x ?? MANAGER_GATE.x, y: memberAgent.position?.y ?? MANAGER_GATE.y } : null)
+    if (!at) { managerBusy = false; return later(processHandoverQueue, 200) }
+    const proceed = () => {
+      const current = store.getState()
+      const manager = current.agents[managerId]
+      if (!manager || manager.status !== 'working') { managerBusy = false; return }
+      walk(managerId, at, { behavior: 'chat', expression: 'normal', bubble: `任务交接 · ${item.label || ''}` })
+      arriveThen(managerId, HANDOVER_DWELL_MS, () => {
+        walk(managerId, MANAGER_GATE, { behavior: 'gantt-chart', expression: 'normal', bubble: null })
+        arriveThen(managerId, 0, () => {
+          managerBusy = false
+          processHandoverQueue()
+        })
       })
-    })
+    }
+    if (memberAgent && (memberAgent.isMoving || memberAgent.journeyTarget)) {
+      arriveThen(item.id, 0, proceed) // wait for the member to settle at the seat
+    } else {
+      proceed()
+    }
   }
 
   function restoreWorkAnimationIfIdleAtGate(managerId) {
@@ -237,17 +254,20 @@ export function startMawChoreography(store) {
     if (torn) return
     const s = store.getState()
     if (s.mode !== 'maw') return
-    const candidates = Object.values(s.agents).filter((a) => a?.mawMember && a.maw?.role !== 'manager' && a.status === 'working')
+    const candidates = Object.values(s.agents).filter((a) => a?.mawMember && a.maw?.role !== 'manager' && (a.status === 'working' || a.status === 'idle' || a.status === 'done'))
     const pick = candidates[Math.floor(Math.random() * candidates.length)]
     if (!pick) return
     const point = wanderPoint()
     if (!point) return
-    const workSeat = { ...pick.position }
+    const returnSeat = { ...pick.position }
     walk(pick.id, point, { behavior: 'idle', expression: 'normal', bubble: null })
     arriveThen(pick.id, 6000 + Math.random() * 6000, () => {
       const current = store.getState().agents[pick.id]
-      if (!current || current.status !== 'working') return
-      walk(pick.id, workSeat, { behavior: MAW_ROLE_WORK_BEHAVIOR[current.maw?.role] || 'typing', expression: 'normal', bubble: null })
+      if (!current || current.status !== pick.status) return
+      const back = pick.status === 'working'
+        ? { behavior: MAW_ROLE_WORK_BEHAVIOR[current.maw?.role] || 'typing', expression: 'normal', bubble: null }
+        : { behavior: 'idle', expression: current.status === 'done' ? 'happy' : 'normal', bubble: null }
+      walk(pick.id, returnSeat, back)
     })
   }
 
@@ -284,10 +304,12 @@ export function startMawChoreography(store) {
           if (phaseOf(other.status) === 'task') taken[other.maw?.role] = (taken[other.maw?.role] || 0) + 1
         }
         const seat = workSeatFor(member.maw?.role, taken[member.maw?.role] || 0)
+        // Delivering members hurry back to the work seat and wait for the manager.
+        const delay = member.status === 'awaiting-approval' ? 0 : staggerCount() * STAGGER_MS
         later(() => {
           walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null })
           arriveThen(agentId, 0, () => restoreWorkAnimation(member.id))
-        }, staggerCount() * STAGGER_MS)
+        }, delay)
         bumpStagger()
       } else {
         let seat = restSeatByMember.get(member.id)
@@ -330,7 +352,16 @@ export function startMawChoreography(store) {
       const key = `${member.id}:handover`
       if (member.status === 'awaiting-approval' && prevHandover.get(key) !== true) {
         prevHandover.set(key, true)
-        handoverQueue.push({ id: member.id, position: { ...(member.position || MANAGER_GATE) }, label: member.label })
+        const taken = {}
+        for (const other of members) {
+          if (other.id === member.id) continue
+          if (phaseOf(other.status) === 'task') taken[other.maw?.role] = (taken[other.maw?.role] || 0) + 1
+        }
+        handoverQueue.push({
+          id: member.id,
+          workSeat: workSeatFor(member.maw?.role, taken[member.maw?.role] || 0),
+          label: member.label,
+        })
         processHandoverQueue()
       } else if (member.status !== 'awaiting-approval' && prevHandover.get(key) === true) {
         prevHandover.set(key, false)
