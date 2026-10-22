@@ -633,9 +633,12 @@ const server = http.createServer((req, res) => {
   const url = safeParseUrl(req.url)
   if (!url) { res.statusCode = 400; return res.end('Bad Request') }
   // Isolated MAW snapshot channel — mount-shaped for the connect-style middleware.
+  // The 404 `next` is mandatory: the middleware's unknown-path branch calls next(),
+  // and this raw http.createServer stack has no follow-up handler — without it an
+  // unauthenticated GET /api/maw/<unknown> would throw and kill the process.
   if (url.pathname.startsWith('/api/maw/')) {
     req.url = url.pathname.slice('/api/maw'.length) + (url.search || '')
-    return mawChannel.middleware(req, res)
+    return mawChannel.middleware(req, res, () => { res.statusCode = 404; res.end('Not Found') })
   }
   if (url.pathname === '/api/status') return handleStatus(req, res)
   if (url.pathname === '/api/status/stream') {
@@ -833,6 +836,9 @@ function gracefulShutdown(signal) {
   // (SSE responses are never-ending — without this, close() hangs until the 10s hard-exit)
   for (const c of [...sseClients]) { try { c.end() } catch {} }
   sseClients.clear()
+  // MAW SSE streams live in the channel's own client set — same never-ending
+  // response problem; ending them here (not on 'exit') breaks the wait cycle.
+  mawChannel.stop()
 
   server.close((err) => {
     if (err) { console.error('  Server close error:', err.message); process.exit(1) }

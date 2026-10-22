@@ -69,13 +69,17 @@ export function createMawStatus({
   sseClientLimit = 50,
   now = () => Date.now(),
 } = {}) {
-  let epoch = 1
+  // Boot-unique (wall-clock ms): a client that saw epoch N from a previous server
+  // lifetime must never accept a replayed GET as current — epoch 1 would collide
+  // with the old server's early envelopes (plan §4.1.2 freshness rules).
+  let epoch = Date.now()
   let serverSeq = 0
   let snapshot = null // validated members + meta, or null = no-data
   let producer = null // { id, lastSeq, lastContentSha, startedAt, touchedAt }
   let lastConsumptionAt = null
   const sseClients = new Set()
   let heartbeat = null
+  let staleTimer = null
 
   function touchConsumption() {
     lastConsumptionAt = now()
@@ -116,7 +120,7 @@ export function createMawStatus({
     return {
       server_epoch: epoch,
       seq: serverSeq,
-      snapshot,
+      snapshot: effectiveSnapshot(),
       server_time: now(),
       consumer_count: sseClients.size,
     }
@@ -127,6 +131,32 @@ export function createMawStatus({
     producer = null
     epoch += 1
     serverSeq += 1
+    if (staleTimer) { clearTimeout(staleTimer); staleTimer = null }
+  }
+
+  // The last accepted submission stays authoritative for MAW_LEASE_TTL_MS; after
+  // that the channel itself publishes quality=stale (plan: "120 秒无有效新提交则
+  // 服务端发布 stale"). Derived, not destructive — a fresh POST restores quality.
+  function effectiveSnapshot() {
+    if (snapshot === null || leaseActive()) return snapshot
+    return {
+      ...snapshot,
+      quality: 'stale',
+      quality_detail: snapshot.quality_detail ?? 'producer-lease-expired',
+    }
+  }
+
+  // SSE clients have no poll loop — schedule one broadcast at lease expiry so the
+  // staleness transition actually reaches them (a live SSE stream proves nothing
+  // about producer liveness).
+  function scheduleStaleBroadcast() {
+    if (staleTimer) clearTimeout(staleTimer)
+    if (snapshot === null) return
+    staleTimer = setTimeout(() => {
+      staleTimer = null
+      if (snapshot !== null && !leaseActive()) broadcast()
+    }, MAW_LEASE_TTL_MS + 50)
+    if (typeof staleTimer.unref === 'function') staleTimer.unref()
   }
 
   function validateMember(raw, index) {
@@ -217,11 +247,23 @@ export function createMawStatus({
     return typeof provided === 'string' && constantTimeEqual(provided, token)
   }
 
+  // Bracketed IPv6 (`[::1]:5173`) contains inner colons — only split on the LAST
+  // colon, and only outside brackets.
+  function hostnameFromHostHeader(host) {
+    const value = String(host).toLowerCase()
+    if (value.startsWith('[')) {
+      const end = value.indexOf(']')
+      return end === -1 ? value : value.slice(0, end + 1)
+    }
+    return value.split(':')[0]
+  }
+
   function hostAllowed(req) {
     const host = req.headers.host
     if (!host) return true
-    const hostname = host.split(':')[0].toLowerCase()
-    return LOOPBACK_HOSTNAMES.has(hostname) || LOOPBACK_HOSTNAMES.has(host.toLowerCase()) || authorized(req)
+    const hostname = hostnameFromHostHeader(host)
+    const bare = hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname
+    return LOOPBACK_HOSTNAMES.has(hostname) || LOOPBACK_HOSTNAMES.has(bare) || authorized(req)
   }
 
   function originAllowed(req) {
@@ -263,7 +305,18 @@ export function createMawStatus({
         const status = problem.startsWith('member-limit') ? 400 : 400
         return fail(res, status, problem.startsWith('member-limit') ? 'member-limit' : 'invalid-snapshot', problem)
       }
-      const contentSha = sha256(JSON.stringify(body.members) + `\u0000${body.sampled_at}`)
+      // Bind the idempotency digest to the FULL snapshot content: a replayed seq
+      // with a changed workflow/quality/terminal is a conflict, not a duplicate.
+      const contentSha = sha256(JSON.stringify([
+        body.schema,
+        body.workflow ?? null,
+        body.quality,
+        body.quality_detail ?? null,
+        body.terminal ?? null,
+        body.sampled_at,
+        body.seq,
+        body.members,
+      ]))
       if (producer !== null && leaseActive() && producer.id !== body.producer) {
         return fail(res, 409, 'producer-conflict', 'Another producer holds the active lease')
       }
@@ -310,6 +363,7 @@ export function createMawStatus({
         })),
       }
       broadcast()
+      scheduleStaleBroadcast()
       return ack(res, { duplicate: false, producer_seq: body.seq })
     })
   }
@@ -319,6 +373,9 @@ export function createMawStatus({
     readBody(req, res, (raw) => {
       let body = {}
       try { body = raw ? JSON.parse(raw) : {} } catch { return fail(res, 400, 'invalid-snapshot', 'Body is not valid JSON') }
+      if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+        return fail(res, 400, 'invalid-snapshot', 'DELETE body must be a JSON object when provided')
+      }
       if (producer !== null && leaseActive() && body.producer !== producer.id) {
         return fail(res, 409, 'producer-conflict', 'Another producer holds the active lease')
       }
@@ -353,10 +410,15 @@ export function createMawStatus({
   /**
    * Connect-style middleware. Mount with `app.use('/api/maw', maw.middleware())` —
    * connect strips the mount prefix, so req.url is '/status', '/status/stream'.
+   * A missing `next` (plain http.createServer mount, no connect stack) degrades to
+   * a 404 instead of throwing — an unknown path must never crash the process.
    */
   function middleware(req, res, next) {
     const pathname = (req.url || '/').split('?')[0]
-    if (pathname !== '/status' && pathname !== '/status/stream') { next(); return }
+    if (pathname !== '/status' && pathname !== '/status/stream') {
+      if (typeof next === 'function') { next(); return }
+      return fail(res, 404, 'not-found', 'Unknown MAW path')
+    }
     if (!hostAllowed(req)) return fail(res, 403, 'host-not-allowed', 'Host not allowed')
 
     if (pathname === '/status/stream' && req.method === 'GET') return handleStream(req, res)
@@ -366,7 +428,7 @@ export function createMawStatus({
         touchConsumption()
         res.setHeader('Content-Type', 'application/json')
         res.setHeader('Cache-Control', 'no-store')
-        return res.end(JSON.stringify({ ok: true, ...envelope(), snapshot: snapshot }))
+        return res.end(JSON.stringify({ ok: true, ...envelope() }))
       }
       if (req.method === 'POST') return handlePost(req, res)
       if (req.method === 'DELETE') return handleDelete(req, res)
@@ -392,6 +454,7 @@ export function createMawStatus({
 
   function stop() {
     if (heartbeat) { clearInterval(heartbeat); heartbeat = null }
+    if (staleTimer) { clearTimeout(staleTimer); staleTimer = null }
     for (const client of [...sseClients]) { try { client.end() } catch { /* already gone */ } }
     sseClients.clear()
   }

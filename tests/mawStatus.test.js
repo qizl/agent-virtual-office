@@ -5,18 +5,20 @@ import { createMawStatus, MAW_MEMBER_LIMIT, MAW_MAX_BODY_BYTES } from '../src/se
 // Drive the connect-style middleware through a real HTTP server so POST/GET/SSE
 // semantics (lease, epoch/seq, consumer idle) are exercised end to end.
 
-function startServer(maw) {
+function startServer(maw, host = '127.0.0.1') {
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       const pathname = (req.url || '/').split('?')[0]
       if (pathname.startsWith('/api/maw/')) {
         req.url = pathname.slice('/api/maw'.length)
+        // Deliberately NO next — the raw-http mount shape; unknown paths must
+        // 404 from the middleware guard itself, never throw.
         return maw.middleware(req, res)
       }
       res.statusCode = 404
       res.end()
     })
-    server.listen(0, '127.0.0.1', () => resolve({ server, base: `http://127.0.0.1:${server.address().port}` }))
+    server.listen(0, host, () => resolve({ server, base: `http://${host === '::1' ? '[::1]' : host}:${server.address().port}` }))
   })
 }
 
@@ -56,13 +58,16 @@ afterEach(async () => {
 })
 
 describe('MAW snapshot transport', () => {
-  it('GET with no data returns ok with a null snapshot and epoch 1', async () => {
+  it('GET with no data returns ok with a null snapshot and a boot-unique epoch', async () => {
     const { base } = await makeChannel()
     const res = await fetch(`${base}/api/maw/status`)
     const body = await res.json()
     expect(res.status).toBe(200)
     expect(body.ok).toBe(true)
-    expect(body.server_epoch).toBe(1)
+    // Boot-unique (wall-clock ms), never 1: a client that saw a previous server
+    // lifetime's epoch must not confuse a replayed GET with current state.
+    expect(Number.isInteger(body.server_epoch)).toBe(true)
+    expect(body.server_epoch).toBeGreaterThan(0)
     expect(body.snapshot).toBeNull()
   })
 
@@ -80,7 +85,7 @@ describe('MAW snapshot transport', () => {
     expect(body.snapshot.members).toHaveLength(4)
     expect(body.snapshot.members.map((m) => m.id)).toEqual(['task01x', 'task02y', 'task03z', 'task04w'])
     expect(body.snapshot.workflow).toBe('MAW 执行与审核流程 · evaluate')
-    expect(body.server_epoch).toBe(1)
+    expect(body.server_epoch).toBe(ack.server_epoch)
   })
 
   it('same seq + same content is an idempotent duplicate; same seq + new content is a 409', async () => {
@@ -176,12 +181,13 @@ describe('MAW snapshot transport', () => {
   it('DELETE by the lease holder clears to no-data and bumps the epoch', async () => {
     const { base } = await makeChannel()
     await fetch(`${base}/api/maw/status`, { method: 'POST', body: JSON.stringify(snapshot()) })
+    const before = (await (await fetch(`${base}/api/maw/status`)).json()).server_epoch
     const del = await fetch(`${base}/api/maw/status`, { method: 'DELETE', body: JSON.stringify({ producer: 'producer-aaaa' }) })
     expect(del.status).toBe(200)
     const get = await fetch(`${base}/api/maw/status`)
     const body = await get.json()
     expect(body.snapshot).toBeNull()
-    expect(body.server_epoch).toBe(2)
+    expect(body.server_epoch).toBe(before + 1)
 
     const other = await fetch(`${base}/api/maw/status`, { method: 'DELETE', body: JSON.stringify({ producer: 'someone-else' }) })
     expect(other.status).toBe(200) // no active lease after release — harmless
@@ -211,7 +217,7 @@ describe('MAW snapshot transport', () => {
     const dataLine = chunk.split('\n').find((l) => l.startsWith('data: '))
     const envelope = JSON.parse(dataLine.slice(6))
     expect(envelope.snapshot.members).toHaveLength(4)
-    expect(envelope.server_epoch).toBe(1)
+    expect(envelope.server_epoch).toBeGreaterThan(0)
     events.push(envelope)
 
     // An SSE connection counts as a live consumer.
@@ -231,5 +237,70 @@ describe('MAW snapshot transport', () => {
     expect(later.consumer_idle_ms).toBeGreaterThanOrEqual(30 * 60 * 1000)
     expect(later.idle_timeout_reached).toBe(true)
     expect(maw.stats().hasSnapshot).toBe(true) // the server reports; the bridge decides to stop
+  })
+})
+
+describe('MAW transport hardening (review 2026-10-22)', () => {
+  it('an unknown /api/maw path 404s instead of crashing the process', async () => {
+    const { base } = await makeChannel()
+    const res = await fetch(`${base}/api/maw/unknown`)
+    expect(res.status).toBe(404)
+    expect((await res.json()).error.code).toBe('not-found')
+    // the channel still serves after the rejected probe
+    const ok = await fetch(`${base}/api/maw/status`)
+    expect(ok.status).toBe(200)
+  })
+
+  it('a lease-expired snapshot is served as derived stale; a fresh POST restores quality', async () => {
+    const { base } = await makeChannel()
+    await fetch(`${base}/api/maw/status`, { method: 'POST', body: JSON.stringify(snapshot()) })
+    clock += 121_000 // beyond MAW_LEASE_TTL_MS
+    const stale = await (await fetch(`${base}/api/maw/status`)).json()
+    expect(stale.snapshot.quality).toBe('stale')
+    expect(stale.snapshot.quality_detail).toBe('producer-lease-expired')
+    expect(stale.snapshot.members).toHaveLength(4) // last valid content is preserved, not cleared
+
+    const fresh = snapshot({ seq: 2, sampled_at: 2000 }) // same producer, seq advanced — resumes after expiry
+    const ack = await (await fetch(`${base}/api/maw/status`, { method: 'POST', body: JSON.stringify(fresh) })).json()
+    expect(ack.ok).toBe(true)
+    const good = await (await fetch(`${base}/api/maw/status`)).json()
+    expect(good.snapshot.quality).toBe('ok')
+  })
+
+  it('the idempotent duplicate digest binds the full snapshot, not just members', async () => {
+    const { base } = await makeChannel()
+    await fetch(`${base}/api/maw/status`, { method: 'POST', body: JSON.stringify(snapshot()) })
+    for (const drift of [
+      snapshot({ workflow: 'MAW 执行与审核流程 · review' }), // workflow changed
+      snapshot({ quality: 'degraded' }), // quality changed
+      snapshot({ terminal: 'completed' }), // terminal changed
+    ]) {
+      const res = await fetch(`${base}/api/maw/status`, { method: 'POST', body: JSON.stringify(drift) })
+      expect(res.status).toBe(409)
+      expect((await res.json()).error.code).toBe('sequence-content-conflict')
+    }
+  })
+
+  it('malformed DELETE bodies are explicit 400s, not crashes', async () => {
+    const { base } = await makeChannel()
+    await fetch(`${base}/api/maw/status`, { method: 'POST', body: JSON.stringify(snapshot()) }) // lease active
+    for (const body of ['null', '[1,2]', '"producer-aaaa"']) {
+      const res = await fetch(`${base}/api/maw/status`, { method: 'DELETE', body })
+      expect(res.status).toBe(400)
+      expect((await res.json()).error.code).toBe('invalid-snapshot')
+    }
+    const stillThere = await (await fetch(`${base}/api/maw/status`)).json()
+    expect(stillThere.snapshot).not.toBeNull()
+
+    const noBody = await fetch(`${base}/api/maw/status`, { method: 'DELETE' })
+    expect(noBody.status).toBe(409) // body-less DELETE cannot name the lease holder
+  })
+
+  it('a bracketed IPv6 loopback Host is accepted', async () => {
+    const maw = createMawStatus({ now: () => clock, idleTimeoutMs: 0 })
+    const { server, base } = await startServer(maw, '::1')
+    cleanup.push(() => new Promise((done) => { maw.stop(); server.close(done) }))
+    const res = await fetch(`${base}/api/maw/status`) // Host: [::1]:<port>
+    expect(res.status).toBe(200)
   })
 })
