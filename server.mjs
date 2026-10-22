@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url'
 import { execSync } from 'node:child_process'
 import { scanAndMerge, getSessionStats, resolveProjectRoot } from './src/server/scanSessions.mjs'
 import { startAntigravityWatcher } from './src/server/antigravityWatcher.mjs'
+import { createMawStatus } from './src/server/mawStatus.mjs'
 // AVO-146: replaced inline normalizePost copy with the canonical src module.
 // This also fixes the #52 divergence: the old inline copy dropped agents with
 // invalid status; the canonical src module coerces them to 'idle' instead.
@@ -605,6 +606,10 @@ function serveStatic(req, res) {
 // ─── HTTP server ──────────────────────────────────────────────────────────────
 const SERVER_START = Date.now()
 
+// Isolated MAW snapshot channel (avo.maw-snapshot/1) — memory only, never the
+// office-status file. Explicit-start bridge pushes; ?mode=maw clients consume.
+const mawChannel = createMawStatus({ token: apiToken })
+
 const server = http.createServer((req, res) => {
   // Swallow client-abort / ECONNRESET so they don't crash the process.
   req.on('error', () => {})
@@ -627,6 +632,11 @@ const server = http.createServer((req, res) => {
   // req/res 'error' listeners above do not catch a synchronous throw in the listener body.
   const url = safeParseUrl(req.url)
   if (!url) { res.statusCode = 400; return res.end('Bad Request') }
+  // Isolated MAW snapshot channel — mount-shaped for the connect-style middleware.
+  if (url.pathname.startsWith('/api/maw/')) {
+    req.url = url.pathname.slice('/api/maw'.length) + (url.search || '')
+    return mawChannel.middleware(req, res)
+  }
   if (url.pathname === '/api/status') return handleStatus(req, res)
   if (url.pathname === '/api/status/stream') {
     setCors(res, req.headers.origin, 'GET, OPTIONS')
@@ -849,6 +859,7 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
 // (PM2, taskkill, nssm kill the process without emitting SIGTERM).
 process.on('exit', () => {
   antigravityWatcher.stop()
+  mawChannel.stop()
   try { _watcherHandle?.close() } catch {}
   try { if (_watchDebounce) clearTimeout(_watchDebounce) } catch {}
 })

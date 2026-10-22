@@ -8,6 +8,7 @@ import os from 'node:os'
 import { normalizePost, nextSeq, VALID_ROLES, VALID_STATUSES } from './src/utils/statusContract.mjs'
 import { scanAndMerge, getSessionStats, resolveProjectRoot, STALE_MS } from './src/server/scanSessions.mjs'
 import { startAntigravityWatcher } from './src/server/antigravityWatcher.mjs'
+import { createMawStatus } from './src/server/mawStatus.mjs'
 import { parseAllowedHostsEnv } from './src/utils/hostAllowlist.mjs'
 
 // Middleware: Universal status API
@@ -217,12 +218,18 @@ function officeStatusPlugin() {
     name: 'office-status-api',
     closeBundle() { stopAntigravity() },
     configureServer(server) {
+      // Isolated MAW snapshot channel (avo.maw-snapshot/1) — memory only, never the
+      // office-status file. Explicit-start bridge pushes; ?mode=maw clients consume.
+      const mawChannel = createMawStatus({ token: apiConfig.token })
       const observer = startAntigravityWatcher({ projectRoot: PROJECT_ROOT, statusDir: STATUS_DIR })
       stopAntigravity = () => {
         observer.stop()
+        mawChannel.stop()
         process.off('SIGTERM', stopAntigravity)
         process.off('exit', stopAntigravity)
       }
+      server.httpServer?.once('close', () => { mawChannel.stop() })
+      server.middlewares.use('/api/maw', mawChannel.middleware)
       server.httpServer?.once('close', stopAntigravity)
       process.once('SIGTERM', stopAntigravity)
       process.once('exit', stopAntigravity)
