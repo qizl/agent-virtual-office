@@ -79,8 +79,8 @@ function seatKey(point) {
 // pushes are folded back by clampToRestZone below.
 const MEETING_OVERFLOW_SEATS = []
 const OVERFLOW_ROWS = [
-  { ys: [24, 60], xs: [634, 682, 730] },
-  { ys: [24, 60], xs: [658, 706, 754] },
+  { ys: [60, 96], xs: [634, 682, 730] },
+  { ys: [60, 96], xs: [658, 706, 754] },
   { ys: [252, 288, 324, 360, 396], xs: [634, 682, 730] },
   { ys: [252, 288, 324, 360, 396], xs: [658, 706, 754] },
 ]
@@ -157,9 +157,10 @@ const REST_AREA_RECTS = [ZONE_FLOOR_RECTS.meetingRoom, ZONE_FLOOR_RECTS.lounge, 
 /** Fold any point back into the MEETING ROOM — the bound for SEAT-RETURN walks
  * (CR-1: 归座目标必须在会议室, however crowded the room gets). */
 export function clampToMeetingZone(point) {
+  // CR-9: the fold keeps 48px of headroom so the sprite body never clips.
   return {
     x: Math.min(MEETING_RECT.x2 - 2, Math.max(MEETING_RECT.x1 + 2, point.x)),
-    y: Math.min(MEETING_RECT.y2 - 2, Math.max(MEETING_RECT.y1 + 2, point.y)),
+    y: Math.min(MEETING_RECT.y2 - 2, Math.max(48, point.y)),
   }
 }
 
@@ -175,7 +176,7 @@ export function clampToRestZone(point) {
   let bestDist = Infinity
   for (const r of REST_AREA_RECTS) {
     const cx = Math.min(r.x2 - 2, Math.max(r.x1 + 2, point.x))
-    const cy = Math.min(r.y2 - 2, Math.max(r.y1 + 2, point.y))
+    const cy = Math.min(r.y2 - 2, Math.max(48, r.y1 + 2, point.y))
     const d = (cx - point.x) ** 2 + (cy - point.y) ** 2
     if (d < bestDist) {
       bestDist = d
@@ -202,9 +203,11 @@ export function wanderPoint(rng = Math.random) {
   if (!rect) return null
   const point = clampToFloor({
     x: rect.x1 + 24 + rng() * Math.max(8, rect.x2 - rect.x1 - 48),
-    y: rect.y1 + 24 + rng() * Math.max(8, rect.y2 - rect.y1 - 48),
+    y: Math.max(48, rect.y1 + 24 + rng() * Math.max(8, rect.y2 - rect.y1 - 48)),
   })
-  return point
+  // CR-9 visibility floor: a sprite's body extends ~32px above its feet —
+  // anything closer than 48px to the top wall clips the head (owner screenshot).
+  return { x: Math.min(778, Math.max(24, point.x)), y: Math.min(500, Math.max(48, point.y)) }
 }
 
 /**
@@ -324,6 +327,7 @@ export function startMawChoreography(store) {
   const restingSince = new Map() // memberId -> start of the current resting stretch
   let lastWanderAt = 0
   const walkTokens = new Map() // agentId -> latest walk token — a superseding walk invalidates the old chain
+  const walkBounds = new Map() // agentId -> the zone bound of its CURRENT walk — timeout re-issues must keep it
   const walkTargets = new Map() // agentId -> last PUBLISHED walk target (post avoidOverlap/re-clamp) — where the walk actually goes
   let choreoEpoch = 0 // bumped when the channel degrades (stale / terminal): every pending callback dies with its generation
   let lastSeenQuality = null
@@ -346,6 +350,7 @@ export function startMawChoreography(store) {
     if (!s.agents[agentId]) return
     const token = (walkTokens.get(agentId) || 0) + 1
     walkTokens.set(agentId, token)
+    walkBounds.set(agentId, zoneBound)
     const safe = agentId.endsWith('~manager') ? { x: target.x, y: target.y } : clampToMemberZone(target)
     s.setAgentGroupEvent(agentId, {
       behavior,
@@ -422,7 +427,7 @@ export function startMawChoreography(store) {
             return
           }
           reissues += 1
-          walk(agentId, current.groupTarget, { behavior: current.behavior, expression: current.expression, bubble: current.bubble })
+          walk(agentId, current.groupTarget, { behavior: current.behavior, expression: current.expression, bubble: current.bubble, zoneBound: walkBounds.get(agentId) })
           return awaitWalk()
         }
         setTimeout(poll, ARRIVAL_POLL_MS)
@@ -476,7 +481,7 @@ export function startMawChoreography(store) {
         restSeatsByMember.delete(id)
       }
     }
-    for (const map of [prevHandover, workingSince, restingSince, walkTokens, walkTargets, pendingEnter]) {
+    for (const map of [prevHandover, workingSince, restingSince, walkTokens, walkTargets, pendingEnter, walkBounds]) {
       for (const id of [...map.keys()]) {
         if (!memberIds.has(id)) map.delete(id)
       }
@@ -558,6 +563,22 @@ export function startMawChoreography(store) {
       // CR-8: after ALL work completes (terminal) the whole team — manager
       // included — free-roams the rest areas on every tick, no 90s threshold.
       const freeRoam = s.mawMeta?.terminal != null
+      // CR-3 audit runs EVERY tick (before the wander cadence gate): a WORKING
+      // member stands at its own desk. Figures displaced by timeout bail-outs /
+      // stale holds / supersede remnants are walked back to their stable seat;
+      // the CR-6 wander dwell is naturally exempt (its last published target IS
+      // where the figure stands). The manager is skipped while a handover owns it.
+      if (!freeRoam) {
+        for (const agent of Object.values(s.agents)) {
+          if (!agent?.mawMember) continue
+          if (agent.isMoving || agent.journeyTarget || agent.inGroupEvent) continue
+          if (agent.maw?.role === 'manager' && managerBusy) continue
+          if (phaseOf(agent.status) !== 'task') continue
+          if (settledAt(agent, agent.id)) continue // standing at its own published spot
+          walk(agent.id, stableWorkSeat(agent), { behavior: 'idle', expression: 'normal', bubble: null, zoneBound: 'member' })
+          arriveThen(agent.id, 0, () => restorePresentation(agent.id))
+        }
+      }
       if (!freeRoam && Date.now() - lastWanderAt < WANDER_INTERVAL_MS) return
       const candidates = wanderCandidates({
         members: Object.values(s.agents).filter((a) => a?.mawMember),
@@ -581,7 +602,9 @@ export function startMawChoreography(store) {
         const back = working
           ? { behavior: MAW_ROLE_WORK_BEHAVIOR[current.maw?.role] || 'typing', expression: 'normal', bubble: null }
           : { behavior: 'idle', expression: current.status === 'done' ? 'happy' : 'normal', bubble: null }
-        walk(agent.id, home, { ...back, zoneBound: 'meeting' })
+        // CR-3/CR-1: a WORKING member's home is its DESK (office band); a resting
+        // member returns to its meeting-room chair.
+        walk(agent.id, home, { ...back, zoneBound: working ? 'member' : 'meeting' })
         arriveThen(agent.id, 0, () => restorePresentation(agent.id))
         if (working) workingSince.set(agent.id, Date.now())
         else restingSince.set(agent.id, Date.now())

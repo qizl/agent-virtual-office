@@ -804,6 +804,23 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
       return rosterId ? { ...d, label: t(`characters.${rosterId}.name`) } : { ...d, label: '' }
     })
   }, [isMaw])
+  // CR-10: MAW work-seat nameplates — one per member's ASSIGNED seat (the stable
+  // maw.workSeat stamp), covering the overflow seats the four base desks don't
+  // reach. Seats already labeled through the base-desk mapping are skipped.
+  const mawSeatNameplates = useMemo(() => {
+    if (!isMaw) return []
+    const baseLabeled = new Set(['140,240', '260,240', '400,220', '340,340'])
+    const out = []
+    const seen = new Set()
+    for (const a of Object.values(useOfficeStore.getState().agents)) {
+      if (!a?.mawMember || !a.maw?.workSeat) continue
+      const key = `${a.maw.workSeat.x},${a.maw.workSeat.y}`
+      if (baseLabeled.has(key) || seen.has(key)) continue
+      seen.add(key)
+      out.push({ x: a.maw.workSeat.x, y: a.maw.workSeat.y, name: t(`characters.${a.maw.role}.name`), color: a.color })
+    }
+    return out
+  }, [isMaw, agentOrderSignature])
   // Only re-render PixelOffice when agent IDs change, not on every property update.
   // AgentCharacter subscribes to its own agent state independently.
   const agentOrderSignature = useOfficeStore(useShallow((s) => getAgentOrderSignature(s.agents)))
@@ -1205,10 +1222,32 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
           stay at their faint 0.4: PLANNING sits ON the sprint board and REVIEW beside the
           Researcher tag, so making them readable prints over both. No letter-spacing on
           ENGINEERING either — tracking widened it under the Developer name tag. Anchors unchanged. */}
-      <text x={200} y={200} textAnchor="middle" fontSize="7" fill={SIGNS.ink} fontFamily="monospace" opacity={SIGNS.faintOpacity}>PLANNING</text>
-      <text x={460} y={200} textAnchor="middle" fontSize="7" fill={SIGNS.ink} fontFamily="monospace" opacity={SIGNS.faintOpacity}>REVIEW</text>
-      <text x={400} y={310} textAnchor="middle" fontSize="7" fill={SIGNS.ink} fontFamily={SIGNS.font} fontWeight="600" opacity={SIGNS.signatureOpacity}>ENGINEERING</text>
-      <path d="M392 314.5h16" stroke={SIGNS.accent} strokeWidth="1.5" opacity={SIGNS.signatureOpacity} />
+      {!isMaw && (
+        <>
+          <text x={200} y={200} textAnchor="middle" fontSize="7" fill={SIGNS.ink} fontFamily="monospace" opacity={SIGNS.faintOpacity}>PLANNING</text>
+          <text x={460} y={200} textAnchor="middle" fontSize="7" fill={SIGNS.ink} fontFamily="monospace" opacity={SIGNS.faintOpacity}>REVIEW</text>
+          <text x={400} y={310} textAnchor="middle" fontSize="7" fill={SIGNS.ink} fontFamily={SIGNS.font} fontWeight="600" opacity={SIGNS.signatureOpacity}>ENGINEERING</text>
+          <path d="M392 314.5h16" stroke={SIGNS.accent} strokeWidth="1.5" opacity={SIGNS.signatureOpacity} />
+        </>
+      )}
+
+      {/* CR-10: MAW work-seat nameplates — bound to each member's ASSIGNED seat */}
+      {mawSeatNameplates.map((s) => (
+        <ScaledText
+          key={`seat-plate-${s.x}-${s.y}`}
+          x={s.x}
+          y={s.y - 24}
+          scale={labelTextScale}
+          textAnchor="middle"
+          fontSize="6"
+          fill={s.color}
+          fontFamily="monospace"
+          fontWeight="bold"
+          opacity="0.85"
+        >
+          {s.name}
+        </ScaledText>
+      ))}
 
       {/* Personalized desks */}
       {(isMaw ? mawDeskData : DESK_DATA).map((d) => (

@@ -672,6 +672,10 @@ function applyMawSnapshotImpl(s, envelope) {
   }
   for (const [agentId, { member, seat }] of desired) {
     const existing = agents[agentId]
+    const built = buildMawMember(member, seat, stale)
+    // CR-10: the assigned work seat is stamped ONCE and stays stable across
+    // snapshots — PixelOffice renders the seat nameplate from it.
+    built.maw.workSeat = existing?.maw?.workSeat ?? { ...seat }
     if (existing) {
       // Preserve live motion state; refresh only the projected facts. While the
       // choreography owns a walk (inGroupEvent) its behavior/expression/bubble are
@@ -681,7 +685,7 @@ function applyMawSnapshotImpl(s, envelope) {
         ? { behavior: existing.behavior, expression: existing.expression, bubble: existing.bubble }
         : {}
       agents[agentId] = {
-        ...buildMawMember(member, seat, stale),
+        ...built,
         ...preserved,
         position: existing.position,
         targetPosition: existing.targetPosition,
@@ -692,7 +696,7 @@ function applyMawSnapshotImpl(s, envelope) {
         groupTarget: existing.groupTarget,
       }
     } else {
-      agents[agentId] = buildMawMember(member, seat, stale)
+      agents[agentId] = built
     }
   }
   return { agents, mawMeta: meta }
