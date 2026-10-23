@@ -385,6 +385,8 @@ export function startMawChoreography(store) {
   let lastSeenQuality = null
   let lastSeenTerminal = false
   let prevWorkflowActive = null // null = not yet observed (no flip on the first snapshot)
+  let standbySweepSeq = 0 // latest standby sweep — older sweeps' callbacks void themselves
+  const pendingRelocation = new Map() // agentId -> { workflowActive } — deferred relocations for mid-walk members
   let pendingSeq = 0
   const pendingEnter = new Map() // agentId -> { seq, from } — rolled back if the generation dies pre-fire
 
@@ -555,7 +557,7 @@ export function startMawChoreography(store) {
         restSeatsByMember.delete(id)
       }
     }
-    for (const map of [prevHandover, workingSince, restingSince, walkTokens, walkTargets, pendingEnter, walkBounds, seatTargets, restTargets, breakUntil]) {
+    for (const map of [prevHandover, workingSince, restingSince, walkTokens, walkTargets, pendingEnter, walkBounds, seatTargets, restTargets, breakUntil, pendingRelocation]) {
       for (const id of [...map.keys()]) {
         if (!memberIds.has(id)) map.delete(id)
       }
@@ -682,13 +684,14 @@ export function startMawChoreography(store) {
         const current = store.getState().agents[agent.id]
         if (!current) return
         if (current.status !== statusAtDeparture) return restorePresentation(agent.id) // the transition owns the new walk
-        // CR-3/CR-1/CR-11: the home follows the member's POST — a working member
-        // or a standby member returns to its DESK; only an off-duty resting
-        // member returns to the meeting-room chair (the ZONE BOUND and the
-        // DESTINATION must both follow the post — review P2: the bound changed
-        // but the destination stayed the meeting room).
+        // CR-3/CR-1/CR-8/CR-11: the home follows the member's POST — a working
+        // member or a standby member returns to its DESK; only an off-duty
+        // resting member returns to the meeting-room chair. COMPLETED (terminal)
+        // workflows are OFF DUTY: a done member's break always ends at its rest
+        // seat (review P2: done members kept returning to their desks).
         const workflowLive = store.getState().mawMeta?.workflow != null
-        const postIsDesk = working || workflowLive
+        const terminalLive = store.getState().mawMeta?.terminal != null
+        const postIsDesk = working || (workflowLive && !terminalLive)
         const home = postIsDesk ? stableWorkSeat(current) : stableRestSeat(current)
         const back = working
           ? { behavior: MAW_ROLE_WORK_BEHAVIOR[current.maw?.role] || 'typing', expression: 'normal', bubble: null }
@@ -724,13 +727,16 @@ export function startMawChoreography(store) {
     const members = Object.values(s.agents).filter((a) => a?.mawMember)
     const quality = s.mawMeta?.quality ?? null
     const terminal = s.mawMeta?.terminal != null
-    // CR-11 standby: while a workflow is ACTIVE, members with no task stand by
-    // at their WORK seats (waiting for assignments) instead of the meeting room.
-    const workflowActive = s.mawMeta?.workflow != null
-    const standbyFlip = prevWorkflowActive !== null && workflowActive !== prevWorkflowActive
-    prevWorkflowActive = workflowActive
     const enteringStale = quality === 'stale' && lastSeenQuality !== 'stale'
     const enteringTerminal = terminal !== lastSeenTerminal
+    // CR-11 standby: while a workflow is ACTIVE, members with no task stand by
+    // at their WORK seats (waiting for assignments) instead of the meeting room.
+    // The flip is evaluated only on a LIVE channel — a stale arrival (or a stale
+    // mid-flip) must NOT launch relocations; prevWorkflowActive stays frozen so
+    // recovery re-evaluates the flip against the pre-stale post (review P2).
+    const workflowActive = s.mawMeta?.workflow != null
+    const standbyFlip = quality !== 'stale' && prevWorkflowActive !== null && workflowActive !== prevWorkflowActive
+    if (!enteringStale && quality !== 'stale') prevWorkflowActive = workflowActive
     if (quality !== lastSeenQuality) lastSeenQuality = quality
     lastSeenTerminal = terminal
     if (enteringStale || enteringTerminal) {
@@ -763,18 +769,28 @@ export function startMawChoreography(store) {
       // between its meeting-room seat and its standby work seat, staggered.
       // Runs AFTER the generation bump: the relocations belong to the NEW
       // generation (a same-dispatch terminal change must not swallow them).
+      standbySweepSeq += 1
+      const mySweep = standbySweepSeq
       let sweep = 0
       for (const member of members) {
         if (member.maw?.role === 'manager') continue
         if (phaseOf(member.status) !== 'rest') continue
-        if (member.isMoving || member.journeyTarget) continue
+        if (member.isMoving || member.journeyTarget || member.inGroupEvent) {
+          // mid-walk at the flip: defer — the relocation pass below walks them
+          // to the CURRENT post the moment they stop moving (review P2).
+          pendingRelocation.set(member.id, { workflowActive })
+          continue
+        }
         const agentId = member.id
         const seat = workflowActive ? stableWorkSeat(member) : stableRestSeat(member)
         const delay = sweep * STAGGER_MS
         sweep += 1
         later(() => {
           const live = store.getState().agents[agentId]
-          if (!live || phaseOf(live.status) !== 'rest') return
+          // a newer sweep, a stale channel, or a phase change voids this walk —
+          // an outdated destination must never overwrite newer state (review P2)
+          if (!live || live.mawMeta?.quality === 'stale' || standbySweepSeq !== mySweep) return
+          if (phaseOf(live.status) !== 'rest') return
           walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null, zoneBound: workflowActive ? 'member' : 'meeting' })
           arriveThen(agentId, 0, () => restorePresentation(agentId))
         }, delay)
@@ -787,6 +803,19 @@ export function startMawChoreography(store) {
     // accumulated status diffs replay exactly once.
     if (quality === 'stale') return
     pruneGoneMembers(new Set(members.map((m) => m.id)))
+
+    // CR-11 deferred relocations: members who were MID-WALK at the flip get
+    // their standby/rest relocation the moment they stop moving (review P2).
+    for (const [agentId] of pendingRelocation) {
+      const live = store.getState().agents[agentId]
+      if (!live) { pendingRelocation.delete(agentId); continue }
+      if (live.isMoving || live.journeyTarget || live.inGroupEvent) continue
+      pendingRelocation.delete(agentId)
+      if (live.maw?.role === 'manager') continue
+      const seat = workflowActive ? stableWorkSeat(live) : stableRestSeat(live)
+      walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null, zoneBound: workflowActive ? 'member' : 'meeting' })
+      arriveThen(agentId, 0, () => restorePresentation(agentId))
+    }
 
     // member transitions — EVERY role launches in the batch sequence (CR-1):
     // the manager takes its slot in member order (working seat = gate; the
