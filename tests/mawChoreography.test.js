@@ -8,6 +8,7 @@ import {
   phaseOf,
   behaviorFor,
   wanderPoint,
+  wanderCandidates,
   planChoreography,
   startMawChoreography,
   MANAGER_GATE,
@@ -88,6 +89,21 @@ describe('maw choreography planning', () => {
       expect(inRest).toBe(true)
       expect(violatesMemberZone(p)).toBe(false)
     }
+  })
+
+  it('the working manager is never a wander candidate — gate duty holds (CR-6)', () => {
+    const now = Date.now()
+    const longAgo = now - 120_000 // well past LONG_WORK_MS
+    const candidates = wanderCandidates({
+      members: [
+        { id: 'mgr01~manager', maw: { role: 'manager' }, status: 'working' },
+        { id: 'exe01~executor', maw: { role: 'executor' }, status: 'working' },
+      ],
+      workingSince: new Map([['mgr01~manager', longAgo], ['exe01~executor', longAgo]]),
+      restingSince: new Map(),
+      now,
+    })
+    expect(candidates.map((a) => a.id)).toEqual(['exe01~executor']) // the manager stays at the gate
   })
 
   it('phase mapping: idle/done rest, everything else is task work', () => {
