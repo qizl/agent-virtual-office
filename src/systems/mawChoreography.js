@@ -268,6 +268,7 @@ export function startMawChoreography(store) {
   let choreoEpoch = 0 // bumped when the channel degrades (stale / terminal): every pending callback dies with its generation
   let lastSeenQuality = null
   let lastSeenTerminal = false
+  const pendingEnter = new Map() // agentId -> phase BEFORE the scheduled walk — rolled back if the generation dies pre-fire
 
   function later(fn, ms) {
     if (torn) return
@@ -413,7 +414,7 @@ export function startMawChoreography(store) {
         restSeatsByMember.delete(id)
       }
     }
-    for (const map of [prevHandover, workingSince, restingSince, walkTokens, walkTargets]) {
+    for (const map of [prevHandover, workingSince, restingSince, walkTokens, walkTargets, pendingEnter]) {
       for (const id of [...map.keys()]) {
         if (!memberIds.has(id)) map.delete(id)
       }
@@ -542,26 +543,29 @@ export function startMawChoreography(store) {
     const quality = s.mawMeta?.quality ?? null
     const terminal = s.mawMeta?.terminal != null
     const enteringStale = quality === 'stale' && lastSeenQuality !== 'stale'
+    const enteringTerminal = terminal !== lastSeenTerminal
     if (quality !== lastSeenQuality) lastSeenQuality = quality
-    // A terminal boundary is a generation of its own — it can arrive while the
-    // quality is unchanged, and pending callbacks must die with it anyway.
-    if (terminal !== lastSeenTerminal) {
-      lastSeenTerminal = terminal
+    lastSeenTerminal = terminal
+    if (enteringStale || enteringTerminal) {
+      // A generation boundary reaps EVERYTHING the old generation still owned:
+      // walk locks, the queue's busy flag and pending items, the handover
+      // latches, and the not-yet-fired staggered walks. Presentation differs:
+      // stale rests everyone (plan: stop active work animation), a cancellation
+      // dresses each figure in its CURRENT status (blocked → scratch-head …).
       choreoEpoch += 1
-    }
-    if (enteringStale) {
-      choreoEpoch += 1
-      // The interrupted generation leaves NOTHING behind: walk locks and their
-      // transit/chat animation are released to an honest rest, the queue's busy
-      // flag and its pending items are dropped, and the handover latches reset so
-      // recovery can re-dispatch every still-awaiting deliverer (review P1: after
-      // a stale interruption the manager used to stay chat/locked/busy forever).
       for (const a of members) {
-        if (a.inGroupEvent) s.clearAgentGroupEvent(a.id, { behavior: 'idle', expression: 'normal', bubble: a.bubble ?? null })
+        if (!a.inGroupEvent) continue
+        if (enteringStale) s.clearAgentGroupEvent(a.id, { behavior: 'idle', expression: 'normal', bubble: a.bubble ?? null })
+        else restorePresentation(a.id)
       }
       managerBusy = false
       handoverQueue.length = 0
       for (const id of [...prevHandover.keys()]) prevHandover.set(id, false)
+      // Walks scheduled but not yet fired: roll their recorded phase back so the
+      // transition replays (on recovery) instead of being swallowed by the
+      // already-updated prevPhase (review P2: the enter never re-dispatched).
+      for (const [id, from] of pendingEnter) prevPhase[id] = from
+      pendingEnter.clear()
     }
     // Channel stale (producer lease expired): the snapshot already rests the figures
     // (buildMawMember), so no NEW walks — members hold where they are until a fresh
@@ -594,7 +598,9 @@ export function startMawChoreography(store) {
       // Delivering members hurry back to the work seat and wait for the manager.
       const delay = member.status === 'awaiting-approval' ? 0 : batchStagger * STAGGER_MS
       batchStagger += 1
+      pendingEnter.set(agentId, previous ?? null) // rolled back if this walk dies pre-fire
       later(() => {
+        pendingEnter.delete(agentId)
         const live = store.getState().agents[agentId]
         if (!live || phaseOf(live.status) !== phase) return // the phase moved on — its own transition owns the walk
         walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null })

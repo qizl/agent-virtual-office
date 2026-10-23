@@ -393,6 +393,16 @@ describe('startMawChoreography (controller)', () => {
       expect(after.inGroupEvent).toBe(false) // the stale enter never walked
       expect(after.groupTarget).toBeNull()
       expect(after.position).toEqual(frozen.position)
+
+      // recovery: the swallowed enter RE-dispatches (its recorded phase was rolled
+      // back when the generation died) — the reviewer does not stay stranded
+      useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, quality: 'ok' } })
+      vi.advanceTimersByTime(100) // mid-flight: the re-dispatched walk owns the lock again
+      expect(store.getState().agents['rev01~reviewer'].inGroupEvent).toBe(true)
+      vi.advanceTimersByTime(30_000)
+      const settled = store.getState().agents['rev01~reviewer']
+      expect(settled.inGroupEvent).toBe(false)
+      expect(settled.behavior).toBe('magnifier') // honest working animation restored
     } finally {
       cleanup()
     }
@@ -457,6 +467,32 @@ describe('startMawChoreography (controller)', () => {
       vi.advanceTimersByTime(1_600)
       expect(store.getState().agents['m2x~reviewer'].inGroupEvent).toBe(true)
       expect(store.getState().agents['m4x~reviewer'].inGroupEvent).toBe(true)
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('a cancellation snapshot reaps an in-flight walk: the lock drops and the animation is status-honest', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    try {
+      store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'idle')]))
+      vi.advanceTimersByTime(100)
+      store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'working')], 2))
+      vi.advanceTimersByTime(100)
+      expect(store.getState().agents['exe01~executor'].inGroupEvent).toBe(true) // enter walk in flight
+
+      // cancellation: terminal + blocked in the SAME task phase — no new walk is
+      // scheduled, so the old generation's walk must be reaped right here
+      store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'blocked')], 3))
+      useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, terminal: { status: 'cancelled' } } })
+      vi.advanceTimersByTime(25_000)
+      const a = store.getState().agents['exe01~executor']
+      expect(a.inGroupEvent).toBe(false) // the walk lock did NOT outlive the cancellation
+      expect(a.groupTarget).toBeNull()
+      expect(a.behavior).toBe('scratch-head') // blocked is honest, not the walk's transit/typing
+      expect(a.expression).toBe('confused')
     } finally {
       cleanup()
     }
