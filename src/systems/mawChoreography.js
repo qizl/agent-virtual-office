@@ -166,16 +166,25 @@ export function wanderPoint(rng = Math.random) {
  * REST. Blocked / awaiting-approval members and the manager (handover duty)
  * never wander; neither does anyone mid-walk.
  */
-export function wanderCandidates({ members, workingSince, restingSince, now = Date.now() }) {
+export function wanderCandidates({ members, workingSince, restingSince, now = Date.now(), freeRoam = false }) {
   const out = []
   for (const agent of members) {
-    if (!agent || agent.maw?.role === 'manager') continue
+    if (!agent) continue
+    // CR-6: a WORKING manager never wanders (gate duty). CR-8: once ALL work is
+    // completed (freeRoam) the manager joins the rest-area free-for-all too.
+    if (!freeRoam && agent.maw?.role === 'manager') continue
     if (agent.isMoving || agent.journeyTarget || agent.inGroupEvent) continue
     const working = agent.status === 'working' || agent.status === 'planning'
     const resting = agent.status === 'idle' || agent.status === 'done'
     if (!working && !resting) continue
-    const since = working ? workingSince.get(agent.id) : restingSince.get(agent.id)
-    if (since === undefined || now - since < LONG_WORK_MS) continue
+    if (freeRoam) {
+      // CR-8 free-roam is for the RESTING team only — a working status past the
+      // terminal marker is contradictory data, not someone to send for a walk.
+      if (working) continue
+    } else {
+      const since = working ? workingSince.get(agent.id) : restingSince.get(agent.id)
+      if (since === undefined || now - since < LONG_WORK_MS) continue
+    }
     out.push(agent)
   }
   return out
@@ -492,11 +501,15 @@ export function startMawChoreography(store) {
       if (torn) return
       const s = store.getState()
       if (s.mawMeta?.quality === 'stale') return // channel stale — hold positions
-      if (Date.now() - lastWanderAt < WANDER_INTERVAL_MS) return
+      // CR-8: after ALL work completes (terminal) the whole team — manager
+      // included — free-roams the rest areas on every tick, no 90s threshold.
+      const freeRoam = s.mawMeta?.terminal != null
+      if (!freeRoam && Date.now() - lastWanderAt < WANDER_INTERVAL_MS) return
       const candidates = wanderCandidates({
         members: Object.values(s.agents).filter((a) => a?.mawMember),
         workingSince,
         restingSince,
+        freeRoam,
       })
       if (candidates.length === 0) return
       lastWanderAt = Date.now()

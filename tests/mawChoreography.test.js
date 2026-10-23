@@ -92,6 +92,19 @@ describe('maw choreography planning', () => {
     }
   })
 
+  it('CR-8 free-roam: after all work completes every role — manager included — wanders without the 90s threshold', () => {
+    const now = Date.now()
+    const members = [
+      { id: 'mgr01~manager', maw: { role: 'manager' }, status: 'done' },
+      { id: 'exe01~executor', maw: { role: 'executor' }, status: 'idle' }, // fresh rest — no stretch recorded
+    ]
+    const free = wanderCandidates({ members, workingSince: new Map(), restingSince: new Map(), now, freeRoam: true })
+    expect(free.map((a) => a.id)).toEqual(['mgr01~manager', 'exe01~executor'])
+    // strict mode keeps both out: the manager by role, the executor by threshold
+    const strict = wanderCandidates({ members, workingSince: new Map(), restingSince: new Map(), now })
+    expect(strict).toEqual([])
+  })
+
   it('the working manager is never a wander candidate — gate duty holds (CR-6)', () => {
     const now = Date.now()
     const longAgo = now - 120_000 // well past LONG_WORK_MS
@@ -564,6 +577,34 @@ describe('startMawChoreography (controller)', () => {
     }
   })
 
+  it('CR-8 free-roam: after completion the team wanders the rest areas without waiting 90s', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0) // deterministic pick + dwell
+    try {
+      store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'done')]))
+      useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, terminal: { status: 'completed' } } })
+      vi.advanceTimersByTime(6_000) // first free-roam tick (5s interval) — no 90s wait
+      const walking = store.getState().agents['exe01~executor']
+      expect(walking.inGroupEvent).toBe(true) // stretching already
+      const inRestArea = [ZONE_FLOOR_RECTS.meetingRoom, ZONE_FLOOR_RECTS.lounge, ZONE_FLOOR_RECTS.research]
+        .some((r) => walking.groupTarget.x >= r.x1 && walking.groupTarget.x <= r.x2 &&
+          walking.groupTarget.y >= r.y1 && walking.groupTarget.y <= r.y2)
+      expect(inRestArea).toBe(true) // CR-7: rest areas only
+      vi.advanceTimersByTime(30_000)
+      const back = store.getState().agents['exe01~executor']
+      const inRestArea2 = [ZONE_FLOOR_RECTS.meetingRoom, ZONE_FLOOR_RECTS.lounge, ZONE_FLOOR_RECTS.research]
+        .some((r) => back.position.x >= r.x1 && back.position.x <= r.x2 &&
+          back.position.y >= r.y1 && back.position.y <= r.y2)
+      expect(inRestArea2).toBe(true) // always somewhere in the rest areas
+      expect(back.behavior).toBe('idle')
+    } finally {
+      randomSpy.mockRestore()
+      cleanup()
+    }
+  })
+
   it('a member who finishes walks to their stable rest seat and the rest animation is honest', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
@@ -637,9 +678,14 @@ describe('startMawChoreography (controller)', () => {
       store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager', 'done'), mawMember('exe01', 'executor', 'done')], 3))
       vi.advanceTimersByTime(30_000)
       const mgr = useOfficeStore.getState().agents['mgr01~manager']
-      expect(mgr.inGroupEvent).toBe(false) // the rest walk completed and released — not clobbered mid-flight
+      // CR-8: after completion the manager may be mid free-roam stretch at any
+      // instant — the invariants are the rest-area position and honest animation
+      const inRestArea = [ZONE_FLOOR_RECTS.meetingRoom, ZONE_FLOOR_RECTS.lounge, ZONE_FLOOR_RECTS.research]
+        .some((r) => mgr.position.x >= r.x1 - 16 && mgr.position.x <= r.x2 + 16 &&
+          mgr.position.y >= r.y1 - 16 && mgr.position.y <= r.y2 + 16)
+      expect(inRestArea).toBe(true)
       expect(mgr.behavior).toBe('idle')
-      expect(mgr.expression).toBe('happy')
+      expect(['normal', 'happy']).toContain(mgr.expression)
 
       // and the queue did not wedge: a later cycle still dispatches handovers
       useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, terminal: null } })
