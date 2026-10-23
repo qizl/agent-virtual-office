@@ -480,6 +480,127 @@ describe('startMawChoreography (controller)', () => {
       cleanup()
     }
   })
+
+  it('a stale interruption leaves nothing behind: locks released, queue reset, handover resumes on recovery', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    try {
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor')]))
+      vi.advanceTimersByTime(2_000)
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor', 'awaiting-approval')], 2))
+      vi.advanceTimersByTime(1_000)
+      expect(useOfficeStore.getState().agents['mgr01~manager'].inGroupEvent).toBe(true) // mid-handover
+
+      // stale hits MID-handover: the interrupted generation must not leave the
+      // manager chat/locked/busy
+      useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, quality: 'stale' } })
+      vi.advanceTimersByTime(100)
+      const mgr = useOfficeStore.getState().agents['mgr01~manager']
+      expect(mgr.inGroupEvent).toBe(false) // walk lock released
+      expect(mgr.groupTarget).toBeNull()
+      expect(mgr.behavior).toBe('idle') // honest rest, no chat animation residue
+
+      // recovery: a fresh delivery re-dispatches (busy flag was reset, latch cleared)
+      useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, quality: 'ok' } })
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor', 'working')], 3))
+      vi.advanceTimersByTime(100)
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor', 'awaiting-approval')], 4))
+      vi.advanceTimersByTime(30_000)
+      const done = useOfficeStore.getState().agents['mgr01~manager']
+      expect(done.inGroupEvent).toBe(false) // the recovered handover completed
+      expect(done.groupTarget).toBeNull()
+      for (const id of ['mgr01~manager']) {
+        expect(useOfficeStore.getState().agents[id].behavior).toBe('gantt-chart')
+      }
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('the manager walking away mid-dwell cannot have the new journey clobbered by the old dwell callback', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    try {
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor')]))
+      vi.advanceTimersByTime(2_000)
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor', 'awaiting-approval')], 2))
+      vi.advanceTimersByTime(4_000) // arrival + INTO the 3s dwell
+      expect(useOfficeStore.getState().agents['mgr01~manager'].behavior).toBe('chat')
+
+      // terminal + manager done: the manager starts its own walk home — a NEW
+      // journey superseding the dwell
+      useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, terminal: { status: 'completed' } } })
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager', 'done'), mawMember('exe01', 'executor', 'done')], 3))
+      vi.advanceTimersByTime(30_000)
+      const mgr = useOfficeStore.getState().agents['mgr01~manager']
+      expect(mgr.inGroupEvent).toBe(false) // the rest walk completed and released — not clobbered mid-flight
+      expect(mgr.behavior).toBe('idle')
+      expect(mgr.expression).toBe('happy')
+
+      // and the queue did not wedge: a later cycle still dispatches handovers
+      useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, terminal: null } })
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor', 'working')], 4))
+      vi.advanceTimersByTime(2_000)
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor', 'awaiting-approval')], 5))
+      vi.advanceTimersByTime(30_000)
+      expect(useOfficeStore.getState().agents['mgr01~manager'].inGroupEvent).toBe(false)
+      expect(useOfficeStore.getState().agents['mgr01~manager'].behavior).toBe('gantt-chart')
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('the final walk timeout releases the queue instead of wedging managerBusy', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    // NO walker: the manager's handover walk can never physically complete
+    try {
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor')]))
+      vi.advanceTimersByTime(2_000)
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor', 'awaiting-approval')], 2))
+      vi.advanceTimersByTime(90_000) // timeout + 3 re-issues, all fruitless
+      const bailed = useOfficeStore.getState().agents['mgr01~manager']
+      expect(bailed.inGroupEvent).toBe(false) // the bail released the lock (no chained leg)
+
+      // the queue must NOT be wedged: a later delivery still dispatches the manager
+      installWalker(store) // now walks complete
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor', 'working')], 3))
+      vi.advanceTimersByTime(100)
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor', 'awaiting-approval')], 4))
+      vi.advanceTimersByTime(30_000)
+      const done = useOfficeStore.getState().agents['mgr01~manager']
+      expect(done.inGroupEvent).toBe(false) // the recovered handover ran to completion
+      expect(done.behavior).toBe('gantt-chart')
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('the settle check follows the PUBLISHED walk target when avoidOverlap moves it', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    try {
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor'), mawMember('exe02', 'executor')]))
+      vi.advanceTimersByTime(2_000)
+      const seat1 = useOfficeStore.getState().agents['exe01~executor'].position
+      // exe02 parks right next to exe01's seat: the deliverer's walk target gets
+      // side-stepped by avoidOverlap — the OLD check (8px around the nominal seat)
+      // would never see the member settled and drop the handover after 20s.
+      useOfficeStore.setState({ agents: { ...useOfficeStore.getState().agents, 'exe02~executor': { ...useOfficeStore.getState().agents['exe02~executor'], position: { x: seat1.x + 34, y: seat1.y } } } })
+
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor', 'awaiting-approval'), mawMember('exe02', 'executor')], 2))
+      vi.advanceTimersByTime(25_000) // member walk + settle + manager visit + dwell + return
+      const mgr = useOfficeStore.getState().agents['mgr01~manager']
+      expect(mgr.inGroupEvent).toBe(false) // the handover was NOT dropped — it completed
+      expect(useOfficeStore.getState().agents['exe01~executor'].behavior).toBe('await-approval')
+      expect(useOfficeStore.getState().agents['exe02~executor'].behavior).toBe('typing') // untouched, honest
+    } finally {
+      cleanup()
+    }
+  })
 })
 
 function inRect(point, rect) {

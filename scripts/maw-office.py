@@ -304,7 +304,10 @@ def fingerprint(state: dict) -> str:
     """Content fingerprint over the declared inputs (plan §4.2.4: stronger than the
     Dashboard's core three — includes ready/terminate/task files)."""
     hasher = hashlib.sha256()
-    task_dir = state["project_root"] / RUNTIME_REL / state["task_id"]
+    # Re-validate the FULL base path at read time: checked_path only guards the
+    # parts appended BELOW the task dir, so a task dir swapped to an outside
+    # symlink between the first read and this pass must not leak one read.
+    task_dir = safe_resolve(state["project_root"], f"{RUNTIME_REL}/{state['task_id']}")
     for relative in ["task.json", "workflow.json"]:
         try:
             hasher.update(relative.encode())

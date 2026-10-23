@@ -264,8 +264,10 @@ export function startMawChoreography(store) {
   const restingSince = new Map() // memberId -> start of the current resting stretch
   let lastWanderAt = 0
   const walkTokens = new Map() // agentId -> latest walk token — a superseding walk invalidates the old chain
+  const walkTargets = new Map() // agentId -> last PUBLISHED walk target (post avoidOverlap/re-clamp) — where the walk actually goes
   let choreoEpoch = 0 // bumped when the channel degrades (stale / terminal): every pending callback dies with its generation
   let lastSeenQuality = null
+  let lastSeenTerminal = false
 
   function later(fn, ms) {
     if (torn) return
@@ -289,6 +291,9 @@ export function startMawChoreography(store) {
       bubble,
       groupTarget: safe,
     })
+    // Record where the store actually published the walk to — the queue's settle
+    // check must judge THIS point, never the requested one (avoidOverlap moves it).
+    walkTargets.set(agentId, store.getState().agents[agentId]?.groupTarget ?? null)
   }
 
   /** Release the walk lock and dress the member in their CURRENT status animation. */
@@ -314,29 +319,45 @@ export function startMawChoreography(store) {
       Math.hypot((agent.position?.x ?? 1e9) - agent.groupTarget.x, (agent.position?.y ?? 1e9) - agent.groupTarget.y) <= ARRIVE_EPSILON_PX)
   }
 
-  const settledAt = (agent, seat) => Boolean(agent && !agent.isMoving && !agent.journeyTarget && !agent.inGroupEvent &&
-    Math.hypot((agent.position?.x ?? 1e9) - seat.x, (agent.position?.y ?? 1e9) - seat.y) <= ARRIVE_EPSILON_PX)
+  const settledAt = (agent, agentId) => {
+    if (!agent || agent.isMoving || agent.journeyTarget || agent.inGroupEvent) return false
+    const target = walkTargets.get(agentId)
+    if (!target) return false
+    return Math.hypot((agent.position?.x ?? 1e9) - target.x, (agent.position?.y ?? 1e9) - target.y) <= ARRIVE_EPSILON_PX
+  }
 
   /**
    * Poll until the agent's CURRENT walk physically settles, then run `fn` after an
    * optional dwell. The whole chain dies with its walk token and choreography
-   * epoch: a superseding walk, or a stale/terminal transition, invalidates it. A
-   * timeout is NOT success — the walk is re-issued (door claims expire); after the
-   * final attempt the lock is released WITHOUT running the chained step.
+   * epoch — INCLUDING the post-arrival dwell: a newer walk (or a new generation)
+   * during the dwell must never have its journey clobbered by the stale callback.
+   * A timeout is NOT success: the walk is re-issued (door claims expire), and after
+   * the final attempt the lock is released WITHOUT running `fn` — but `onCancel`
+   * still runs so the caller's queue state never wedges.
    */
-  function arriveThen(agentId, afterMs, fn) {
+  function arriveThen(agentId, afterMs, fn, onCancel = null) {
     const epoch = choreoEpoch
     let reissues = 0
     const awaitWalk = () => {
       const token = walkTokens.get(agentId)
       const startedAt = Date.now()
       const poll = () => {
-        if (torn || choreoEpoch !== epoch || walkTokens.get(agentId) !== token) return
+        if (torn || choreoEpoch !== epoch || walkTokens.get(agentId) !== token) return // superseded — the new walk owns the chain
         const current = store.getState().agents[agentId]
-        if (!current || !current.inGroupEvent || !current.groupTarget) return // superseded or released elsewhere
-        if (arrivedAt(current)) return later(fn, afterMs)
+        if (!current || !current.inGroupEvent || !current.groupTarget) return // released elsewhere
+        if (arrivedAt(current)) {
+          const settledToken = token
+          return later(() => {
+            if (torn || choreoEpoch !== epoch || walkTokens.get(agentId) !== settledToken) return
+            fn()
+          }, afterMs)
+        }
         if (Date.now() - startedAt >= ARRIVE_TIMEOUT_MS) {
-          if (reissues >= ARRIVE_MAX_REISSUES) return restorePresentation(agentId)
+          if (reissues >= ARRIVE_MAX_REISSUES) {
+            restorePresentation(agentId)
+            onCancel?.()
+            return
+          }
           reissues += 1
           walk(agentId, current.groupTarget, { behavior: current.behavior, expression: current.expression, bubble: current.bubble })
           return awaitWalk()
@@ -392,7 +413,7 @@ export function startMawChoreography(store) {
         restSeatsByMember.delete(id)
       }
     }
-    for (const map of [prevHandover, workingSince, restingSince, walkTokens]) {
+    for (const map of [prevHandover, workingSince, restingSince, walkTokens, walkTargets]) {
       for (const id of [...map.keys()]) {
         if (!memberIds.has(id)) map.delete(id)
       }
@@ -417,10 +438,17 @@ export function startMawChoreography(store) {
     const item = handoverQueue.shift()
     if (!item) return
     managerBusy = true
+    // Every exit — success, moot, timeout bail — funnels through here, so the
+    // queue can never wedge on a busy flag (review P1: the final timeout used to
+    // leave managerBusy true forever).
+    const finish = () => {
+      managerBusy = false
+      processHandoverQueue()
+    }
     const proceed = () => {
       const current = store.getState()
       const manager = current.agents[managerId]
-      if (!manager || manager.status !== 'working') { managerBusy = false; return processHandoverQueue() }
+      if (!manager || manager.status !== 'working') return finish()
       walk(managerId, item.workSeat, { behavior: 'chat', expression: 'normal', bubble: `任务交接 · ${item.label || ''}` })
       arriveThen(managerId, HANDOVER_DWELL_MS, () => {
         const live = store.getState()
@@ -429,28 +457,25 @@ export function startMawChoreography(store) {
         restorePresentation(managerId) // dress the manager's CURRENT status — handover or not
         // The handover went moot mid-dwell (member resolved, manager left working):
         // no return leg — the next real transition owns the manager's walk.
-        if (!mgr || mgr.status !== 'working' || !member || member.status !== 'awaiting-approval') {
-          managerBusy = false
-          return processHandoverQueue()
-        }
+        if (!mgr || mgr.status !== 'working' || !member || member.status !== 'awaiting-approval') return finish()
         walk(managerId, MANAGER_GATE, { behavior: 'gantt-chart', expression: 'normal', bubble: null })
         arriveThen(managerId, 0, () => {
           restorePresentation(managerId)
-          managerBusy = false
-          processHandoverQueue()
-        })
-      })
+          finish()
+        }, finish)
+      }, finish)
     }
     // The member walks to the seat on its OWN (trigger path); the manager departs
-    // only once the member has physically settled there.
+    // only once the member has settled at the PUBLISHED walk target (avoidOverlap
+    // may have moved it off the nominal seat).
     const waitForMember = (ticksLeft) => {
       const current = store.getState()
       const manager = current.agents[managerId]
-      if (!manager || manager.status !== 'working') { managerBusy = false; return processHandoverQueue() }
+      if (!manager || manager.status !== 'working') return finish()
       const member = current.agents[item.id]
-      if (!member || member.status !== 'awaiting-approval') { managerBusy = false; return processHandoverQueue() } // moot
-      if (settledAt(member, item.workSeat)) return proceed()
-      if (ticksLeft <= 0) { managerBusy = false; return processHandoverQueue() } // the walk died — drop, don't chase
+      if (!member || member.status !== 'awaiting-approval') return finish() // moot
+      if (settledAt(member, item.id)) return proceed()
+      if (ticksLeft <= 0) return finish() // the walk died — drop, don't chase
       later(() => waitForMember(ticksLeft - 1), 500)
     }
     waitForMember(40) // ~20s — the member walk budget (timeout + re-issues)
@@ -512,19 +537,37 @@ export function startMawChoreography(store) {
   function dispatch() {
     const s = store.getState()
     if (s.mode !== 'maw') return
-    // Channel degradation (producer lease expired / terminal workflow): every
-    // pending callback dies with its generation — a delayed enter, a dwell, a
-    // walk-home must never fire over degraded state (review P1: old callbacks
-    // overrode stale). prevPhase is intentionally kept: on recovery the
-    // accumulated status diffs replay exactly once.
-    const quality = s.mawMeta?.quality ?? null
-    if (quality !== lastSeenQuality) {
-      lastSeenQuality = quality
-      if (quality === 'stale' || s.mawMeta?.terminal != null) choreoEpoch += 1
-    }
-    if (quality === 'stale') return
     const members = Object.values(s.agents).filter((a) => a?.mawMember)
     const manager = members.find((a) => a.maw?.role === 'manager')
+    const quality = s.mawMeta?.quality ?? null
+    const terminal = s.mawMeta?.terminal != null
+    const enteringStale = quality === 'stale' && lastSeenQuality !== 'stale'
+    if (quality !== lastSeenQuality) lastSeenQuality = quality
+    // A terminal boundary is a generation of its own — it can arrive while the
+    // quality is unchanged, and pending callbacks must die with it anyway.
+    if (terminal !== lastSeenTerminal) {
+      lastSeenTerminal = terminal
+      choreoEpoch += 1
+    }
+    if (enteringStale) {
+      choreoEpoch += 1
+      // The interrupted generation leaves NOTHING behind: walk locks and their
+      // transit/chat animation are released to an honest rest, the queue's busy
+      // flag and its pending items are dropped, and the handover latches reset so
+      // recovery can re-dispatch every still-awaiting deliverer (review P1: after
+      // a stale interruption the manager used to stay chat/locked/busy forever).
+      for (const a of members) {
+        if (a.inGroupEvent) s.clearAgentGroupEvent(a.id, { behavior: 'idle', expression: 'normal', bubble: a.bubble ?? null })
+      }
+      managerBusy = false
+      handoverQueue.length = 0
+      for (const id of [...prevHandover.keys()]) prevHandover.set(id, false)
+    }
+    // Channel stale (producer lease expired): the snapshot already rests the figures
+    // (buildMawMember), so no NEW walks — members hold where they are until a fresh
+    // snapshot restores quality. prevPhase is intentionally kept: on recovery the
+    // accumulated status diffs replay exactly once.
+    if (quality === 'stale') return
     pruneGoneMembers(new Set(members.map((m) => m.id)))
 
     // member transitions (manager handled by the handover queue only)
@@ -564,6 +607,14 @@ export function startMawChoreography(store) {
       const mphase = phaseOf(manager.status)
       if (prevPhase[manager.id] !== mphase) {
         prevPhase[manager.id] = mphase
+        if (managerBusy) {
+          // The manager's own transition killed the handover chain (its callbacks
+          // die with the superseded walk). Release the queue here: awaiting
+          // deliverers re-latch below in the same dispatch.
+          managerBusy = false
+          handoverQueue.length = 0
+          for (const id of [...prevHandover.keys()]) prevHandover.set(id, false)
+        }
         if (mphase === 'task') {
           walk(manager.id, MANAGER_GATE, { behavior: 'gantt-chart', expression: 'normal', bubble: null })
           // Any valid manager status releases the lock here (an initially

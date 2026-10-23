@@ -242,6 +242,29 @@ class SubFileBoundaryTest(unittest.TestCase):
                 maw_office.read_with_consistency(root, "maw-synth-001", 30)
         self.assertEqual(ctx.exception.code, "unsafe-file-type")
 
+    def test_fingerprint_pass_refuses_a_task_dir_swapped_outside(self):
+        # checked_path only guards the parts BELOW the task dir — the fingerprint
+        # pass must re-validate the base itself (review 2026-10-23 P2: the swapped
+        # base leaked one outside read before the second read refused).
+        root = fixtures.build_runtime(fixtures.uuid_tmp())
+        real_dir = root / RUNTIME_REL / "maw-synth-001"
+        outside = fixtures.uuid_tmp()
+        calls = {"n": 0}
+        real_read = maw_office.read_runtime_state
+
+        def swap_after_first_read(project_root, task_id):
+            state = real_read(project_root, task_id)
+            calls["n"] += 1
+            if calls["n"] == 1:  # before the fingerprint pass runs
+                real_dir.rename(outside / "maw-synth-001")
+                os.symlink(outside / "maw-synth-001", real_dir)
+            return state
+
+        with mock.patch.object(maw_office, "read_runtime_state", swap_after_first_read):
+            with self.assertRaises(maw_office.BridgeError) as ctx:
+                maw_office.read_with_consistency(root, "maw-synth-001", 30)
+        self.assertEqual(ctx.exception.code, "unsafe-file-type")
+
 
 if __name__ == "__main__":
     unittest.main()
