@@ -796,19 +796,29 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
   const projectMode = useOfficeStore((s) => s.mode)
   const mawMeta = useOfficeStore(useShallow((s) => s.mawMeta))
   const isMaw = projectMode === 'maw'
+  const agentOrderSignature = useOfficeStore(useShallow((s) => getAgentOrderSignature(s.agents)))
   const mawDeskData = useMemo(() => {
     if (!isMaw) return DESK_DATA
-    // Keyed by SEAT coords (HOME/work seats), not desk coords — the manager's
-    // seat is the GATE (no desk), so the pm desk stays unlabeled in MAW mode.
-    const labelBySeat = { '260,264': 'decision-maker', '400,244': 'reviewer', '340,364': 'executor' }
+    // Each desk is labeled with the role of its OCCUPANT (agents stamp their
+    // assigned seat as maw.workSeat) — spare desks get labels too when an extra
+    // member takes them.
+    const seatToDesk = {
+      '140,264': '140,240', '260,264': '260,240', '400,244': '400,220', '520,244': '520,220',
+      '340,364': '340,340', '460,364': '460,340', '140,384': '140,360',
+    }
+    const roleByDesk = {}
+    for (const a of Object.values(useOfficeStore.getState().agents)) {
+      if (!a?.mawMember || !a.maw?.workSeat) continue
+      const deskKey = seatToDesk[`${a.maw.workSeat.x},${a.maw.workSeat.y}`]
+      if (deskKey) roleByDesk[deskKey] = a.maw.role
+    }
     return DESK_DATA.map((d) => {
-      const rosterId = labelBySeat[`${d.x},${d.y}`]
+      const rosterId = roleByDesk[`${d.x},${d.y}`]
       return rosterId ? { ...d, label: t(`characters.${rosterId}.name`) } : { ...d, label: '' }
     })
-  }, [isMaw])
+  }, [isMaw, agentOrderSignature])
   // Only re-render PixelOffice when agent IDs change, not on every property update.
   // AgentCharacter subscribes to its own agent state independently.
-  const agentOrderSignature = useOfficeStore(useShallow((s) => getAgentOrderSignature(s.agents)))
 
   // CR-10: MAW work-seat nameplates — one per member's ASSIGNED seat (the stable
   // maw.workSeat stamp), for EVERY seat including the base desks: the PersonalDesk
@@ -816,13 +826,18 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
   // here" marker.
   const mawSeatNameplates = useMemo(() => {
     if (!isMaw) return []
+    const seatToDesk = {
+      '140,264': '140,240', '260,264': '260,240', '400,244': '400,220', '520,244': '520,220',
+      '340,364': '340,340', '460,364': '460,340', '140,384': '140,360',
+    }
     const out = []
     const seen = new Set()
     for (const a of Object.values(useOfficeStore.getState().agents)) {
       if (!a?.mawMember || !a.maw?.workSeat) continue
-      const key = `${a.maw.workSeat.x},${a.maw.workSeat.y}`
-      if (seen.has(key)) continue
-      seen.add(key)
+      const seatKey = `${a.maw.workSeat.x},${a.maw.workSeat.y}`
+      if (seatToDesk[seatKey]) continue // a real desk — its nameplate is the desk label above
+      if (seen.has(seatKey)) continue
+      seen.add(seatKey)
       out.push({ x: a.maw.workSeat.x, y: a.maw.workSeat.y, name: t(`characters.${a.maw.role}.name`), color: a.color })
     }
     return out

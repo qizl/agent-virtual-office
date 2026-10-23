@@ -122,16 +122,28 @@ for (let row = 0; row < 5; row++) {
 }
 export const MAW_EXTRA_WORK_SEATS = [...HAND_EXTRA_WORK_SEATS, ...GENERATED_EXTRA_WORK_SEATS]
 
-/** Working seat: base chair per role, main-office extras after.
- * CR-2: the manager's working seat is the GATE booth, not a desk. */
+// Spare REAL desks (one per role beyond its base chair): the map renders seven
+// desks, only four are base seats — extras sit at a real desk with a nameplate
+// instead of an invisible floor spot. Disjoint per role, so two roles never
+// claim the same spare desk.
+const ROLE_SPARE_DESK_SEAT = {
+  executor: { x: 140, y: 264 },         // pm desk
+  'decision-maker': { x: 520, y: 244 }, // research desk
+  reviewer: { x: 460, y: 364 },         // ops desk
+}
+
+/** Working seat: base chair per role; the first extra of each role takes a REAL
+ * spare desk (CR-10 nameplates + visible furniture); further extras fall back to
+ * the overflow pool. CR-2: the manager's working seat is the GATE booth. */
 export function workSeatFor(role, perRoleCount) {
   if (role === 'manager') return { ...MANAGER_GATE }
   const base = HOME_POSITIONS[role]
   if (perRoleCount === 0 && base) return { ...base }
+  if (perRoleCount === 1 && ROLE_SPARE_DESK_SEAT[role]) return { ...ROLE_SPARE_DESK_SEAT[role] }
   // Clamp only as a defensive bound — a valid snapshot (≤ 50 members, ≤ 49 extras
   // of one role) can never reach it, so no two members ever share a seat.
-  const index = Math.min(perRoleCount - 1, MAW_EXTRA_WORK_SEATS.length - 1)
-  return { ...MAW_EXTRA_WORK_SEATS[index] }
+  const index = Math.min(perRoleCount - 2, MAW_EXTRA_WORK_SEATS.length - 1)
+  return { ...MAW_EXTRA_WORK_SEATS[Math.max(0, index)] }
 }
 
 /** True when a walk target would break a member's zone rules. */
