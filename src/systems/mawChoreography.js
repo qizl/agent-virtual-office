@@ -151,16 +151,28 @@ export function clampToMemberZone(point) {
   }
 }
 
-const MEETING_RECT = ZONE_FLOOR_RECTS.meetingRoom
+const REST_AREA_RECTS = [ZONE_FLOOR_RECTS.meetingRoom, ZONE_FLOOR_RECTS.lounge, ZONE_FLOOR_RECTS.research]
 
-/** Fold any point back into the meeting-room rect — CR-1 bounds for REST walks
- * (avoidOverlap may shove a tightly-packed rest seat across the wall; the final
- * published target must stay in the default rest area). */
+/** Fold any point back into the NEAREST rest-area rect. Bounds every REST-phase
+ * walk away from the middle office (CR-1: an avoidOverlap shove must not eject a
+ * rest seat into the office band) while PASSING THROUGH legitimate CR-8 free-roam
+ * targets — lounge/research walks are rest-area walks, not homecomings. */
 export function clampToRestZone(point) {
-  return {
-    x: Math.min(MEETING_RECT.x2 - 2, Math.max(MEETING_RECT.x1 + 2, point.x)),
-    y: Math.min(MEETING_RECT.y2 - 2, Math.max(MEETING_RECT.y1 + 2, point.y)),
+  if (REST_AREA_RECTS.some((r) => point.x >= r.x1 && point.x <= r.x2 && point.y >= r.y1 && point.y <= r.y2)) {
+    return { x: point.x, y: point.y }
   }
+  let best = { x: point.x, y: point.y }
+  let bestDist = Infinity
+  for (const r of REST_AREA_RECTS) {
+    const cx = Math.min(r.x2 - 2, Math.max(r.x1 + 2, point.x))
+    const cy = Math.min(r.y2 - 2, Math.max(r.y1 + 2, point.y))
+    const d = (cx - point.x) ** 2 + (cy - point.y) ** 2
+    if (d < bestDist) {
+      bestDist = d
+      best = { x: cx, y: cy }
+    }
+  }
+  return best
 }
 
 export function phaseOf(status) {
@@ -489,6 +501,11 @@ export function startMawChoreography(store) {
       const current = store.getState()
       const manager = current.agents[managerId]
       if (!manager || manager.status !== 'working') return finish()
+      // The handover takes the manager over — cancel its pending launch walk:
+      // a late launch callback used to re-walk the manager to the gate MID-
+      // handover, superseding the chat walk's token; the handover chain then
+      // exited without finish() and the queue wedged forever (review P1).
+      pendingEnter.delete(managerId)
       walk(managerId, item.workSeat, { behavior: 'chat', expression: 'normal', bubble: `任务交接 · ${item.label || ''}` })
       arriveThen(managerId, HANDOVER_DWELL_MS, () => {
         const live = store.getState()

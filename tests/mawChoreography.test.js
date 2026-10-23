@@ -729,6 +729,71 @@ describe('startMawChoreography (controller)', () => {
     }
   })
 
+  it('a handover takeover cancels the manager pending launch — the queue cannot wedge (review P1)', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    try {
+      // member order gives the manager the LAST launch slot (1800ms) so its
+      // pending enter fires right after the first handover takes over
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('m1x', 'executor', 'idle'),
+        mawMember('m2x', 'executor', 'idle'),
+        mawMember('e9x', 'executor', 'idle'),
+        mawMember('mgr01', 'manager', 'idle'),
+      ]))
+      vi.advanceTimersByTime(50)
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('m1x', 'executor', 'awaiting-approval'),
+        mawMember('m2x', 'executor', 'idle'),
+        mawMember('e9x', 'executor', 'idle'),
+        mawMember('mgr01', 'manager', 'working'),
+      ], 2))
+      vi.advanceTimersByTime(950) // handover #1 in flight; mgr pending enter fires at t≈1800
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('m1x', 'executor', 'awaiting-approval'),
+        mawMember('m2x', 'executor', 'awaiting-approval'),
+        mawMember('e9x', 'executor', 'idle'),
+        mawMember('mgr01', 'manager', 'working'),
+      ], 3))
+      vi.advanceTimersByTime(12_000) // old callback fires at 1800; both handovers must complete
+
+      const bubbles = []
+      // (recorded implicitly by completion below) — assert both handovers ran
+      const mgr = store.getState().agents['mgr01~manager']
+      expect(mgr.inGroupEvent).toBe(false) // the queue did NOT wedge
+      expect(mgr.behavior).toBe('gantt-chart')
+      // both deliverers were visited: their seats show await-approval and the
+      // manager returned to the gate after the SECOND visit
+      expect(store.getState().agents['m1x~executor'].behavior).toBe('await-approval')
+      expect(store.getState().agents['m2x~executor'].behavior).toBe('await-approval')
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('CR-8 free-roam targets in lounge/research are NOT folded back to the meeting room (review P2)', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.6) // wander rect index 1 = lounge
+    try {
+      store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'done')]))
+      useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, terminal: { status: 'completed' } } })
+      vi.advanceTimersByTime(5_200) // first free-roam tick
+      const walking = store.getState().agents['exe01~executor']
+      expect(walking.inGroupEvent).toBe(true)
+      const lounge = ZONE_FLOOR_RECTS.lounge
+      expect(walking.groupTarget.x).toBeGreaterThanOrEqual(lounge.x1)
+      expect(walking.groupTarget.x).toBeLessThanOrEqual(lounge.x2)
+      expect(walking.groupTarget.y).toBeGreaterThanOrEqual(lounge.y1)
+      expect(walking.groupTarget.y).toBeLessThanOrEqual(lounge.y2)
+    } finally {
+      randomSpy.mockRestore()
+      cleanup()
+    }
+  })
+
   it('a member who finishes walks to their stable rest seat and the rest animation is honest', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
