@@ -562,10 +562,14 @@ export function startMawChoreography(store) {
       managerBusy = false
       handoverQueue.length = 0
       for (const id of [...prevHandover.keys()]) prevHandover.set(id, false)
-      // Walks scheduled but not yet fired: roll their recorded phase back so the
-      // transition replays (on recovery) instead of being swallowed by the
-      // already-updated prevPhase (review P2: the enter never re-dispatched).
-      for (const [id, pending] of pendingEnter) prevPhase[id] = pending.from
+      // Only the STALE path rolls pending walks back: the channel will hold
+      // positions and recovery must replay the swallowed transitions (review P2).
+      // A CANCELLATION must NOT roll back — its dispatch re-runs the transition
+      // loop immediately, so a rollback would re-arm and instantly re-walk the
+      // very moves the cancellation just killed; drop the records instead.
+      if (enteringStale) {
+        for (const [id, pending] of pendingEnter) prevPhase[id] = pending.from
+      }
       pendingEnter.clear()
     }
     // Channel stale (producer lease expired): the snapshot already rests the figures
@@ -653,7 +657,9 @@ export function startMawChoreography(store) {
         // serial queue coordinates only the manager's visit, never the member's walk.
         walk(member.id, stableWorkSeat(member), { behavior: 'idle', expression: 'normal', bubble: null })
         arriveThen(member.id, 0, () => restorePresentation(member.id))
-        enqueueHandover(member.id, stableWorkSeat(member), member.bubble ?? member.label)
+        // `name` (member.label || roster name) is stable — the label BUBBLE is
+        // cleared by transit walks and only re-applied by the next snapshot.
+        enqueueHandover(member.id, stableWorkSeat(member), member.name ?? member.bubble ?? member.label)
       } else if (member.status !== 'awaiting-approval' && prevHandover.get(member.id) === true) {
         prevHandover.set(member.id, false)
       }

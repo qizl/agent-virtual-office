@@ -65,18 +65,31 @@ describe('applyMawSnapshot', () => {
     expect(a['m4xxxx~reviewer'].behavior).toBe('gantt-chart')
   })
 
-  it('CR-1 opening action: a resting member spawns at the meeting-room rest seat, a working member at the work seat', () => {
+  it('CR-1 opening action: the first snapshot spawns everyone at the meeting room; later task arrivals spawn at the desk', () => {
     useOfficeStore.getState().applyMawSnapshot(envelope(1, [
       member('rest01', 'executor', 'idle'),
       member('work01', 'reviewer', 'working'),
     ]))
     const a = useOfficeStore.getState().agents
-    const restSeat = restSeatFor('rest01~executor').seat
-    expect(a['rest01~executor'].position).toEqual(restSeat) // opens at the default position
+    // opening: BOTH spawn at their meeting-room rest seats — the staggered
+    // walk-in to the desks is played by the choreography, not pre-empted
+    expect(a['rest01~executor'].position).toEqual(restSeatFor('rest01~executor').seat)
+    expect(a['work01~reviewer'].position).toEqual(restSeatFor('work01~reviewer').seat)
     const inMeeting = (p) => p.x >= ZONE_FLOOR_RECTS.meetingRoom.x1 && p.x <= ZONE_FLOOR_RECTS.meetingRoom.x2 &&
       p.y >= ZONE_FLOOR_RECTS.meetingRoom.y1 && p.y <= ZONE_FLOOR_RECTS.meetingRoom.y2
-    expect(inMeeting(a['rest01~executor'].position)).toBe(true)
-    expect(a['work01~reviewer'].position).toEqual(workSeatFor('reviewer', 0)) // task members spawn at the desk
+    expect(inMeeting(a['work01~reviewer'].position)).toBe(true)
+
+    // after the opening, a NEW working member spawns straight at the desk
+    useOfficeStore.getState().applyMawSnapshot(envelope(2, [
+      member('rest01', 'executor', 'idle'),
+      member('work01', 'reviewer', 'working'),
+      member('late01', 'executor', 'working'),
+    ]))
+    const late = useOfficeStore.getState().agents['late01~executor']
+    const inMain = (p) => p.x >= ZONE_FLOOR_RECTS.mainOffice.x1 && p.x <= ZONE_FLOOR_RECTS.mainOffice.x2 &&
+      p.y >= ZONE_FLOOR_RECTS.mainOffice.y1 && p.y <= ZONE_FLOOR_RECTS.mainOffice.y2
+    expect(inMain(late.position)).toBe(true)
+    expect(late.position).not.toEqual(a['rest01~executor'].position)
   })
 
   it('removes absent members on the next snapshot (full-set replacement)', () => {
@@ -144,11 +157,14 @@ describe('applyMawSnapshot', () => {
   })
 
   it('a full 50-member same-role snapshot seats every member on a unique spot', () => {
-    const members = Array.from({ length: 50 }, (_, i) => member(`full${String(i).padStart(2, '0')}`, 'executor'))
-    useOfficeStore.getState().applyMawSnapshot(envelope(1, members))
+    // seed first so the CR-1 opening (meeting-room spawn) does not apply — this
+    // pins the WORK-seat pool uniqueness for task-phase members
+    useOfficeStore.getState().applyMawSnapshot(envelope(1, [member('seed00', 'reviewer')]))
+    const members = Array.from({ length: 50 }, (_, i) => member(`full${String(i).padStart(2, '0')}`, 'executor', 'working'))
+    useOfficeStore.getState().applyMawSnapshot(envelope(2, [member('seed00', 'reviewer'), ...members]))
     const positions = Object.values(useOfficeStore.getState().agents).map((a) => `${a.position.x},${a.position.y}`)
-    expect(positions).toHaveLength(50)
-    expect(new Set(positions).size).toBe(50)
+    expect(positions).toHaveLength(51)
+    expect(new Set(positions).size).toBe(51)
   })
 
   it('ignores snapshots in non-maw modes (default office stays organic)', () => {

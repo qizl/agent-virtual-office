@@ -639,6 +639,13 @@ function applyMawSnapshotImpl(s, envelope) {
   }
   const agents = { ...s.agents }
   const desired = new Map()
+  // CR-1 opening action: the FIRST snapshot after load spawns EVERYONE at the
+  // default meeting-room seats, so the choreography's staggered walk-in plays
+  // on every page load. Later newcomers spawn by phase (rest → meeting room,
+  // task → desk). The probing set matches the choreography's own binding order,
+  // so opening spawn seats equal its stable rest-seat bindings exactly.
+  const opening = !Object.values(agents).some((a) => a?.mawMember)
+  const openingTaken = new Set()
   if (snapshot && Array.isArray(snapshot.members)) {
     const perRoleCount = {}
     for (const member of snapshot.members) {
@@ -646,13 +653,16 @@ function applyMawSnapshotImpl(s, envelope) {
       const agentId = `${member.id}~${member.role}`
       const roleCount = perRoleCount[member.role] || 0
       perRoleCount[member.role] = roleCount + 1
-      // CR-1 opening action: a member arriving in the REST phase spawns at their
-      // meeting-room rest seat (the animation opens with everyone at the default
-      // position); task-phase members spawn at their work seat, and the
-      // choreography's staggered enter covers the sequential walk-in.
-      const spawnSeat = phaseOf(member.status) === 'rest'
-        ? restSeatFor(agentId).seat
-        : workSeatFor(member.role, roleCount)
+      let spawnSeat
+      if (opening) {
+        const assigned = restSeatFor(agentId, openingTaken)
+        openingTaken.add(assigned.index)
+        spawnSeat = assigned.seat
+      } else if (phaseOf(member.status) === 'rest') {
+        spawnSeat = restSeatFor(agentId).seat
+      } else {
+        spawnSeat = workSeatFor(member.role, roleCount)
+      }
       desired.set(agentId, { member, seat: spawnSeat })
     }
   }
