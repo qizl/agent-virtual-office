@@ -653,6 +653,10 @@ function applyMawSnapshotImpl(s, envelope) {
       const agentId = `${member.id}~${member.role}`
       const roleCount = perRoleCount[member.role] || 0
       perRoleCount[member.role] = roleCount + 1
+      // CR-10: the WORK seat is stamped separately from the spawn seat — the
+      // opening spawns everyone at the meeting room, but the seat nameplate
+      // must show at the member's ASSIGNED desk.
+      const workSeat = workSeatFor(member.role, roleCount)
       let spawnSeat
       if (opening) {
         const assigned = restSeatFor(agentId, openingTaken)
@@ -661,21 +665,21 @@ function applyMawSnapshotImpl(s, envelope) {
       } else if (phaseOf(member.status) === 'rest') {
         spawnSeat = restSeatFor(agentId).seat
       } else {
-        spawnSeat = workSeatFor(member.role, roleCount)
+        spawnSeat = workSeat
       }
-      desired.set(agentId, { member, seat: spawnSeat })
+      desired.set(agentId, { member, seat: spawnSeat, workSeat })
     }
   }
   // Remove members absent from this snapshot (every submission is the FULL member set).
   for (const id of Object.keys(agents)) {
     if (agents[id]?.mawMember && !desired.has(id)) delete agents[id]
   }
-  for (const [agentId, { member, seat }] of desired) {
+  for (const [agentId, { member, seat, workSeat }] of desired) {
     const existing = agents[agentId]
     const built = buildMawMember(member, seat, stale)
     // CR-10: the assigned work seat is stamped ONCE and stays stable across
     // snapshots — PixelOffice renders the seat nameplate from it.
-    built.maw.workSeat = existing?.maw?.workSeat ?? { ...seat }
+    built.maw.workSeat = existing?.maw?.workSeat ?? { ...workSeat }
     if (existing) {
       // Preserve live motion state; refresh only the projected facts. While the
       // choreography owns a walk (inGroupEvent) its behavior/expression/bubble are

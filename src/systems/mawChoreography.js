@@ -122,8 +122,10 @@ for (let row = 0; row < 5; row++) {
 }
 export const MAW_EXTRA_WORK_SEATS = [...HAND_EXTRA_WORK_SEATS, ...GENERATED_EXTRA_WORK_SEATS]
 
-/** Working seat in the main office: base chair per role, main-office extras after. */
+/** Working seat: base chair per role, main-office extras after.
+ * CR-2: the manager's working seat is the GATE booth, not a desk. */
 export function workSeatFor(role, perRoleCount) {
+  if (role === 'manager') return { ...MANAGER_GATE }
   const base = HOME_POSITIONS[role]
   if (perRoleCount === 0 && base) return { ...base }
   // Clamp only as a defensive bound — a valid snapshot (≤ 50 members, ≤ 49 extras
@@ -157,10 +159,11 @@ const REST_AREA_RECTS = [ZONE_FLOOR_RECTS.meetingRoom, ZONE_FLOOR_RECTS.lounge, 
 /** Fold any point back into the MEETING ROOM — the bound for SEAT-RETURN walks
  * (CR-1: 归座目标必须在会议室, however crowded the room gets). */
 export function clampToMeetingZone(point) {
-  // CR-9: the fold keeps 48px of headroom so the sprite body never clips.
+  // CR-9: the fold keeps 64px of headroom — the sprite body extends ~54px above
+  // its feet, so 48px still clipped the head (review repro (667,38)).
   return {
     x: Math.min(MEETING_RECT.x2 - 2, Math.max(MEETING_RECT.x1 + 2, point.x)),
-    y: Math.min(MEETING_RECT.y2 - 2, Math.max(48, point.y)),
+    y: Math.min(MEETING_RECT.y2 - 2, Math.max(64, point.y)),
   }
 }
 
@@ -169,14 +172,16 @@ export function clampToMeetingZone(point) {
  * guard for everything else (CR-1: an avoidOverlap shove must not eject a rest
  * walk into the office band). */
 export function clampToRestZone(point) {
+  // Points inside a rest area still respect the CR-9 visibility floor —
+  // avoidOverlap may push a legal y=48 target ABOVE the floor.
   if (REST_AREA_RECTS.some((r) => point.x >= r.x1 && point.x <= r.x2 && point.y >= r.y1 && point.y <= r.y2)) {
-    return { x: point.x, y: point.y }
+    return { x: point.x, y: Math.max(64, point.y) }
   }
   let best = { x: point.x, y: point.y }
   let bestDist = Infinity
   for (const r of REST_AREA_RECTS) {
     const cx = Math.min(r.x2 - 2, Math.max(r.x1 + 2, point.x))
-    const cy = Math.min(r.y2 - 2, Math.max(48, r.y1 + 2, point.y))
+    const cy = Math.min(r.y2 - 2, Math.max(64, r.y1 + 2, point.y))
     const d = (cx - point.x) ** 2 + (cy - point.y) ** 2
     if (d < bestDist) {
       bestDist = d
@@ -207,7 +212,7 @@ export function wanderPoint(rng = Math.random) {
   })
   // CR-9 visibility floor: a sprite's body extends ~32px above its feet —
   // anything closer than 48px to the top wall clips the head (owner screenshot).
-  return { x: Math.min(778, Math.max(24, point.x)), y: Math.min(500, Math.max(48, point.y)) }
+  return { x: Math.min(778, Math.max(24, point.x)), y: Math.min(500, Math.max(64, point.y)) }
 }
 
 /**
@@ -328,6 +333,8 @@ export function startMawChoreography(store) {
   let lastWanderAt = 0
   const walkTokens = new Map() // agentId -> latest walk token — a superseding walk invalidates the old chain
   const walkBounds = new Map() // agentId -> the zone bound of its CURRENT walk — timeout re-issues must keep it
+  const seatTargets = new Map() // agentId -> published target of its last SEAT walk — the CR-3 audit's compliance spot
+  const breakUntil = new Map() // agentId -> timestamp until which a sanctioned CR-6/CR-8 break may keep the figure away
   const walkTargets = new Map() // agentId -> last PUBLISHED walk target (post avoidOverlap/re-clamp) — where the walk actually goes
   let choreoEpoch = 0 // bumped when the channel degrades (stale / terminal): every pending callback dies with its generation
   let lastSeenQuality = null
@@ -352,6 +359,11 @@ export function startMawChoreography(store) {
     walkTokens.set(agentId, token)
     walkBounds.set(agentId, zoneBound)
     const safe = agentId.endsWith('~manager') ? { x: target.x, y: target.y } : clampToMemberZone(target)
+    // Seat-intent walks (desk/gate returns) publish the member's COMPLIANCE
+    // spot for the CR-3 audit; 'none' marks a TEMPORARY destination (handover
+    // chat stop) the audit must not treat as the desk; wander walks ('rest-
+    // areas') are CR-6/CR-8 breaks, exempt via breakUntil instead.
+    if (zoneBound === 'member' || zoneBound === 'meeting') seatTargets.set(agentId, null)
     s.setAgentGroupEvent(agentId, {
       behavior,
       expression,
@@ -361,7 +373,9 @@ export function startMawChoreography(store) {
     })
     // Record where the store actually published the walk to — the queue's settle
     // check must judge THIS point, never the requested one (avoidOverlap moves it).
-    walkTargets.set(agentId, store.getState().agents[agentId]?.groupTarget ?? null)
+    const published = store.getState().agents[agentId]?.groupTarget ?? null
+    walkTargets.set(agentId, published)
+    if (zoneBound === 'member' || zoneBound === 'meeting') seatTargets.set(agentId, published)
   }
 
   /** Release the walk lock and dress the member in their CURRENT status animation. */
@@ -481,7 +495,7 @@ export function startMawChoreography(store) {
         restSeatsByMember.delete(id)
       }
     }
-    for (const map of [prevHandover, workingSince, restingSince, walkTokens, walkTargets, pendingEnter, walkBounds]) {
+    for (const map of [prevHandover, workingSince, restingSince, walkTokens, walkTargets, pendingEnter, walkBounds, seatTargets, breakUntil]) {
       for (const id of [...map.keys()]) {
         if (!memberIds.has(id)) map.delete(id)
       }
@@ -522,7 +536,7 @@ export function startMawChoreography(store) {
       // handover, superseding the chat walk's token; the handover chain then
       // exited without finish() and the queue wedged forever (review P1).
       pendingEnter.delete(managerId)
-      walk(managerId, item.workSeat, { behavior: 'chat', expression: 'normal', bubble: `任务交接 · ${item.label || ''}` })
+      walk(managerId, item.workSeat, { behavior: 'chat', expression: 'normal', bubble: `任务交接 · ${item.label || ''}`, zoneBound: 'none' })
       arriveThen(managerId, HANDOVER_DWELL_MS, () => {
         const live = store.getState()
         const mgr = live.agents[managerId]
@@ -574,7 +588,16 @@ export function startMawChoreography(store) {
           if (agent.isMoving || agent.journeyTarget || agent.inGroupEvent) continue
           if (agent.maw?.role === 'manager' && managerBusy) continue
           if (phaseOf(agent.status) !== 'task') continue
-          if (settledAt(agent, agent.id)) continue // standing at its own published spot
+          if (pendingEnter.has(agent.id)) continue // launch still queued — the stagger owns it (review P2: audit broke the entrance order)
+          if ((breakUntil.get(agent.id) ?? 0) > Date.now()) continue // sanctioned CR-6/CR-8 break in progress
+          const seatTarget = seatTargets.get(agent.id)
+          // Compliance = standing where its last SEAT walk published. The last
+          // walk target of ANY kind (wander point, handover chat stop) is a
+          // TEMPORARY destination, not the desk — compliance is judged against
+          // seatTarget ONLY: a settledAt() check would short-circuit with the
+          // temp destination and skip a manager parked at a member's desk or an
+          // executor stranded in a rest area after going blocked (review P2).
+          if (seatTarget && Math.hypot((agent.position?.x ?? 1e9) - seatTarget.x, (agent.position?.y ?? 1e9) - seatTarget.y) <= ARRIVE_EPSILON_PX) continue
           walk(agent.id, stableWorkSeat(agent), { behavior: 'idle', expression: 'normal', bubble: null, zoneBound: 'member' })
           arriveThen(agent.id, 0, () => restorePresentation(agent.id))
         }

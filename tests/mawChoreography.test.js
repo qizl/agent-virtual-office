@@ -52,7 +52,9 @@ describe('maw choreography planning', () => {
   })
 
   it('work seats land in the main office; extras use overflow seats', () => {
-    for (const role of ['manager', 'decision-maker', 'executor', 'reviewer']) {
+    // CR-2: the manager's work seat is the GATE (entrance zone, manager-only)
+    expect(workSeatFor('manager', 0)).toEqual(MANAGER_GATE)
+    for (const role of ['decision-maker', 'executor', 'reviewer']) {
       const base = workSeatFor(role, 0)
       expect(inRect(base, MAIN)).toBe(true)
     }
@@ -272,6 +274,7 @@ describe('startMawChoreography (controller)', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
     installWalker(store)
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.1) // deterministic pick + 8.8s dwell
     try {
       store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'working')]))
       vi.advanceTimersByTime(95_000) // past LONG_WORK_MS, through 5s wander ticks
@@ -292,6 +295,7 @@ describe('startMawChoreography (controller)', () => {
       const desk = workSeatFor('executor', 0)
       expect(Math.hypot(back.position.x - desk.x, back.position.y - desk.y)).toBeLessThan(60)
     } finally {
+      randomSpy.mockRestore()
       cleanup()
     }
   })
@@ -924,6 +928,60 @@ describe('startMawChoreography (controller)', () => {
         expect(inUnion(a.groupTarget)).toBe(true)
       }
     } finally {
+      cleanup()
+    }
+  })
+
+  it('CR-3 audit: the manager parked at a member desk is walked back to the gate', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    try {
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor')]))
+      vi.advanceTimersByTime(2_000)
+      // handover: manager walks to exe01's desk and dwells there
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor', 'awaiting-approval')], 2))
+      vi.advanceTimersByTime(4_000)
+      const parked = store.getState().agents['mgr01~manager']
+      const memberDesk = store.getState().agents['exe01~executor'].position
+      expect(parked.behavior).toBe('chat')
+      // deliverer resolves MID-DWELL (done) — the moot path releases the manager
+      // at the member's desk WITHOUT a walk-back; the working manager must NOT
+      // stay parked there (review P2: lastTarget == temp destination)
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor', 'done')], 3))
+      vi.advanceTimersByTime(20_000)
+      const mgr = store.getState().agents['mgr01~manager']
+      // walked back toward the GATE (its own seat), not parked at the member desk
+      expect(Math.hypot(mgr.position.x - MANAGER_GATE.x, mgr.position.y - MANAGER_GATE.y)).toBeLessThan(60)
+      void memberDesk
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('CR-3 audit: an executor stranded in a rest area after going blocked is walked back to its desk', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.99) // wander into the last rest rect (research)
+    try {
+      store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'working')]))
+      vi.advanceTimersByTime(95_000) // wander break starts
+      vi.advanceTimersByTime(8_000) // mid-dwell, standing in a rest area
+      const research = ZONE_FLOOR_RECTS.research
+      const stranded = store.getState().agents['exe01~executor']
+      const inResearch = stranded.position.x >= research.x1 - 16 && stranded.position.x <= research.x2 + 16
+      expect(inResearch).toBe(true)
+      // goes BLOCKED mid-break: the rework order pulls it back to its DESK,
+      // not left standing in research (review P2: lastTarget == wander point)
+      store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'blocked')], 2))
+      vi.advanceTimersByTime(30_000)
+      const back = store.getState().agents['exe01~executor']
+      const desk = workSeatFor('executor', 0)
+      expect(Math.hypot(back.position.x - desk.x, back.position.y - desk.y)).toBeLessThan(60)
+      expect(back.behavior).toBe('scratch-head')
+    } finally {
+      randomSpy.mockRestore()
       cleanup()
     }
   })
