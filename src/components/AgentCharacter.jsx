@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { useOfficeStore, STATUS_COLORS } from '../systems/store.js'
 import { getNextBehavior } from '../systems/behaviorEngine'
-import { getTargetForBehavior, pickSocialTarget, calcFacing, calculateJourney, needsLocationChange, HOME_POSITIONS, resolveClaimAwareHomePosition, resolveFocusFacing, SOCIAL_BEHAVIORS, visuallyOverlapping, avoidOverlap, doorPassageRect } from '../systems/movementSystem'
+import { getTargetForBehavior, pickSocialTarget, calcFacing, calculateJourney, needsLocationChange, HOME_POSITIONS, resolveClaimAwareHomePosition, resolveFocusFacing, SOCIAL_BEHAVIORS, visuallyOverlapping, avoidOverlap } from '../systems/movementSystem'
 import { eventBubble, charName, useLocale, t } from '../i18n'
 import { BlockedReasonBadge } from './blockedReasonBadge'
 import { recurringInfo } from '../systems/recurringFailure'
@@ -789,10 +789,12 @@ function AgentCharacter({ agent }) {
   const timerRef = useRef(null)
   const pathRef = useRef([])
   const activeDoorJourneyRef = useRef(null)
-  // Door ids whose claims this journey currently holds — released early once the
-  // walker has cleared every claimed door passage (see onWaypointReached).
+  // Per-claim progress entries { doorId, at } — `at` is the waypoint index whose
+  // REACH crosses that door. Released in onWaypointReached as the walker advances
+  // past each index; position alone cannot express "crossed" (indoor waypoints
+  // sit outside every door rect long before the crossing).
   const claimedDoorIdsRef = useRef([])
-  const DOOR_CLEAR_MARGIN_PX = 16
+  const waypointsDoneRef = useRef(0)
   const pendingDoorJourneyRef = useRef(null)
   const lastGroupTargetRef = useRef(null)
   const movingRef = useRef(false)
@@ -1155,10 +1157,12 @@ function AgentCharacter({ agent }) {
         return 'queued'
       }
       activeDoorJourneyRef.current = journeyId
-      claimedDoorIdsRef.current = journey.doorIds.slice()
+      claimedDoorIdsRef.current = (journey.doorClear ?? []).map((d) => ({ ...d }))
+      waypointsDoneRef.current = 0
     } else {
       activeDoorJourneyRef.current = null
       claimedDoorIdsRef.current = []
+      waypointsDoneRef.current = 0
     }
 
     pendingDoorJourneyRef.current = null
@@ -1177,23 +1181,19 @@ function AgentCharacter({ agent }) {
 
     if (pathRef.current.length > 0) {
       const next = pathRef.current.shift()
+      waypointsDoneRef.current += 1
       if (activeDoorJourneyRef.current) {
-        // Release the claims as soon as the walker has CLEARED every claimed
-        // door passage (+ margin): holding them until final arrival serialized
-        // group entrances — the next queued walker's journey stayed stationary
-        // until the previous one SAT DOWN. Early release lets it start crossing
-        // while the previous walker is still en route to its desk; the passage
-        // itself stays single-occupant (the margin keeps the next crossing
-        // behind the released walker, preserving the AVO-187 anti-stack fence).
-        // Idempotent with the arrival/abort release paths.
-        const pos = visualPosRef.current
-        const stillInside = claimedDoorIdsRef.current.filter((doorId) => {
-          const rect = doorPassageRect(doorId)
-          if (!rect || !pos) return true
-          return pos.x >= rect.x1 - DOOR_CLEAR_MARGIN_PX && pos.x <= rect.x2 + DOOR_CLEAR_MARGIN_PX &&
-            pos.y >= rect.y1 - DOOR_CLEAR_MARGIN_PX && pos.y <= rect.y2 + DOOR_CLEAR_MARGIN_PX
-        })
-        if (stillInside.length === 0) {
+        // Release the claims the moment the walker REACHES the waypoint that
+        // CROSSES its last claimed door (path progress — position sat outside
+        // every door rect on the indoor legs BEFORE the crossing, so a
+        // position check handed the door to a head-on walker mid-route).
+        // Crossing-only release keeps each passage single-occupant (the
+        // AVO-187 anti-stack fence) while the previous walker still walks to
+        // its desk; doors not yet crossed keep their claims. Idempotent with
+        // the arrival/abort release paths.
+        const done = waypointsDoneRef.current
+        const lastClear = claimedDoorIdsRef.current.reduce((m, c) => Math.max(m, c.at), -1)
+        if (done > lastClear) {
           store.releaseAgentDoorClaims(id, activeDoorJourneyRef.current)
           claimedDoorIdsRef.current = []
           activeDoorJourneyRef.current = null
@@ -1218,6 +1218,7 @@ function AgentCharacter({ agent }) {
       store.setAgentArrived(id, activeDoorJourneyRef.current)
       activeDoorJourneyRef.current = null
       claimedDoorIdsRef.current = []
+      waypointsDoneRef.current = 0
       movingRef.current = false
       setIsWalking(false)  // FINAL arrival — the only legitimate walk-complete clear (see animate())
       // Apply deferred behavior now that character has arrived at destination.

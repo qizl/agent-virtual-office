@@ -101,3 +101,23 @@ describe('doorPassageRect — claim-door id to physical passage rect', () => {
     expect(doorPassageRect('not-a-door')).toBeNull()
   })
 })
+
+describe('calculateJourney — doorClear progress indexes (review 1f03092 follow-up)', () => {
+  it('reports the crossing waypoint index per door, ascending', () => {
+    const j = calculateJourney({ x: 700, y: 200 }, { x: 300, y: 300 }) // meeting room → main office
+    expect(j.doorIds).toEqual(['mainToMeeting'])
+    expect(j.doorClear).toHaveLength(1)
+    expect(j.doorClear[0].doorId).toBe('mainToMeeting')
+    const wp = j.waypoints[j.doorClear[0].at]
+    // the clear waypoint is the far side of the door-meeting passage
+    expect(wp.x).toBeLessThanOrEqual(628)
+  })
+
+  it('reports both doors in traversal order for a two-door journey', () => {
+    const j = calculateJourney({ x: 700, y: 480 }, { x: 300, y: 470 }) // research → lounge through main office
+    expect(j.doorIds).toEqual(['mainToResearch', 'mainToLounge'])
+    expect(j.doorClear[0].doorId).toBe('mainToResearch')
+    expect(j.doorClear[1].doorId).toBe('mainToLounge')
+    expect(j.doorClear[0].at).toBeLessThan(j.doorClear[1].at)
+  })
+})

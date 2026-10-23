@@ -570,7 +570,9 @@ describe('startMawChoreography (controller)', () => {
       const settled = store.getState().agents['rev01~reviewer']
       const restSeat = restSeatFor('rev01~reviewer').seat
       expect(settled.inGroupEvent).toBe(false)
-      expect(settled.position).toEqual(restSeat) // recovery re-dispatched the swallowed rest walk
+      // recovery re-dispatched the swallowed rest walk — avoidOverlap may
+      // side-step the published target inside the crowded meeting room
+      expect(Math.hypot(settled.position.x - restSeat.x, settled.position.y - restSeat.y)).toBeLessThan(60)
       expect(settled.behavior).toBe('idle')
     } finally {
       cleanup()
@@ -601,6 +603,128 @@ describe('startMawChoreography (controller)', () => {
       expect(back.behavior).toBe('idle')
     } finally {
       randomSpy.mockRestore()
+      cleanup()
+    }
+  })
+
+  it('launch order includes the manager: every role takes its i×STAGGER_MS slot (CR-1)', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    try {
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('mgr01', 'manager', 'idle'),
+        mawMember('dm01', 'decision-maker', 'idle'),
+        mawMember('exe01', 'executor', 'idle'),
+        mawMember('exe02', 'executor', 'idle'),
+        mawMember('rev01', 'reviewer', 'idle'),
+      ]))
+      vi.advanceTimersByTime(3_500) // every opening rest walk settles BEFORE the workday starts
+      const order = []
+      let launched = new Set()
+      const unsubscribe = store.subscribe(() => {
+        for (const a of Object.values(store.getState().agents)) {
+          if (a?.inGroupEvent && !launched.has(a.id)) {
+            launched.add(a.id)
+            order.push(a.id)
+          }
+        }
+      })
+
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('mgr01', 'manager', 'working'),
+        mawMember('dm01', 'decision-maker', 'working'),
+        mawMember('exe01', 'executor', 'working'),
+        mawMember('exe02', 'executor', 'working'),
+        mawMember('rev01', 'reviewer', 'working'),
+      ], 2))
+      // launch slots in member order: 0 / STAGGER_MS / 2× / 3× / 4×
+      vi.advanceTimersByTime(50)
+      expect(order).toEqual(['mgr01~manager']) // slot 0 — the manager is IN the sequence
+      vi.advanceTimersByTime(STAGGER_MS - 50)
+      expect(order).toEqual(['mgr01~manager', 'dm01~decision-maker'])
+      vi.advanceTimersByTime(STAGGER_MS)
+      expect(order).toEqual(['mgr01~manager', 'dm01~decision-maker', 'exe01~executor'])
+      vi.advanceTimersByTime(STAGGER_MS)
+      expect(order).toEqual(['mgr01~manager', 'dm01~decision-maker', 'exe01~executor', 'exe02~executor'])
+      vi.advanceTimersByTime(STAGGER_MS)
+      expect(order).toEqual(['mgr01~manager', 'dm01~decision-maker', 'exe01~executor', 'exe02~executor', 'rev01~reviewer'])
+      unsubscribe()
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('a pruned member re-entering binds a NEW seat — the old delayed callback cannot drag it back', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    try {
+      // four executors: drag01 takes the LAST launch slot (1800ms) and binds the
+      // extra pool seat far from its later re-entry binding
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('seed0', 'reviewer', 'working'),
+        mawMember('e0x', 'executor', 'working'),
+        mawMember('e1x', 'executor', 'working'),
+        mawMember('e2x', 'executor', 'working'),
+        mawMember('drag01', 'executor', 'working'),
+      ]))
+      vi.advanceTimersByTime(100)
+      // member deleted — its pending enter timer survives but its binding is pruned
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('seed0', 'reviewer', 'working'),
+        mawMember('e0x', 'executor', 'working'),
+        mawMember('e1x', 'executor', 'working'),
+        mawMember('e2x', 'executor', 'working'),
+      ], 2))
+      // re-entered at a position whose binding differs (count order shifted)
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('seed0', 'reviewer', 'working'),
+        mawMember('drag01', 'executor', 'working'),
+        mawMember('e0x', 'executor', 'working'),
+        mawMember('e1x', 'executor', 'working'),
+        mawMember('e2x', 'executor', 'working'),
+      ], 3))
+      vi.advanceTimersByTime(100) // the re-entry walk launches (batch slot 0)
+      const bound = store.getState().agents['drag01~executor'].groupTarget
+      expect(bound).not.toBeNull()
+
+      vi.advanceTimersByTime(2_500) // the re-entry completes AND the old pre-prune callback fires
+      const after = store.getState().agents['drag01~executor']
+      // NOT dragged to the pruned binding — still walking to / standing at the re-entry seat
+      expect(Math.hypot(after.position.x - bound.x, after.position.y - bound.y)).toBeLessThan(60)
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('a crowded rest room keeps every rest walk target INSIDE the meeting room (CR-1)', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    try {
+      // no walker — the walk targets are published but never physically reached
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('mgr01', 'manager', 'idle'),
+        mawMember('dm01', 'decision-maker', 'idle'),
+        mawMember('e0x', 'executor', 'idle'),
+        mawMember('e1x', 'executor', 'idle'),
+        mawMember('e2x', 'executor', 'idle'),
+        mawMember('e3x', 'executor', 'idle'),
+        mawMember('e4x', 'executor', 'idle'),
+        mawMember('rev01', 'reviewer', 'idle'),
+      ]))
+      vi.advanceTimersByTime(6_000) // all rest walks published
+      const meeting = ZONE_FLOOR_RECTS.meetingRoom
+      for (const a of Object.values(store.getState().agents)) {
+        if (!a?.inGroupEvent || !a.groupTarget) continue
+        // CR-1: rest targets stay in the meeting room — avoidOverlap shoves are
+        // folded back by the store's phase-aware clamp
+        expect(a.groupTarget.x).toBeGreaterThanOrEqual(meeting.x1)
+        expect(a.groupTarget.x).toBeLessThanOrEqual(meeting.x2)
+        expect(a.groupTarget.y).toBeGreaterThanOrEqual(meeting.y1)
+        expect(a.groupTarget.y).toBeLessThanOrEqual(meeting.y2)
+      }
+    } finally {
       cleanup()
     }
   })

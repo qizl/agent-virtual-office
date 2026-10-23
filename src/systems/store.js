@@ -14,7 +14,7 @@ import { PET_TYPES, nextPetType } from './petState.js'
 import { pruneRecentPicks } from './behaviorEngine.js'  // AVO-180: prune on eviction
 import { isValidTheme, DEFAULT_THEME } from './theme.js'
 import { recordEpisode, isNewBlockedEpisode } from './recurringFailure.js'
-import { workSeatFor, restSeatFor, phaseOf, clampToMemberZone } from './mawChoreography.js' // shared MAW seat planner (store and choreography must agree)
+import { workSeatFor, restSeatFor, phaseOf, clampToMemberZone, clampToRestZone } from './mawChoreography.js' // shared MAW seat planner (store and choreography must agree)
 import { AGENT_CARRY_FIELDS } from '../utils/statusFields.js'
 import {
   createDoorClaimState,
@@ -824,7 +824,12 @@ export const useOfficeStore = create((set) => ({
         // entrance rect. The member band wins over non-overlap — fold it back after
         // the push (the manager is exempt: gate duty lives inside the entrance).
         const actor = s.agents[id]
-        if (actor.mawMember && actor.maw?.role !== 'manager') gt = clampToMemberZone(gt)
+        if (actor.mawMember && actor.maw?.role !== 'manager') {
+          // CR-1 phase bounds: a RESTING member's walk target stays inside the
+          // meeting room (avoidOverlap shoves tightly-packed rest seats across
+          // the wall); task targets fold back into the main-office band.
+          gt = phaseOf(actor.status) === 'rest' ? clampToRestZone(gt) : clampToMemberZone(gt)
+        }
       } else {
         // React-in-place participant (spiller, caller, dog-reactor): the event FREEZES them
         // wherever they stand, so that spot has to survive the event's duration on two axes —

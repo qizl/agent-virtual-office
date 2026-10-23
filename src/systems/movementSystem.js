@@ -672,6 +672,10 @@ export function calculateJourney(from, to) {
 
   const path = []
   const doorIds = []
+  // Per-door waypoint index whose REACH means that door is crossed — the
+  // entrance flow releases claims on this progress, not on position (a walker
+  // is outside every door rect on its indoor legs long before crossing).
+  const doorClear = []
   const exitDoor = ROUTE[fromZone]?.[toZone]
 
   if (exitDoor) {
@@ -683,6 +687,7 @@ export function calculateJourney(from, to) {
     const [fromSide, toSide] = jitterDoorCrossing(rawFromSide, rawToSide)
     appendZoneRoute(path, from, fromSide, fromZone)
     pushPoint(path, toSide)
+    doorClear.push({ doorId: exitDoor, at: path.length - 1 })
   }
 
   // Multi-room transit (e.g., lounge → research goes through mainOffice)
@@ -697,12 +702,13 @@ export function calculateJourney(from, to) {
       const prevPt = path[path.length - 1] || from
       appendZoneRoute(path, prevPt, mainSide, 'mainOffice')
       pushPoint(path, toSide)
+      doorClear.push({ doorId: entryDoor, at: path.length - 1 })
     }
   }
 
   const last = path[path.length - 1] || from
   appendZoneRoute(path, last, to, toZone)
-  return { waypoints: path, doorIds }
+  return { waypoints: path, doorIds, doorClear }
 }
 
 export function calculatePath(from, to) {

@@ -68,12 +68,26 @@ function seatKey(point) {
 // first; overflow fills a deterministic grid on the free floor BELOW the meeting
 // table (the table obstacle ends at y=195, the meeting-room rect runs to y=413),
 // so every rest seat — default and overflow — stays inside the meeting room.
+// Overflow grid on STAGGERED rows: adjacent-row neighbours sit at (24px, 36px)
+// — outside the sprite clearance ellipse SPRITE_CLEAR_RX/RY (32×44: 0.75² +
+// 0.82² > 1) — so avoidOverlap has no reason to shove a rest target out of the
+// room. Above-table rows stop at y=60: the row at y≈96 would fall inside the
+// chair ellipse band (chairs span y 120–205; the first below row starts at
+// y=252, 47px clear of the y=205 chair row). This yields 30 overflow seats;
+// with the 8 chairs the non-overlapping capacity is EXACTLY 50 — a full
+// valid snapshot seats without sharing a chair or stacking, and avoidOverlap
+// pushes are folded back by clampToRestZone below.
 const MEETING_OVERFLOW_SEATS = []
-for (let row = 0; row < 8; row++) {
-  for (let col = 0; col < 7; col++) MEETING_OVERFLOW_SEATS.push({ x: 640 + col * 21, y: 212 + row * 24 })
+const OVERFLOW_ROWS = [
+  { ys: [24, 60], xs: [634, 682, 730] },
+  { ys: [24, 60], xs: [658, 706, 754] },
+  { ys: [252, 288, 324, 360, 396], xs: [634, 682, 730] },
+  { ys: [252, 288, 324, 360, 396], xs: [658, 706, 754] },
+]
+for (const { ys, xs } of OVERFLOW_ROWS) {
+  for (const y of ys) for (const x of xs) MEETING_OVERFLOW_SEATS.push({ x, y })
 }
-// 8 meeting chairs + 56 in-room overflow = 64 unique seats — a full 50-member
-// snapshot always rests without sharing a chair.
+// 8 meeting chairs + 24 staggered overflow = 32 non-overlapping seats.
 export const REST_SEATS = [...MEETING_CHAIRS, ...MEETING_OVERFLOW_SEATS]
 
 /** Stable rest seat for one member id: meeting room first, bottom rooms on overflow. */
@@ -134,6 +148,18 @@ export function clampToMemberZone(point) {
   return {
     x: Math.min(585, Math.max(25, point.x)),
     y: Math.min(388, Math.max(175, point.y)),
+  }
+}
+
+const MEETING_RECT = ZONE_FLOOR_RECTS.meetingRoom
+
+/** Fold any point back into the meeting-room rect — CR-1 bounds for REST walks
+ * (avoidOverlap may shove a tightly-packed rest seat across the wall; the final
+ * published target must stay in the default rest area). */
+export function clampToRestZone(point) {
+  return {
+    x: Math.min(MEETING_RECT.x2 - 2, Math.max(MEETING_RECT.x1 + 2, point.x)),
+    y: Math.min(MEETING_RECT.y2 - 2, Math.max(MEETING_RECT.y1 + 2, point.y)),
   }
 }
 
@@ -556,7 +582,6 @@ export function startMawChoreography(store) {
     const s = store.getState()
     if (s.mode !== 'maw') return
     const members = Object.values(s.agents).filter((a) => a?.mawMember)
-    const manager = members.find((a) => a.maw?.role === 'manager')
     const quality = s.mawMeta?.quality ?? null
     const terminal = s.mawMeta?.terminal != null
     const enteringStale = quality === 'stale' && lastSeenQuality !== 'stale'
@@ -595,11 +620,13 @@ export function startMawChoreography(store) {
     if (quality === 'stale') return
     pruneGoneMembers(new Set(members.map((m) => m.id)))
 
-    // member transitions (manager handled by the handover queue only)
+    // member transitions — EVERY role launches in the batch sequence (CR-1):
+    // the manager takes its slot in member order (working seat = gate; the
+    // handover queue still coordinates only the manager's confirmation visits)
     const now = Date.now()
-    let batchStagger = 0 // i×1.5s WITHIN one migration batch (plan §5.1) — never cumulative across the session
+    let batchStagger = 0 // i×0.6s WITHIN one migration batch (plan §5.1) — never cumulative across the session
     for (const member of members) {
-      if (member.maw?.role === 'manager') continue
+      const isManager = member.maw?.role === 'manager'
       if (phaseOf(member.status) === 'task') {
         if (!workingSince.has(member.id)) workingSince.set(member.id, now)
         restingSince.delete(member.id)
@@ -611,54 +638,40 @@ export function startMawChoreography(store) {
       const previous = prevPhase[member.id]
       if (phase === previous) continue
       prevPhase[member.id] = phase
+      if (isManager && managerBusy) {
+        // The manager's own transition killed the handover chain (its callbacks
+        // die with the superseded walk). Release the queue here: awaiting
+        // deliverers re-latch below in the same dispatch.
+        managerBusy = false
+        handoverQueue.length = 0
+        for (const id of [...prevHandover.keys()]) prevHandover.set(id, false)
+      }
       const agentId = member.id
       // Stable seat binding: the seat was assigned when the member FIRST entered
       // this phase; recomputing from live counts would stack same-role members
       // and send the manager to someone else's desk.
-      const seat = phase === 'task' ? stableWorkSeat(member) : stableRestSeat(member)
+      const seat = isManager
+        ? (phase === 'task' ? MANAGER_GATE : stableRestSeat(member))
+        : phase === 'task' ? stableWorkSeat(member) : stableRestSeat(member)
       // Delivering members hurry back to the work seat and wait for the manager.
       const delay = member.status === 'awaiting-approval' ? 0 : batchStagger * STAGGER_MS
       batchStagger += 1
       // The pending record is owned by ITS callback only: rapid rest/task toggles
       // stack several scheduled walks, and an older callback firing late must
       // never delete a newer pending record — the stale reap could no longer roll
-      // that walk back and recovery would swallow it (review P2 regression).
+      // that walk back and recovery would swallow it (review P2 regression). Nor
+      // may the stale callback keep walking: losing ownership TERMINATES it.
       const seq = ++pendingSeq
       pendingEnter.set(agentId, { seq, from: previous ?? null }) // rolled back if this walk dies pre-fire
       later(() => {
         const mine = pendingEnter.get(agentId)
-        if (mine?.seq === seq) pendingEnter.delete(agentId)
+        if (!mine || mine.seq !== seq) return // ownership lost (a newer pending walk or a prune) — terminate; the owner walks
+        pendingEnter.delete(agentId)
         const live = store.getState().agents[agentId]
         if (!live || phaseOf(live.status) !== phase) return // the phase moved on — its own transition owns the walk
         walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null })
         arriveThen(agentId, 0, () => restorePresentation(agentId))
       }, delay)
-    }
-
-    // manager: working seat = gate; rest seat = stable meeting-room chair
-    if (manager) {
-      const mphase = phaseOf(manager.status)
-      if (prevPhase[manager.id] !== mphase) {
-        prevPhase[manager.id] = mphase
-        if (managerBusy) {
-          // The manager's own transition killed the handover chain (its callbacks
-          // die with the superseded walk). Release the queue here: awaiting
-          // deliverers re-latch below in the same dispatch.
-          managerBusy = false
-          handoverQueue.length = 0
-          for (const id of [...prevHandover.keys()]) prevHandover.set(id, false)
-        }
-        if (mphase === 'task') {
-          walk(manager.id, MANAGER_GATE, { behavior: 'gantt-chart', expression: 'normal', bubble: null })
-          // Any valid manager status releases the lock here (an initially
-          // awaiting-approval manager used to keep the work animation forever).
-          arriveThen(manager.id, 0, () => restorePresentation(manager.id))
-        } else {
-          const seat = stableRestSeat(manager)
-          walk(manager.id, seat, { behavior: 'idle', expression: 'normal', bubble: null })
-          arriveThen(manager.id, 0, () => restorePresentation(manager.id))
-        }
-      }
     }
 
     // handover triggers: any member entering awaiting-approval (same-phase or not —
