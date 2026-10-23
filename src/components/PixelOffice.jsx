@@ -794,6 +794,7 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
   // MAW mode: desk labels resolve from the seated roster characters (plan §4.1.3), and an
   // empty stage shows the waiting notice instead of pretending anyone is working.
   const projectMode = useOfficeStore((s) => s.mode)
+  const isDashboard = useOfficeStore((s) => s.integration === 'dashboard')
   const mawMeta = useOfficeStore(useShallow((s) => s.mawMeta))
   const isMaw = projectMode === 'maw'
   const agentOrderSignature = useOfficeStore(useShallow((s) => getAgentOrderSignature(s.agents)))
@@ -1364,7 +1365,7 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
       <Printer x={600} y={495} />
 
       {/* ═══ CONNECTION HINT (shown until first external status is received) ═══ */}
-      {!hasEverReceivedStatus && (
+      {!hasEverReceivedStatus && !isDashboard && (
         <g className={reducedMotion ? '' : 'animate-pulse'} pointerEvents="none">
           <rect x="240" y="14" width="320" height="40" rx="9" fill="#241d15" opacity="0.68" />
           <rect x="241" y="15" width="318" height="38" rx="8" fill="none" stroke="#f3ead0" strokeOpacity="0.28" />

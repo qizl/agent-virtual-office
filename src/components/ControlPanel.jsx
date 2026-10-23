@@ -259,7 +259,7 @@ export default function ControlPanel({ platform = 'browser', mode = 'full' }) {
         </div>
       )}
       {/* Onboarding popover */}
-      {showInfo && (
+      {showInfo && !isDashboard && (
         <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-72 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg p-3 text-xs z-50">
           <p className="text-gray-700 dark:text-gray-200 mb-2">
             {t('onboarding.description')}
