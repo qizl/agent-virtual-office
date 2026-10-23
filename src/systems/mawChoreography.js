@@ -122,27 +122,40 @@ for (let row = 0; row < 5; row++) {
 }
 export const MAW_EXTRA_WORK_SEATS = [...HAND_EXTRA_WORK_SEATS, ...GENERATED_EXTRA_WORK_SEATS]
 
-// Spare REAL desks (one per role beyond its base chair): the map renders seven
-// desks, only four are base seats — extras sit at a real desk with a nameplate
-// instead of an invisible floor spot. Disjoint per role, so two roles never
-// claim the same spare desk.
-const ROLE_SPARE_DESK_SEAT = {
-  executor: { x: 140, y: 264 },         // pm desk
-  'decision-maker': { x: 520, y: 244 }, // research desk
-  reviewer: { x: 460, y: 364 },         // ops desk
-}
+// CR-3/CR-10 work-seat clusters: geographic desk GROUPS. Roles are assigned to
+// groups RANDOMLY on every page load (CR-3 随机分配), and each role's members
+// sit ADJACENTLY within its group (同一角色工位相邻) — the group order is
+// shuffled, the seats inside a group keep their geographic order.
+const WORK_CLUSTER_SEATS = [
+  // right block: dev + ops + qa + research desks (4 seats, mutually adjacent)
+  [{ x: 340, y: 364 }, { x: 460, y: 364 }, { x: 400, y: 244 }, { x: 520, y: 244 }],
+  // center-left row: arch + pm desks (2 seats, adjacent)
+  [{ x: 260, y: 264 }, { x: 140, y: 264 }],
+  // bottom-left: designer desk (1 seat)
+  [{ x: 140, y: 384 }],
+]
+const ROLE_WORK_CLUSTERS = (() => {
+  const roles = ['executor', 'decision-maker', 'reviewer']
+  const clusters = WORK_CLUSTER_SEATS.map((group) => group.map((s) => ({ ...s })))
+  for (let i = clusters.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[clusters[i], clusters[j]] = [clusters[j], clusters[i]]
+  }
+  const map = { manager: [{ ...MANAGER_GATE }] }
+  roles.forEach((role, i) => { map[role] = clusters[i] })
+  return map
+})()
 
-/** Working seat: base chair per role; the first extra of each role takes a REAL
- * spare desk (CR-10 nameplates + visible furniture); further extras fall back to
- * the overflow pool. CR-2: the manager's working seat is the GATE booth. */
+/** Working seat: the role's cluster seat (adjacent per role, random group per
+ * page load); members beyond the cluster's desks fall back to the overflow
+ * pool. CR-2: the manager's working seat is the GATE booth. */
 export function workSeatFor(role, perRoleCount) {
   if (role === 'manager') return { ...MANAGER_GATE }
-  const base = HOME_POSITIONS[role]
-  if (perRoleCount === 0 && base) return { ...base }
-  if (perRoleCount === 1 && ROLE_SPARE_DESK_SEAT[role]) return { ...ROLE_SPARE_DESK_SEAT[role] }
-  // Clamp only as a defensive bound — a valid snapshot (≤ 50 members, ≤ 49 extras
-  // of one role) can never reach it, so no two members ever share a seat.
-  const index = Math.min(perRoleCount - 2, MAW_EXTRA_WORK_SEATS.length - 1)
+  const cluster = ROLE_WORK_CLUSTERS[role] ?? []
+  if (perRoleCount < cluster.length) return { ...cluster[perRoleCount] }
+  // Clamp only as a defensive bound — a valid snapshot (≤ 50 members) can never
+  // exhaust the cluster + overflow pool, so no two members ever share a seat.
+  const index = Math.min(perRoleCount - cluster.length, MAW_EXTRA_WORK_SEATS.length - 1)
   return { ...MAW_EXTRA_WORK_SEATS[Math.max(0, index)] }
 }
 
