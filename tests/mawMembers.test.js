@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest'
+import { ZONE_FLOOR_RECTS } from '../src/systems/movementSystem.js'
+import { restSeatFor, workSeatFor } from '../src/systems/mawChoreography.js'
 import { useOfficeStore } from '../src/systems/store.js'
 
 // applyMawSnapshot: every submission is the FULL member set. Members render as
@@ -61,6 +63,20 @@ describe('applyMawSnapshot', () => {
     expect(a['m3xxxx~executor'].expression).toBe('happy')
     expect(a['m3xxxx~executor'].behavior).toBe('idle')
     expect(a['m4xxxx~reviewer'].behavior).toBe('gantt-chart')
+  })
+
+  it('CR-1 opening action: a resting member spawns at the meeting-room rest seat, a working member at the work seat', () => {
+    useOfficeStore.getState().applyMawSnapshot(envelope(1, [
+      member('rest01', 'executor', 'idle'),
+      member('work01', 'reviewer', 'working'),
+    ]))
+    const a = useOfficeStore.getState().agents
+    const restSeat = restSeatFor('rest01~executor').seat
+    expect(a['rest01~executor'].position).toEqual(restSeat) // opens at the default position
+    const inMeeting = (p) => p.x >= ZONE_FLOOR_RECTS.meetingRoom.x1 && p.x <= ZONE_FLOOR_RECTS.meetingRoom.x2 &&
+      p.y >= ZONE_FLOOR_RECTS.meetingRoom.y1 && p.y <= ZONE_FLOOR_RECTS.meetingRoom.y2
+    expect(inMeeting(a['rest01~executor'].position)).toBe(true)
+    expect(a['work01~reviewer'].position).toEqual(workSeatFor('reviewer', 0)) // task members spawn at the desk
   })
 
   it('removes absent members on the next snapshot (full-set replacement)', () => {

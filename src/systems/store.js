@@ -14,7 +14,7 @@ import { PET_TYPES, nextPetType } from './petState.js'
 import { pruneRecentPicks } from './behaviorEngine.js'  // AVO-180: prune on eviction
 import { isValidTheme, DEFAULT_THEME } from './theme.js'
 import { recordEpisode, isNewBlockedEpisode } from './recurringFailure.js'
-import { workSeatFor, clampToMemberZone } from './mawChoreography.js' // shared MAW seat planner (store and choreography must agree)
+import { workSeatFor, restSeatFor, phaseOf, clampToMemberZone } from './mawChoreography.js' // shared MAW seat planner (store and choreography must agree)
 import { AGENT_CARRY_FIELDS } from '../utils/statusFields.js'
 import {
   createDoorClaimState,
@@ -646,10 +646,14 @@ function applyMawSnapshotImpl(s, envelope) {
       const agentId = `${member.id}~${member.role}`
       const roleCount = perRoleCount[member.role] || 0
       perRoleCount[member.role] = roleCount + 1
-      // Same seat planner the choreography uses — base chair first, then the unique
-      // extra-seat pool (a 50-member snapshot never stacks two members on one spot,
-      // and no member is ever seated in the forbidden entrance area).
-      desired.set(agentId, { member, seat: workSeatFor(member.role, roleCount) })
+      // CR-1 opening action: a member arriving in the REST phase spawns at their
+      // meeting-room rest seat (the animation opens with everyone at the default
+      // position); task-phase members spawn at their work seat, and the
+      // choreography's staggered enter covers the sequential walk-in.
+      const spawnSeat = phaseOf(member.status) === 'rest'
+        ? restSeatFor(agentId).seat
+        : workSeatFor(member.role, roleCount)
+      desired.set(agentId, { member, seat: spawnSeat })
     }
   }
   // Remove members absent from this snapshot (every submission is the FULL member set).
