@@ -126,23 +126,26 @@ export const MAW_EXTRA_WORK_SEATS = [...HAND_EXTRA_WORK_SEATS, ...GENERATED_EXTR
 // groups RANDOMLY on every page load (CR-3 随机分配), and each role's members
 // sit ADJACENTLY within its group (同一角色工位相邻) — the group order is
 // shuffled, the seats inside a group keep their geographic order.
-const WORK_CLUSTER_SEATS = [
-  // right block: dev + ops + qa + research desks (4 seats, mutually adjacent)
-  [{ x: 340, y: 364 }, { x: 460, y: 364 }, { x: 400, y: 244 }, { x: 520, y: 244 }],
-  // center-left row: arch + pm desks (2 seats, adjacent)
-  [{ x: 260, y: 264 }, { x: 140, y: 264 }],
-  // bottom-left: designer desk (1 seat)
-  [{ x: 140, y: 384 }],
+// Seat UNITS (adjacent real desks): executor deals itself two units (4 desks —
+// the largest team), decision-maker and reviewer take one each. The units are
+// SHUFFLED on every page load (CR-3 随机分配) and every unit is a real desk, so
+// no member ever lands on an invisible floor spot.
+const WORK_UNIT_SEATS = [
+  [{ x: 340, y: 364 }, { x: 460, y: 364 }], // dev + ops (bottom row)
+  [{ x: 400, y: 244 }, { x: 520, y: 244 }], // qa + research (top row)
+  [{ x: 260, y: 264 }],                     // arch
+  [{ x: 140, y: 264 }],                     // pm
 ]
 const ROLE_WORK_CLUSTERS = (() => {
-  const roles = ['executor', 'decision-maker', 'reviewer']
-  const clusters = WORK_CLUSTER_SEATS.map((group) => group.map((s) => ({ ...s })))
-  for (let i = clusters.length - 1; i > 0; i--) {
+  const units = WORK_UNIT_SEATS.map((u) => u.map((s) => ({ ...s })))
+  for (let i = units.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1))
-    ;[clusters[i], clusters[j]] = [clusters[j], clusters[i]]
+    ;[units[i], units[j]] = [units[j], units[i]]
   }
-  const map = { manager: [{ ...MANAGER_GATE }] }
-  roles.forEach((role, i) => { map[role] = clusters[i] })
+  const map = { manager: [] }
+  map.executor = [...units[0], ...units[1]] // two units — the biggest crew
+  map['decision-maker'] = units[2] ?? []
+  map.reviewer = units[3] ?? []
   return map
 })()
 
