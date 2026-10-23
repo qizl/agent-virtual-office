@@ -299,7 +299,15 @@ if (ONCE) {
 
 let alive = true
 while (alive) {
-  alive = await publish(beat)
+  try {
+    alive = await publish(beat)
+  } catch (error) {
+    // Transient transport/lease failures must not kill the demo — back off and
+    // RETRY the same beat (the storyline only advances on a successful publish).
+    console.log(`[mock-maw] publish failed: ${error.message} — retrying in 5s`)
+    await new Promise((r) => setTimeout(r, 5_000))
+    continue
+  }
   // Per-beat dwell (calm head 5×, completed 3×) so the walk home and the
   // idle stretch that follows are visible before the next storyline loop.
   const dwell = EVERY * (beatDataDwell(beat) ?? 1)

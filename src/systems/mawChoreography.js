@@ -706,27 +706,6 @@ export function startMawChoreography(store) {
     const workflowActive = s.mawMeta?.workflow != null
     const standbyFlip = prevWorkflowActive !== null && workflowActive !== prevWorkflowActive
     prevWorkflowActive = workflowActive
-    if (standbyFlip) {
-      console.log('[DBG] standby sweep flip, workflowActive =', workflowActive, 'members =', members.length)
-      // CR-11: the workday started/ended — relocate every RESTING member
-      // between its meeting-room seat and its standby work seat, staggered.
-      let sweep = 0
-      for (const member of members) {
-        if (member.maw?.role === 'manager') continue
-        if (phaseOf(member.status) !== 'rest') continue
-        if (member.isMoving || member.journeyTarget) continue
-        const agentId = member.id
-        const seat = workflowActive ? stableWorkSeat(member) : stableRestSeat(member)
-        const delay = sweep * STAGGER_MS
-        sweep += 1
-        later(() => {
-          const live = store.getState().agents[agentId]
-          if (!live || phaseOf(live.status) !== 'rest') return
-          walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null, zoneBound: workflowActive ? 'member' : 'meeting' })
-          arriveThen(agentId, 0, () => restorePresentation(agentId))
-        }, delay)
-      }
-    }
     const enteringStale = quality === 'stale' && lastSeenQuality !== 'stale'
     const enteringTerminal = terminal !== lastSeenTerminal
     if (quality !== lastSeenQuality) lastSeenQuality = quality
@@ -756,6 +735,29 @@ export function startMawChoreography(store) {
       }
       pendingEnter.clear()
     }
+    if (standbyFlip) {
+      // CR-11: the workday started/ended — relocate every RESTING member
+      // between its meeting-room seat and its standby work seat, staggered.
+      // Runs AFTER the generation bump: the relocations belong to the NEW
+      // generation (a same-dispatch terminal change must not swallow them).
+      let sweep = 0
+      for (const member of members) {
+        if (member.maw?.role === 'manager') continue
+        if (phaseOf(member.status) !== 'rest') continue
+        if (member.isMoving || member.journeyTarget) continue
+        const agentId = member.id
+        const seat = workflowActive ? stableWorkSeat(member) : stableRestSeat(member)
+        const delay = sweep * STAGGER_MS
+        sweep += 1
+        later(() => {
+          const live = store.getState().agents[agentId]
+          if (!live || phaseOf(live.status) !== 'rest') return
+          walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null, zoneBound: workflowActive ? 'member' : 'meeting' })
+          arriveThen(agentId, 0, () => restorePresentation(agentId))
+        }, delay)
+      }
+    }
+
     // Channel stale (producer lease expired): the snapshot already rests the figures
     // (buildMawMember), so no NEW walks — members hold where they are until a fresh
     // snapshot restores quality. prevPhase is intentionally kept: on recovery the
