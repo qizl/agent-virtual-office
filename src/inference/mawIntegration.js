@@ -6,7 +6,8 @@
 // are neutralized by the (epoch, seq) order in envelopeIsNewer, and the store's
 // applyMawSnapshot treats every accepted snapshot as the FULL member set.
 
-import { detectProjectMode } from '../systems/platformDetect'
+import { detectProjectMode, detectIntegrationConfig } from '../systems/platformDetect'
+import { startDashboardIntegration } from './dashboardIntegration.js'
 import { startMawChoreography } from '../systems/mawChoreography.js'
 
 const POLL_INTERVAL_MS = 2000
@@ -28,6 +29,8 @@ export function envelopeIsNewer(envelope, lastKey) {
 }
 
 export function startMawIntegration(store) {
+  const config = detectIntegrationConfig()
+  if (config.integration === 'dashboard') return startDashboardIntegration(store, config)
   let torn = false
   const choreographyCleanup = startMawChoreography(store)
   let source = null // 'sse' | 'poll'

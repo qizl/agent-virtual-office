@@ -158,7 +158,7 @@ class ConsistencyTest(unittest.TestCase):
                 fixtures.write(task_file, fixtures.task(1, "dev", "review-passed" if calls["n"] == 2 else "in-progress"))
             return real_read(project_root, task_id)
 
-        with mock.patch.object(maw_office, "read_runtime_state", alternating):
+        with mock.patch.object(maw_office.projection, "read_runtime_state", alternating):
             state = maw_office.read_with_consistency(root, "maw-synth-001", 30)
         self.assertTrue(state.get("_inconsistent"))
         snapshot = maw_office.build_snapshot(state, "p", 1, 1000)
@@ -237,7 +237,7 @@ class SubFileBoundaryTest(unittest.TestCase):
                 os.symlink(outside, workflow)
             return real_read(project_root, task_id)
 
-        with mock.patch.object(maw_office, "read_runtime_state", swap_mid_read):
+        with mock.patch.object(maw_office.projection, "read_runtime_state", swap_mid_read):
             with self.assertRaises(maw_office.BridgeError) as ctx:
                 maw_office.read_with_consistency(root, "maw-synth-001", 30)
         self.assertEqual(ctx.exception.code, "unsafe-file-type")
@@ -260,7 +260,7 @@ class SubFileBoundaryTest(unittest.TestCase):
                 os.symlink(outside / "maw-synth-001", real_dir)
             return state
 
-        with mock.patch.object(maw_office, "read_runtime_state", swap_after_first_read):
+        with mock.patch.object(maw_office.projection, "read_runtime_state", swap_after_first_read):
             with self.assertRaises(maw_office.BridgeError) as ctx:
                 maw_office.read_with_consistency(root, "maw-synth-001", 30)
         self.assertEqual(ctx.exception.code, "unsafe-file-type")

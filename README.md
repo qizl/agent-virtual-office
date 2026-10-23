@@ -253,6 +253,26 @@ python3.12 scripts/maw-office.py --serve --project-root /path/to/your-maw-projec
 - No snapshot for 120s? The office shows the stale/empty state — the bridge
   proves freshness; SSE being alive alone proves nothing.
 
+## Dashboard integration
+
+The MAW Dashboard can embed the full office with
+`/visualization/?integration=dashboard&project=<registered-id>&task=<task-id>`.
+Both identifiers are mandatory. This opt-in mode reads only the selected task
+through the Dashboard's same-origin Python API; it never discovers a different
+task. Language, appearance, office/list view and animation pause remain available.
+Manual status testing and workflow simulation are disabled at the state actions.
+
+The client polls every two seconds with one request in flight, supports retry,
+and marks the view stale after 120 seconds without a valid snapshot. A missing
+project or task clears the team. Recovery reconciles the current snapshot without
+replaying activity that was not observed. Default and independent `?mode=maw`
+entry points retain their existing transports.
+
+AVO is the only maintained frontend and projection source. The maintenance
+packager builds committed sources with Node >=22 and emits relative static
+resources plus `scripts/maw_projection.py`; Dashboard users need Python >=3.11,
+with no Node service or bridge. Set `OFFICE_DASHBOARD_BUILD=1` only for this build.
+
 ## Embedding & language
 
 ```

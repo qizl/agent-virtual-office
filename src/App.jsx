@@ -3,7 +3,7 @@ import PixelOffice from './components/PixelOffice'
 import ControlPanel from './components/ControlPanel'
 import ActivityFeed from './components/ActivityFeed'
 import ErrorBoundary from './components/ErrorBoundary'
-import { detectPlatform, getPlatformConfig } from './systems/platformDetect'
+import { detectPlatform, getPlatformConfig, detectIntegrationConfig } from './systems/platformDetect'
 import { useOfficeStore } from './systems/store'
 import { setLocale, locale, availableLocales } from './i18n'
 
@@ -15,8 +15,9 @@ function getDisplayMode() {
 
 export default function App() {
   const platform = useMemo(() => detectPlatform(), [])
-  const config = useMemo(() => getPlatformConfig(platform), [platform])
-  const mode = useMemo(() => getDisplayMode(), [])
+  const integration = useMemo(() => detectIntegrationConfig().integration, [])
+  const config = useMemo(() => getPlatformConfig(platform, integration), [platform, integration])
+  const mode = useMemo(() => integration === 'dashboard' ? 'full' : getDisplayMode(), [integration])
 
   // Global keyboard shortcuts: Space = pause, L = switch language
   useEffect(() => {

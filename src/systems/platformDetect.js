@@ -55,7 +55,9 @@ export function detectPlatform() {
 /**
  * Get platform-specific config adjustments
  */
-export function getPlatformConfig(platform) {
+export function getPlatformConfig(platform, integration = null) {
+  // Dashboard is an explicit complete-office view, regardless of iframe detection.
+  if (integration === 'dashboard') return getPlatformConfig('browser')
   const configs = {
     browser: {
       showControlPanel: true,
@@ -116,6 +118,8 @@ export function getPlatformConfig(platform) {
  * This is for the Level B inference - checks if we're in an AgentCortex project
  */
 export function detectProjectMode() {
+  if (typeof window === 'undefined') return 'agentcortex'
+  if (detectIntegrationConfig().integration === 'dashboard') return 'maw'
   // In browser context, we rely on URL params or config
   const params = new URLSearchParams(window.location.search)
   const mode = params.get('mode')
@@ -127,4 +131,14 @@ export function detectProjectMode() {
 
   // Fallback: agentcortex (full 7 agents)
   return 'agentcortex'
+}
+
+/** Explicit integrations never inherit a global or auto-discovered task selection. */
+export function detectIntegrationConfig(search = typeof window === 'undefined' ? '' : window.location.search) {
+  const params = new URLSearchParams(search)
+  if (params.get('integration') !== 'dashboard') return { integration: null, project: null, task: null, error: null }
+  const project = params.get('project')
+  const task = params.get('task')
+  const error = !project?.trim() ? 'missing-project' : !task?.trim() ? 'missing-task' : null
+  return { integration: 'dashboard', project, task, error }
 }

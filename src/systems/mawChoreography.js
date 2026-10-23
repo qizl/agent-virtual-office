@@ -362,7 +362,7 @@ export function planChoreography({ prevPhase, members, workSeatsByMember = new M
  * Create the running choreography controller. Returns a cleanup function.
  * `store` is the zustand office store.
  */
-export function startMawChoreography(store) {
+export function startMawChoreography(store, { resumeCurrent = false } = {}) {
   let torn = false
   const prevPhase = {}
   const prevHandover = new Map()
@@ -384,6 +384,7 @@ export function startMawChoreography(store) {
   let choreoEpoch = 0 // bumped when the channel degrades (stale / terminal): every pending callback dies with its generation
   let lastSeenQuality = null
   let lastSeenTerminal = false
+  let lastRecovery = 0 // Dashboard-only observation baseline; standalone replay remains unchanged
   let prevPostDesk = null // null = not yet observed; true = the team stands by at desks (CR-11)
   let standbySweepSeq = 0 // latest standby sweep — older sweeps' callbacks void themselves
   const pendingRelocation = new Map() // agentId -> { workflowActive } — deferred relocations for mid-walk members
@@ -725,6 +726,35 @@ export function startMawChoreography(store) {
     const s = store.getState()
     if (s.mode !== 'maw') return
     const members = Object.values(s.agents).filter((a) => a?.mawMember)
+    const recovery = s.mawMeta?.dashboard_recovery ?? 0
+    if (resumeCurrent && recovery !== lastRecovery) {
+      lastRecovery = recovery
+      // A disconnected Dashboard did not observe intermediate work. Cancel every
+      // old callback and baseline the CURRENT facts, without rest/task or handover replay.
+      choreoEpoch += 1
+      for (const timer of pendingTimers) clearTimeout(timer)
+      pendingTimers.clear()
+      pendingEnter.clear()
+      pendingRelocation.clear()
+      handoverQueue.length = 0
+      managerBusy = false
+      workingSince.clear()
+      restingSince.clear()
+      pruneGoneMembers(new Set(members.map((m) => m.id)))
+      const now = Date.now()
+      for (const member of members) {
+        prevPhase[member.id] = phaseOf(member.status)
+        prevHandover.set(member.id, member.status === 'awaiting-approval')
+        stableWorkSeat(member)
+        stableRestSeat(member)
+        if (phaseOf(member.status) === 'task') workingSince.set(member.id, now)
+        else restingSince.set(member.id, now)
+      }
+      prevPostDesk = s.mawMeta?.workflow != null && s.mawMeta?.terminal == null
+      lastSeenQuality = s.mawMeta?.quality ?? null
+      lastSeenTerminal = s.mawMeta?.terminal != null
+      return
+    }
     const quality = s.mawMeta?.quality ?? null
     const terminal = s.mawMeta?.terminal != null
     const enteringStale = quality === 'stale' && lastSeenQuality !== 'stale'

@@ -469,5 +469,22 @@
   },
   "pairLink": {
     "coediting": "同時在編輯"
+  },
+  "dashboard": {
+      "loading": "正在同步…",
+      "synced": "已同步",
+      "error": "同步失敗",
+      "missing": "所選任務無法使用",
+      "stale": "資料已過期，活動已暫停",
+      "configuration-error": "Dashboard 設定錯誤",
+      "missing-project": "缺少 project 參數",
+      "missing-task": "缺少 task 參數",
+      "project-not-found": "專案已移除",
+      "task-not-found": "任務已移除或不存在",
+      "client-sync-timeout": "120 秒內未取得有效回應",
+      "request-timeout": "請求逾時",
+      "read-failed": "無法讀取所選任務",
+      "invalid-snapshot": "快照無效或順序已過期",
+      "retry": "重試"
   }
 }

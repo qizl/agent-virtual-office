@@ -65,6 +65,8 @@ export default function ControlPanel({ platform = 'browser', mode = 'full' }) {
   // objects are never Object.is-equal, which breaks React 19's useSyncExternalStore
   // consistency check and causes an infinite update loop.
   const agentList = useOfficeStore(useShallow((s) => Object.values(s.agents)))
+  const isDashboard = useOfficeStore((s) => s.integration === 'dashboard')
+  const dashboardSync = useOfficeStore((s) => s.dashboardSync)
   const isPaused = useOfficeStore((s) => s.isPaused)
   const togglePause = useOfficeStore((s) => s.togglePause)
   const rosterMode = useOfficeStore((s) => s.rosterMode)
@@ -174,17 +176,7 @@ export default function ControlPanel({ platform = 'browser', mode = 'full' }) {
   }
   const isPanel = mode === 'panel'
 
-  const setStatus = (id, status) => {
-    useOfficeStore.setState((s) => {
-      if (!s.agents[id]) return s
-      return {
-        agents: {
-          ...s.agents,
-          [id]: { ...s.agents[id], status },
-        },
-      }
-    })
-  }
+  const setStatus = (id, status) => useOfficeStore.getState().setManualAgentStatus(id, status)
 
   const cycleLang = () => {
     const locales = availableLocales()
@@ -254,6 +246,18 @@ export default function ControlPanel({ platform = 'browser', mode = 'full' }) {
   // ─── Full mode: standard control panel ───
   return (
     <div className="fixed bottom-0 left-0 right-0 bg-white/90 dark:bg-gray-900/90 backdrop-blur border-t border-gray-200 dark:border-gray-700 px-3 py-1.5 text-xs select-none z-50">
+      {isDashboard && dashboardSync && (
+        <div className="mb-1 flex items-center justify-center gap-2 text-[11px] text-gray-600 dark:text-gray-300" role="status" data-dashboard-sync={dashboardSync.state}>
+          <span>{t(`dashboard.${dashboardSync.state}`, dashboardSync.state)}</span>
+          {dashboardSync.code && <span>{t(`dashboard.${dashboardSync.code}`, dashboardSync.code)}</span>}
+          {dashboardSync.lastValidAt != null && <span>{t('maw.lastSample')}: {new Date(dashboardSync.lastValidAt).toLocaleTimeString()}</span>}
+          {dashboardSync.state !== 'configuration-error' && <button
+            onClick={() => useOfficeStore.getState().requestDashboardSync()}
+            disabled={dashboardSync.retrying}
+            className="rounded border border-gray-300 px-1.5 py-0.5 disabled:opacity-50"
+          >{t('dashboard.retry', 'Retry')}</button>}
+        </div>
+      )}
       {/* Onboarding popover */}
       {showInfo && (
         <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-72 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg p-3 text-xs z-50">
@@ -318,12 +322,12 @@ export default function ControlPanel({ platform = 'browser', mode = 'full' }) {
             <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${rosterMode ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300' : 'bg-gray-200 text-gray-600 dark:bg-gray-700 dark:text-gray-300'}`}>{rosterMode ? '☰' : '🏢'}</span>
           </button>
           {/* Run workflow animation (was the blue Run bar button). */}
-          <button onClick={() => { triggerWorkflow(); setShowSettings(false) }}
+          {!isDashboard && <button onClick={() => { triggerWorkflow(); setShowSettings(false) }}
             className="w-full flex items-center justify-between px-2 py-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700/60 text-gray-700 dark:text-gray-200"
             title={t('aria.runWorkflow', 'Run workflow animation')}>
             <span>{t('settings.run', 'Run workflow')}</span>
             <span aria-hidden="true">▶</span>
-          </button>
+          </button>}
           {/* Help & shortcuts — opens the info popover (which carries metrics + platform). */}
           <button onClick={() => { setShowInfo(true); setShowSettings(false) }}
             className="w-full flex items-center justify-between px-2 py-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700/60 text-gray-700 dark:text-gray-200"
@@ -396,11 +400,11 @@ export default function ControlPanel({ platform = 'browser', mode = 'full' }) {
             </div>
           )}
           {/* Dev test panel toggle */}
-          <button role="switch" aria-checked={showTest} onClick={() => setShowTest((v) => !v)}
+          {!isDashboard && <button role="switch" aria-checked={showTest} onClick={() => setShowTest((v) => !v)}
             className="w-full flex items-center justify-between px-2 py-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700/60 text-gray-700 dark:text-gray-200">
             <span>{t('settings.testPanel', 'Test panel')}</span>
             <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${showTest ? 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300' : 'bg-gray-200 text-gray-500 dark:bg-gray-700 dark:text-gray-400'}`}>{showTest ? t('settings.on', 'On') : t('settings.off', 'Off')}</span>
-          </button>
+          </button>}
           <div className="border-t border-gray-100 dark:border-gray-700 my-1" />
           {/* AVO-115: opt-in cozy share postcard — an action, not a toggle. Lives here in ⚙, never the resting bar. */}
           <button onClick={handleShareCard} disabled={cardBusy}
@@ -508,7 +512,7 @@ export default function ControlPanel({ platform = 'browser', mode = 'full' }) {
         </div>
       )}
 
-      {showTest && (
+      {!isDashboard && showTest && (
         <div className="mt-1.5 pt-1.5 border-t border-gray-200 dark:border-gray-700">
           <div className="flex flex-wrap gap-2">
             {agentList.map((agent) => (

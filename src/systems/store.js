@@ -6,7 +6,7 @@ import { HOME_POSITIONS, OVERFLOW_POSITIONS, OVERFLOW_SLOT_BY_XY, clampToFloor, 
 import { randomBubble, setNameResolver, behaviorLabel, t as i18nT } from '../i18n'
 import { generateContextBubble } from './contextBubble'
 import { rng } from './rng.js'
-import { detectProjectMode } from './platformDetect'
+import { detectProjectMode, detectIntegrationConfig } from './platformDetect'
 import { STATUS_COLORS } from './constants.js'
 import { classifyTask, familyToBehavior, decideBehavior } from './classify.js'
 import { FEED_ORIGINS } from './rosterModel.js'
@@ -636,6 +636,7 @@ function applyMawSnapshotImpl(s, envelope) {
     quality: snapshot ? snapshot.quality : null,
     quality_detail: snapshot ? snapshot.quality_detail : null,
     terminal: snapshot ? snapshot.terminal : null,
+    dashboard_recovery: envelope.dashboard_recovery ?? 0,
   }
   const agents = { ...s.agents }
   const desired = new Map()
@@ -708,6 +709,24 @@ function applyMawSnapshotImpl(s, envelope) {
 
 export const useOfficeStore = create((set) => ({
   mode: _mode,
+  integration: detectIntegrationConfig().integration,
+  dashboardSync: null,
+  dashboardRetry: 0,
+  setDashboardSync: (sync) => set({ dashboardSync: sync }),
+  requestDashboardSync: () => set((s) => s.integration === 'dashboard' ? { dashboardRetry: s.dashboardRetry + 1 } : {}),
+  // The action owns the observation boundary; hiding a UI control alone is insufficient.
+  setManualAgentStatus: (id, status) => set((s) => {
+    if (s.integration === 'dashboard' || !s.agents[id] || !Object.hasOwn(STATUS_COLORS, status)) return {}
+    return { agents: { ...s.agents, [id]: { ...s.agents[id], status } } }
+  }),
+  freezeMawSnapshot: (detail = 'client-sync-timeout') => set((s) => {
+    if (s.integration !== 'dashboard') return {}
+    const agents = Object.fromEntries(Object.entries(s.agents).map(([id, agent]) => [id, {
+      ...agent, behavior: 'idle', expression: 'normal', isMoving: false, inGroupEvent: false,
+      targetPosition: { ...agent.position }, journeyTarget: null, groupTarget: null,
+    }]))
+    return { agents, doorTraffic: createDoorClaimState(), mawMeta: { ...s.mawMeta, quality: 'stale', quality_detail: detail } }
+  }),
   agents: initAgents(_mode),
   hour: new Date().getHours(),
   minute: new Date().getMinutes(),
@@ -1279,7 +1298,7 @@ export const useOfficeStore = create((set) => ({
     try { if (typeof window !== 'undefined') localStorage.setItem('avo.theme', id) } catch {}
     return { theme: id }
   }),
-  triggerWorkflow: () => set({ showWorkflow: true }),
+  triggerWorkflow: () => set((s) => s.integration === 'dashboard' ? {} : { showWorkflow: true }),
   endWorkflow: () => set({ showWorkflow: false }),
 
   // ─── External status integration ───
@@ -1323,6 +1342,8 @@ export const useOfficeStore = create((set) => ({
 
   applyExternalStatus: (updates, meta = {}) =>
     set((s) => {
+      // Dashboard facts belong only to its validated snapshot channel, including idle-gap inference.
+      if (s.integration === 'dashboard') return {}
       const now = meta.now || Date.now()
       const ext = { ...s.externalStatus }
       const agents = { ...s.agents }

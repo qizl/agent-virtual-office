@@ -862,6 +862,8 @@ function fileWatcherFallbackPlugin() {
 }
 
 export default defineConfig({
+  // Dashboard artifacts are mounted below /visualization/; regular builds keep the existing root base.
+  ...(process.env.OFFICE_DASHBOARD_BUILD === '1' ? { base: './' } : {}),
   plugins: [react(), tailwindcss(), officeStatusPlugin(), fileWatcherFallbackPlugin()],
   server: {
     strictPort: true,

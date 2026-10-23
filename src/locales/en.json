@@ -469,5 +469,22 @@
   },
   "pairLink": {
     "coediting": "both editing"
+  },
+  "dashboard": {
+      "loading": "Synchronizing…",
+      "synced": "Synchronized",
+      "error": "Synchronization failed",
+      "missing": "Selected task unavailable",
+      "stale": "Data is stale; activity is paused",
+      "configuration-error": "Dashboard configuration error",
+      "missing-project": "Missing project parameter",
+      "missing-task": "Missing task parameter",
+      "project-not-found": "Project was removed",
+      "task-not-found": "Task was removed or no longer exists",
+      "client-sync-timeout": "No valid response for 120 seconds",
+      "request-timeout": "Request timed out",
+      "read-failed": "Unable to read the selected task",
+      "invalid-snapshot": "Invalid or out-of-order snapshot",
+      "retry": "Retry"
   }
 }
