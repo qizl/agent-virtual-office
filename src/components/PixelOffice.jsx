@@ -811,17 +811,17 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
   const agentOrderSignature = useOfficeStore(useShallow((s) => getAgentOrderSignature(s.agents)))
 
   // CR-10: MAW work-seat nameplates — one per member's ASSIGNED seat (the stable
-  // maw.workSeat stamp), covering the overflow seats the four base desks don't
-  // reach. Seats already labeled through the base-desk mapping are skipped.
+  // maw.workSeat stamp), for EVERY seat including the base desks: the PersonalDesk
+  // labels are blanked in MAW mode, so these nameplates are the only "who sits
+  // here" marker.
   const mawSeatNameplates = useMemo(() => {
     if (!isMaw) return []
-    const baseLabeled = new Set(['260,264', '400,244', '340,364'])
     const out = []
     const seen = new Set()
     for (const a of Object.values(useOfficeStore.getState().agents)) {
       if (!a?.mawMember || !a.maw?.workSeat) continue
       const key = `${a.maw.workSeat.x},${a.maw.workSeat.y}`
-      if (baseLabeled.has(key) || seen.has(key)) continue
+      if (seen.has(key)) continue
       seen.add(key)
       out.push({ x: a.maw.workSeat.x, y: a.maw.workSeat.y, name: t(`characters.${a.maw.role}.name`), color: a.color })
     }
