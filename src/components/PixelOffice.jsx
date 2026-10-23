@@ -798,7 +798,9 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
   const isMaw = projectMode === 'maw'
   const mawDeskData = useMemo(() => {
     if (!isMaw) return DESK_DATA
-    const labelBySeat = { '140,240': 'manager', '260,240': 'decision-maker', '400,220': 'reviewer', '340,340': 'executor' }
+    // Keyed by SEAT coords (HOME/work seats), not desk coords — the manager's
+    // seat is the GATE (no desk), so the pm desk stays unlabeled in MAW mode.
+    const labelBySeat = { '260,264': 'decision-maker', '400,244': 'reviewer', '340,364': 'executor' }
     return DESK_DATA.map((d) => {
       const rosterId = labelBySeat[`${d.x},${d.y}`]
       return rosterId ? { ...d, label: t(`characters.${rosterId}.name`) } : { ...d, label: '' }
@@ -813,7 +815,7 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
   // reach. Seats already labeled through the base-desk mapping are skipped.
   const mawSeatNameplates = useMemo(() => {
     if (!isMaw) return []
-    const baseLabeled = new Set(['140,240', '260,240', '400,220', '340,340'])
+    const baseLabeled = new Set(['260,264', '400,244', '340,364'])
     const out = []
     const seen = new Set()
     for (const a of Object.values(useOfficeStore.getState().agents)) {
@@ -1237,7 +1239,7 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
         <ScaledText
           key={`seat-plate-${s.x}-${s.y}`}
           x={s.x}
-          y={s.y - 24}
+          y={s.y - 48}
           scale={labelTextScale}
           textAnchor="middle"
           fontSize="6"
