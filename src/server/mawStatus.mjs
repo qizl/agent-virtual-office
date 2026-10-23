@@ -77,6 +77,12 @@ export function createMawStatus({
   let snapshot = null // validated members + meta, or null = no-data
   let producer = null // { id, lastSeq, lastContentSha, startedAt, touchedAt }
   let lastConsumptionAt = null
+  // Quality of the LAST published envelope (null = no-data). A quality transition
+  // (ok → derived stale, stale → restored ok, any → cleared) consumes a NEW server
+  // seq: the derived stale snapshot otherwise shares the accepted POST's seq, so a
+  // delayed transport frame carrying the older ok payload would tie on (epoch, seq)
+  // and re-activate the office over newer stale state (review 2026-10-23 P1).
+  let publishedQuality = null
   const sseClients = new Set()
   let heartbeat = null
   let staleTimer = null
@@ -117,10 +123,16 @@ export function createMawStatus({
   }
 
   function envelope() {
+    const effective = effectiveSnapshot()
+    const quality = effective ? effective.quality : null
+    if (quality !== publishedQuality) {
+      serverSeq += 1
+      publishedQuality = quality
+    }
     return {
       server_epoch: epoch,
       seq: serverSeq,
-      snapshot: effectiveSnapshot(),
+      snapshot: effective,
       server_time: now(),
       consumer_count: sseClients.size,
     }
@@ -131,6 +143,7 @@ export function createMawStatus({
     producer = null
     epoch += 1
     serverSeq += 1
+    publishedQuality = null
     if (staleTimer) { clearTimeout(staleTimer); staleTimer = null }
   }
 
@@ -339,6 +352,7 @@ export function createMawStatus({
       producer.lastContentSha = contentSha
       producer.touchedAt = now()
       serverSeq += 1
+      publishedQuality = body.quality
       snapshot = {
         schema: SCHEMA,
         workflow: capString(body.workflow, 200),

@@ -14,9 +14,10 @@ import {
   clampToMemberZone,
 } from '../src/systems/mawChoreography.js'
 
-// Zone rules (owner, 2026-10-22): the manager may enter every area; other
-// members may enter the meeting room, the main office and BOTH bottom rooms
-// (lounge, research) — never the entrance area where the gate sits.
+// Zone rules (plan §4.1): the manager may enter every area; other members may
+// enter the meeting room, the main office and BOTH bottom rooms (lounge,
+// research) — never the entrance area where the gate sits. Rest SEATS live in
+// the meeting room only (§3.2: the bottom rooms are wander scenery).
 
 const ENTRANCE = { x1: 0, y1: 0, x2: 598, y2: 148 }
 const MEETING = ZONE_FLOOR_RECTS.meetingRoom
@@ -29,11 +30,10 @@ function member(id, role, status) {
 }
 
 describe('maw choreography planning', () => {
-  it('rest seats land inside the rest areas, stay stable and seat everyone uniquely', () => {
-    const inRest = (p) => inRect(p, MEETING) || inRect(p, LOUNGE) || inRect(p, RESEARCH)
+  it('rest seats land inside the meeting room, stay stable and seat everyone uniquely', () => {
     for (const id of ['aaa001', 'bbb002', 'ccc003']) {
       const { seat } = restSeatFor(id)
-      expect(inRest(seat)).toBe(true)
+      expect(inRect(seat, MEETING)).toBe(true)
       expect(violatesMemberZone(seat)).toBe(false)
       expect(restSeatFor(id).seat).toEqual(seat) // stable per member
     }
@@ -131,9 +131,8 @@ describe('maw choreography planning', () => {
     const restActions = planChoreography({ prevPhase, members: resting })
     expect(restActions).toHaveLength(3)
     for (const action of restActions) {
-      // all three rooms are rest areas per the owner rule; nobody rests at the gate
-      const inRest = inRect(action.target, MEETING) || inRect(action.target, LOUNGE) || inRect(action.target, RESEARCH)
-      expect(inRest).toBe(true)
+      // all rest seats are meeting-room seats per the plan; nobody rests at the gate
+      expect(inRect(action.target, MEETING)).toBe(true)
       expect(violatesMemberZone(action.target)).toBe(false)
     }
   })
@@ -152,9 +151,11 @@ describe('maw choreography planning', () => {
   })
 })
 
-// Controller-level regressions (codex review 2026-10-22): the earlier review
-// batch failed the implementation because every P1 lived in the RUNNING
-// controller — the pure-function tests above could not catch them.
+// Controller-level regressions (codex reviews 2026-10-22/23): the earlier review
+// batches failed the implementation because every P1 lived in the RUNNING
+// controller — the pure-function tests above could not catch them. The walker
+// below stands in for the React journey engine (groupTarget → position), which
+// headless tests must simulate for "physical arrival" to mean anything.
 
 function envelope(members, seq = 1) {
   return {
@@ -174,6 +175,26 @@ function envelope(members, seq = 1) {
 function mawMember(id, role, status = 'working') {
   return { id, role, status, label: `${id} · label`, detail: null, round: 1, task_kind: 'dev', verdict: null, terminate: null, stalled: false }
 }
+
+function installWalker(store) {
+  // Emulates the journey engine: a published groupTarget is walked — position
+  // converges to it after ~500ms. Without this, the controller's arrival polls
+  // would (correctly) never declare arrival in a headless store.
+  return store.subscribe(() => {
+    for (const a of Object.values(store.getState().agents)) {
+      if (!a?.inGroupEvent || !a.groupTarget) continue
+      if (a.position?.x === a.groupTarget.x && a.position?.y === a.groupTarget.y) continue
+      setTimeout(() => {
+        const cur = store.getState().agents[a.id]
+        if (!cur?.inGroupEvent || !cur.groupTarget) return
+        if (cur.position?.x === cur.groupTarget.x && cur.position?.y === cur.groupTarget.y) return
+        store.setState({ agents: { ...store.getState().agents, [a.id]: { ...cur, position: { x: cur.groupTarget.x, y: cur.groupTarget.y } } } })
+      }, 500)
+    }
+  })
+}
+
+const near = (gt, seat, eps = 60) => Boolean(gt) && Math.hypot(gt.x - seat.x, gt.y - seat.y) < eps
 
 describe('startMawChoreography (controller)', () => {
   beforeEach(() => {
@@ -199,6 +220,7 @@ describe('startMawChoreography (controller)', () => {
   it('a long-working member takes a zone-safe wander and returns to the stable work seat', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
+    installWalker(store)
     try {
       store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'working')]))
       vi.advanceTimersByTime(95_000) // past LONG_WORK_MS, through 5s wander ticks
@@ -218,11 +240,11 @@ describe('startMawChoreography (controller)', () => {
   it('entering awaiting-approval hands over at the member\'s stable seat; the lock releases after every leg', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
+    installWalker(store)
     try {
       store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor')]))
       vi.advanceTimersByTime(2_000) // settle the enter walks
       const stableSeat = useOfficeStore.getState().agents['exe01~executor'].position
-      const near = (gt, seat) => Math.hypot(gt.x - seat.x, gt.y - seat.y) < 60 // avoidOverlap may side-step the occupied desk
 
       store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor', 'awaiting-approval')], 2))
       vi.advanceTimersByTime(1_000)
@@ -245,6 +267,7 @@ describe('startMawChoreography (controller)', () => {
   it('queued handovers are serialized: the manager visits members one at a time in order', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
+    installWalker(store)
     try {
       store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor'), mawMember('exe02', 'executor')]))
       vi.advanceTimersByTime(2_000)
@@ -252,13 +275,23 @@ describe('startMawChoreography (controller)', () => {
       const seat2 = useOfficeStore.getState().agents['exe02~executor'].position
       expect(`${seat1.x},${seat1.y}`).not.toBe(`${seat2.x},${seat2.y}`) // unique stable seats
 
+      const handoverBubbles = []
       const visits = []
-      let last = null
+      let lastBubble = null
+      let lastTarget = null
       const unsubscribe = store.subscribe(() => {
         const m = store.getState().agents['mgr01~manager']
+        // The chat bubble names the member being visited — order is read from it
+        // (groupTarget alone is ambiguous: avoidOverlap pushes the manager off the
+        // occupied desk, sometimes closer to the OTHER member's seat).
+        const b = m?.behavior === 'chat' && m.inGroupEvent ? m.bubble : null
+        if (b && b !== lastBubble) {
+          lastBubble = b
+          handoverBubbles.push(b)
+        }
         const t = m?.groupTarget ? `${m.groupTarget.x},${m.groupTarget.y}` : null
-        if (t !== last) {
-          last = t
+        if (t !== lastTarget) {
+          lastTarget = t
           if (t) visits.push(t)
         }
       })
@@ -271,13 +304,10 @@ describe('startMawChoreography (controller)', () => {
       vi.advanceTimersByTime(60_000)
       unsubscribe()
 
-      const key = (p) => `${p.x},${p.y}`
-      const nearIndex = (seat, from = 0) => visits.findIndex((v, i) => i >= from && Math.hypot(v.split(',')[0] - seat.x, v.split(',')[1] - seat.y) < 60)
-      const first = nearIndex(seat1)
-      const second = nearIndex(seat2, first + 1)
-      expect(first).toBeGreaterThanOrEqual(0)
-      expect(second).toBeGreaterThan(first) // strict order — no interleaved handovers
-      expect(visits[visits.length - 1]).toBe(key(MANAGER_GATE)) // ends at the gate
+      expect(handoverBubbles).toHaveLength(2) // each handover dwelled exactly once
+      expect(handoverBubbles[0]).toContain('exe01')
+      expect(handoverBubbles[1]).toContain('exe02') // strict order — no interleaved handovers
+      expect(visits[visits.length - 1]).toBe(`${MANAGER_GATE.x},${MANAGER_GATE.y}`) // ends at the gate
       expect(useOfficeStore.getState().agents['mgr01~manager'].inGroupEvent).toBe(false)
       for (const id of ['exe01~executor', 'exe02~executor']) {
         const a = useOfficeStore.getState().agents[id]
@@ -289,9 +319,153 @@ describe('startMawChoreography (controller)', () => {
     }
   })
 
+  it('a second deliverer returns to the seat immediately while the manager is busy on the first handover', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    try {
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager'), mawMember('exe01', 'executor'), mawMember('exe02', 'executor')]))
+      vi.advanceTimersByTime(2_000)
+      const seat1 = useOfficeStore.getState().agents['exe01~executor'].position
+
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('mgr01', 'manager'),
+        mawMember('exe01', 'executor', 'awaiting-approval'),
+        mawMember('exe02', 'executor'),
+      ], 2))
+      vi.advanceTimersByTime(600) // the manager is now on the FIRST handover leg
+      expect(near(useOfficeStore.getState().agents['mgr01~manager'].groupTarget, seat1)).toBe(true)
+
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('mgr01', 'manager'),
+        mawMember('exe01', 'executor', 'awaiting-approval'),
+        mawMember('exe02', 'executor', 'awaiting-approval'),
+      ], 3))
+      vi.advanceTimersByTime(50)
+      // exe02's return walk starts WITHOUT waiting behind the manager's queue
+      expect(useOfficeStore.getState().agents['exe02~executor'].inGroupEvent).toBe(true)
+
+      vi.advanceTimersByTime(60_000) // everything settles; nothing loops
+      const manager = useOfficeStore.getState().agents['mgr01~manager']
+      expect(manager.inGroupEvent).toBe(false)
+      expect(manager.bubble).toBeNull()
+      for (const id of ['exe01~executor', 'exe02~executor']) {
+        const a = useOfficeStore.getState().agents[id]
+        expect(a.behavior).toBe('await-approval')
+        expect(a.inGroupEvent).toBe(false)
+      }
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('a manager whose first status is awaiting-approval still releases the walk lock at the gate', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    try {
+      store.getState().applyMawSnapshot(envelope([mawMember('mgr01', 'manager', 'awaiting-approval')]))
+      vi.advanceTimersByTime(30_000)
+      const m = useOfficeStore.getState().agents['mgr01~manager']
+      expect(m.inGroupEvent).toBe(false) // the lock is NOT held forever
+      expect(m.groupTarget).toBeNull()
+      expect(m.behavior).toBe('await-approval') // the honest status animation, restored
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('a stale transition invalidates every pending delayed callback', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    try {
+      store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'idle'), mawMember('rev01', 'reviewer', 'idle')]))
+      vi.advanceTimersByTime(100)
+      store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'working'), mawMember('rev01', 'reviewer', 'working')], 2))
+      vi.advanceTimersByTime(100) // exe01 walked (delay 0); rev01's enter is still pending (delay 1500)
+      expect(store.getState().agents['exe01~executor'].inGroupEvent).toBe(true)
+      const frozen = store.getState().agents['rev01~reviewer']
+      expect(frozen.inGroupEvent).toBe(false)
+
+      useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, quality: 'stale' } })
+      vi.advanceTimersByTime(5_000)
+      const after = store.getState().agents['rev01~reviewer']
+      expect(after.inGroupEvent).toBe(false) // the stale enter never walked
+      expect(after.groupTarget).toBeNull()
+      expect(after.position).toEqual(frozen.position)
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('a terminal snapshot invalidates pending delayed callbacks too', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    try {
+      store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'idle'), mawMember('rev01', 'reviewer', 'idle')]))
+      vi.advanceTimersByTime(100)
+      store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'working'), mawMember('rev01', 'reviewer', 'working')], 2))
+      vi.advanceTimersByTime(100)
+      const frozen = store.getState().agents['rev01~reviewer']
+
+      useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, terminal: { status: 'completed' } } })
+      vi.advanceTimersByTime(5_000)
+      const after = store.getState().agents['rev01~reviewer']
+      expect(after.inGroupEvent).toBe(false)
+      expect(after.position).toEqual(frozen.position)
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('stagger delays are per migration batch, never cumulative across the session', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    try {
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('m1x', 'executor', 'idle'),
+        mawMember('m2x', 'reviewer', 'idle'),
+        mawMember('m3x', 'decision-maker', 'idle'),
+        mawMember('m4x', 'reviewer', 'idle'),
+      ]))
+      vi.advanceTimersByTime(100)
+      // batch 1: m1x enters at 0ms, m2x at 1500ms
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('m1x', 'executor', 'working'),
+        mawMember('m2x', 'reviewer', 'working'),
+        mawMember('m3x', 'decision-maker', 'idle'),
+        mawMember('m4x', 'reviewer', 'idle'),
+      ], 2))
+      vi.advanceTimersByTime(100)
+      expect(store.getState().agents['m1x~executor'].inGroupEvent).toBe(true)
+      expect(store.getState().agents['m2x~reviewer'].inGroupEvent).toBe(false) // still waiting on 1500ms
+
+      // batch 2 at t=200ms: with cumulative stagger m3x would owe 2×1500ms —
+      // per-batch it walks at 0ms.
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('m1x', 'executor', 'working'),
+        mawMember('m2x', 'reviewer', 'working'),
+        mawMember('m3x', 'decision-maker', 'working'),
+        mawMember('m4x', 'reviewer', 'working'),
+      ], 3))
+      vi.advanceTimersByTime(50)
+      expect(store.getState().agents['m3x~decision-maker'].inGroupEvent).toBe(true) // walked without the batch-1 debt
+      expect(store.getState().agents['m4x~reviewer'].inGroupEvent).toBe(false) // its own batch slot is 1500ms
+      expect(store.getState().agents['m2x~reviewer'].inGroupEvent).toBe(false) // fires at t≈1600ms, unchanged
+
+      vi.advanceTimersByTime(1_600)
+      expect(store.getState().agents['m2x~reviewer'].inGroupEvent).toBe(true)
+      expect(store.getState().agents['m4x~reviewer'].inGroupEvent).toBe(true)
+    } finally {
+      cleanup()
+    }
+  })
+
   it('a member who finishes walks to their stable rest seat and the rest animation is honest', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
+    installWalker(store)
     try {
       store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'working')]))
       vi.advanceTimersByTime(2_000)

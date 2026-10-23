@@ -5,7 +5,9 @@ import json
 import os
 import threading
 import unittest
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 import fixtures
 from fixtures import maw_office
@@ -92,6 +94,98 @@ class NoProxyTest(unittest.TestCase):
             self.assertTrue(ack["ok"])
             self.assertEqual(capture.requests[0]["path"], "/api/maw/status")
             self.assertEqual(capture.requests[0]["host"], f"127.0.0.1:{capture.port}")
+        finally:
+            capture.stop()
+
+
+class DeleteCaptureServer:
+    """Minimal local DELETE capture point."""
+
+    def __init__(self):
+        self.requests = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_DELETE(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8")
+                outer.requests.append({
+                    "path": self.path,
+                    "host": self.headers.get("Host"),
+                    "token": self.headers.get("X-Office-Token"),
+                    "body": json.loads(body) if body else None,
+                })
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True}).encode())
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class ReleaseLeaseTest(unittest.TestCase):
+    """The Ctrl+C cleanup DELETE carries the synthetic token, so it must reuse the
+    POST transport policy verbatim (review 2026-10-23 P1: the cleanup branch used
+    the default opener and delivered the token to a configured proxy)."""
+
+    def test_cleanup_delete_reaches_the_validated_target(self):
+        capture = DeleteCaptureServer()
+        try:
+            maw_office.release_lease(
+                f"http://127.0.0.1:{capture.port}", "producer-xyz", "secret-token",
+                host_header=f"127.0.0.1:{capture.port}",
+            )
+            self.assertEqual(len(capture.requests), 1)
+            req = capture.requests[0]
+            self.assertEqual(req["path"], "/api/maw/status")
+            self.assertEqual(req["token"], "secret-token")
+            self.assertEqual(req["body"], {"producer": "producer-xyz"})
+            self.assertEqual(req["host"], f"127.0.0.1:{capture.port}")
+        finally:
+            capture.stop()
+
+    def test_release_opener_disables_proxies_and_redirects(self):
+        built = {}
+        original = urllib.request.build_opener
+
+        def spy(*handlers):
+            built["handlers"] = handlers
+            return original(*handlers)
+
+        capture = DeleteCaptureServer()
+        try:
+            with mock.patch("urllib.request.build_opener", spy):
+                maw_office.release_lease(f"http://127.0.0.1:{capture.port}", "p1", None)
+            handlers = built["handlers"]
+            self.assertTrue(any(h is maw_office.NoRedirect or isinstance(h, maw_office.NoRedirect) for h in handlers))
+            self.assertTrue(any(isinstance(h, urllib.request.ProxyHandler) and h.proxies == {} for h in handlers))
+        finally:
+            capture.stop()
+
+    def test_configured_environment_proxy_cannot_intercept_the_cleanup(self):
+        capture = DeleteCaptureServer()
+        try:
+            saved = {k: v for k, v in os.environ.items() if k.lower().endswith("_proxy")}
+            os.environ["http_proxy"] = f"http://127.0.0.1:{capture.port + 1}"  # dead port
+            os.environ["HTTP_PROXY"] = f"http://127.0.0.1:{capture.port + 1}"
+            try:
+                maw_office.release_lease(f"http://127.0.0.1:{capture.port}", "p1", "t")
+            finally:
+                for key in ("http_proxy", "HTTP_PROXY"):
+                    if key in saved:
+                        os.environ[key] = saved[key]
+                    else:
+                        os.environ.pop(key, None)
+            self.assertEqual(len(capture.requests), 1)  # arrived directly — the proxy was never consulted
         finally:
             capture.stop()
 

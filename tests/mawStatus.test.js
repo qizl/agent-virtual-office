@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import http from 'node:http'
 import { createMawStatus, MAW_MEMBER_LIMIT, MAW_MAX_BODY_BYTES } from '../src/server/mawStatus.mjs'
+import { envelopeIsNewer } from '../src/inference/mawIntegration.js'
 
 // Drive the connect-style middleware through a real HTTP server so POST/GET/SSE
 // semantics (lease, epoch/seq, consumer idle) are exercised end to end.
@@ -265,6 +266,24 @@ describe('MAW transport hardening (review 2026-10-22)', () => {
     expect(ack.ok).toBe(true)
     const good = await (await fetch(`${base}/api/maw/status`)).json()
     expect(good.snapshot.quality).toBe('ok')
+  })
+
+  it('a derived stale transition consumes a NEW server seq — a delayed ok envelope loses the (epoch, seq) order', async () => {
+    const { base } = await makeChannel()
+    await fetch(`${base}/api/maw/status`, { method: 'POST', body: JSON.stringify(snapshot()) })
+    const slowCopy = await (await fetch(`${base}/api/maw/status`)).json() // a transport frame delayed in flight
+    clock += 121_000 // beyond MAW_LEASE_TTL_MS
+    const staleEnvelope = await (await fetch(`${base}/api/maw/status`)).json()
+    expect(staleEnvelope.snapshot.quality).toBe('stale')
+    expect(staleEnvelope.seq).toBeGreaterThan(slowCopy.seq) // the transition is a new sortable revision
+    expect(envelopeIsNewer(staleEnvelope, [slowCopy.server_epoch, slowCopy.seq])).toBe(true)
+    expect(envelopeIsNewer(slowCopy, [staleEnvelope.server_epoch, staleEnvelope.seq])).toBe(false) // the stale frame can never be re-activated
+
+    const fresh = snapshot({ seq: 2, sampled_at: 2000 })
+    await fetch(`${base}/api/maw/status`, { method: 'POST', body: JSON.stringify(fresh) })
+    const restored = await (await fetch(`${base}/api/maw/status`)).json()
+    expect(restored.snapshot.quality).toBe('ok')
+    expect(restored.seq).toBeGreaterThan(staleEnvelope.seq) // restore is newer still
   })
 
   it('the idempotent duplicate digest binds the full snapshot, not just members', async () => {

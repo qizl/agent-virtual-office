@@ -92,6 +92,22 @@ def safe_resolve(root: Path, relative: str) -> Path:
     return candidate
 
 
+def checked_path(base: Path, *parts: str) -> Path:
+    """Compose base/parts and refuse symlink components or non-regular final
+    files BEFORE reading. safe_resolve only guards root-relative task refs —
+    every sub-read (task.json, workflow.json, role dirs, role files, listener
+    state) composes BELOW it and must hold the same boundary: a symlinked
+    sub-file or role directory must not turn into an out-of-project read."""
+    current = base
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise BridgeError("unsafe-file-type", f"symlink in runtime rejected: {current}", EXIT_REFUSED)
+    if current.exists() and not (current.is_file() or current.is_dir()):
+        raise BridgeError("unsafe-file-type", f"non-regular file in runtime: {current}", EXIT_REFUSED)
+    return current
+
+
 def read_json_capped(path: Path):
     """Return (data, degraded_reason). degraded_reason is None, 'missing',
     'corrupt' or 'unknown-schema' (schema_family, expected passed separately)."""
@@ -182,14 +198,14 @@ def read_runtime_state(project_root: Path, task_id: str) -> dict:
     task_dir = safe_resolve(project_root, f"{RUNTIME_REL}/{task_id}")
     degraded: list[str] = []
 
-    manifest, why = read_json_schema(task_dir / "task.json", MANIFEST_SCHEMAS)
+    manifest, why = read_json_schema(checked_path(task_dir, "task.json"), MANIFEST_SCHEMAS)
     if manifest is None:
         degraded.append(f"task.json:{why}")
         return {"degraded": degraded, "manifest": None, "project_root": project_root, "task_id": task_id,
                 "workflow": None, "roles": {}, "listener_fresh": None, "handoff_present": False,
                 "plan_state": "unknown"}
 
-    workflow, why = read_json_schema(task_dir / "workflow.json", WORKFLOW_SCHEMAS)
+    workflow, why = read_json_schema(checked_path(task_dir, "workflow.json"), WORKFLOW_SCHEMAS)
     if workflow is None and why != "missing":
         degraded.append(f"workflow.json:{why}")
 
@@ -200,19 +216,22 @@ def read_runtime_state(project_root: Path, task_id: str) -> dict:
         entries = []
     scanned = 0
     for entry in entries:
-        if not entry.is_dir() or entry.name.startswith((".", "context")):
+        if entry.name.startswith((".", "context")):
+            continue
+        if not ROLE_FOLDER_RE.fullmatch(entry.name):
             continue
         folder = entry.name
-        if not ROLE_FOLDER_RE.fullmatch(folder):
+        checked_path(task_dir, folder)  # a symlinked role dir must not leak outside reads
+        if not entry.is_dir():
             continue
         scanned += 1
         if scanned > MAX_TASK_FILES:
             degraded.append("role-folders:limit")
             break
-        ready, why = read_json_schema(entry / "ready.json", {READY_SCHEMA})
+        ready, why = read_json_schema(checked_path(entry, "ready.json"), {READY_SCHEMA})
         if ready is None and why != "missing":
             degraded.append(f"{folder}/ready.json:{why}")
-        terminate, why = read_json_schema(entry / "terminate.json", {TERMINATE_SCHEMA})
+        terminate, why = read_json_schema(checked_path(entry, "terminate.json"), {TERMINATE_SCHEMA})
         if terminate is None and why != "missing":
             degraded.append(f"{folder}/terminate.json:{why}")
         tasks = []
@@ -224,7 +243,7 @@ def read_runtime_state(project_root: Path, task_id: str) -> dict:
             degraded.append(f"{folder}/tasks:limit")
             children = children[:MAX_TASK_FILES]
         for child in children:
-            task, why = read_json_schema(child, TASK_SCHEMAS)
+            task, why = read_json_schema(checked_path(entry, child.name), TASK_SCHEMAS)
             if task is None:
                 if why != "missing":
                     degraded.append(f"{folder}/{child.name}:{why}")
@@ -237,7 +256,7 @@ def read_runtime_state(project_root: Path, task_id: str) -> dict:
         }
 
     listener_fresh = None
-    listener, why = read_json_capped(task_dir / "context" / "listener-state.json")
+    listener, why = read_json_capped(checked_path(task_dir, "context", "listener-state.json"))
     if isinstance(listener, dict):
         listener_fresh = bool(listener.get("updated_at"))
     elif why not in (None, "missing"):
@@ -245,7 +264,7 @@ def read_runtime_state(project_root: Path, task_id: str) -> dict:
 
     handoff_present = False
     try:
-        handoff = task_dir / "context" / "handoff.md"
+        handoff = checked_path(task_dir, "context", "handoff.md")
         if handoff.exists() and handoff.is_file():
             handoff_present = True  # existence only — the body is never read
     except OSError:
@@ -255,7 +274,8 @@ def read_runtime_state(project_root: Path, task_id: str) -> dict:
     plan_ref = manifest.get("plan_ref")
     if isinstance(plan_ref, str) and plan_ref:
         try:
-            plan_path = safe_resolve(project_root, plan_ref)
+            safe_resolve(project_root, plan_ref)  # containment + traversal validation
+            plan_path = checked_path(project_root, *Path(plan_ref).parts)  # symlink re-walked at read time
             if plan_path.is_file():
                 digest = hashlib.sha256(plan_path.read_bytes()).hexdigest()
                 expected = manifest.get("plan_digest")
@@ -288,14 +308,14 @@ def fingerprint(state: dict) -> str:
     for relative in ["task.json", "workflow.json"]:
         try:
             hasher.update(relative.encode())
-            hasher.update((task_dir / relative).read_bytes())
+            hasher.update(checked_path(task_dir, relative).read_bytes())
         except OSError:
             hasher.update(f"{relative}:absent".encode())
     for folder in sorted(state["roles"]):
         for name in ("ready.json", "terminate.json"):
             try:
                 hasher.update(f"{folder}/{name}".encode())
-                hasher.update((task_dir / folder / name).read_bytes())
+                hasher.update(checked_path(task_dir, folder, name).read_bytes())
             except OSError:
                 hasher.update(f"{folder}/{name}:absent".encode())
         for task in state["roles"][folder]["tasks"]:
@@ -661,6 +681,27 @@ class TransportRetry(Exception):
     pass
 
 
+def release_lease(base_url: str, producer_id: str, token: str | None, host_header: str | None = None) -> None:
+    """Ctrl+C cleanup DELETE. It reuses the POST transport policy verbatim — the
+    validated literal target, proxies disabled, redirects disabled — because the
+    request carries the same synthetic X-Office-Token: a configured environment
+    proxy must never see it (review 2026-10-23 P1: the cleanup branch used the
+    default opener and delivered the token to a local isolation proxy)."""
+    request = urllib.request.Request(
+        f"{base_url}/api/maw/status",
+        data=json.dumps({"producer": producer_id}).encode("utf-8"),
+        method="DELETE",
+        headers={
+            "Content-Type": "application/json",
+            **({"Host": host_header} if host_header else {}),
+            **({"X-Office-Token": token} if token else {}),
+        },
+    )
+    opener = urllib.request.build_opener(NoRedirect, urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=HTTP_TIMEOUT_S) as response:
+        response.read()
+
+
 # ─── orchestration ───────────────────────────────────────────────────────────
 
 
@@ -758,9 +799,7 @@ def run(args) -> int:
     except KeyboardInterrupt:
         log("interrupted")
         try:
-            request = urllib.request.Request(f"{base_url}/api/maw/status", data=json.dumps({"producer": producer_id}).encode(), method="DELETE",
-                                             headers={"Content-Type": "application/json", **({"X-Office-Token": token} if token else {})})
-            urllib.request.build_opener(NoRedirect).open(request, timeout=HTTP_TIMEOUT_S).read()
+            release_lease(base_url, producer_id, token, host_header=office_host_header)
             log("lease released")
         except Exception:
             pass

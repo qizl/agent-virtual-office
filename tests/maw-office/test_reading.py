@@ -170,6 +170,78 @@ class ConsistencyTest(unittest.TestCase):
         state = maw_office.read_with_consistency(root, "maw-synth-001", 30)
         self.assertFalse(state.get("_inconsistent"))
 
+class SubFileBoundaryTest(unittest.TestCase):
+    """The read boundary holds for EVERY composed path, not just the task dir
+    (review 2026-10-23 P2: symlinked sub-files and role dirs were read directly)."""
+
+    def test_symlinked_manifest_is_rejected(self):
+        root = fixtures.build_runtime(fixtures.uuid_tmp())
+        outside = fixtures.uuid_tmp() / "secret.json"
+        outside.write_text("{}", encoding="utf-8")
+        task_json = root / RUNTIME_REL / "maw-synth-001" / "task.json"
+        task_json.unlink()
+        os.symlink(outside, task_json)
+        with self.assertRaises(maw_office.BridgeError) as ctx:
+            maw_office.read_runtime_state(root, "maw-synth-001")
+        self.assertEqual(ctx.exception.code, "unsafe-file-type")
+
+    def test_symlinked_role_dir_is_rejected(self):
+        root = fixtures.build_runtime(fixtures.uuid_tmp())
+        outside = fixtures.uuid_tmp() / "outside-role"
+        outside.mkdir(parents=True)
+        link = root / RUNTIME_REL / "maw-synth-001" / "executor-9"
+        os.symlink(outside, link)
+        with self.assertRaises(maw_office.BridgeError) as ctx:
+            maw_office.read_runtime_state(root, "maw-synth-001")
+        self.assertEqual(ctx.exception.code, "unsafe-file-type")
+
+    def test_symlinked_role_file_is_rejected(self):
+        root = fixtures.build_runtime(fixtures.uuid_tmp())
+        outside = fixtures.uuid_tmp() / "ready.json"
+        outside.write_text("{}", encoding="utf-8")
+        ready = root / RUNTIME_REL / "maw-synth-001" / "executor-1" / "ready.json"
+        ready.unlink()
+        os.symlink(outside, ready)
+        with self.assertRaises(maw_office.BridgeError) as ctx:
+            maw_office.read_runtime_state(root, "maw-synth-001")
+        self.assertEqual(ctx.exception.code, "unsafe-file-type")
+
+    def test_symlinked_listener_state_is_rejected(self):
+        root = fixtures.build_runtime(fixtures.uuid_tmp())
+        outside = fixtures.uuid_tmp() / "listener.json"
+        outside.write_text("{}", encoding="utf-8")
+        context_dir = root / RUNTIME_REL / "maw-synth-001" / "context"
+        context_dir.mkdir()
+        os.symlink(outside, context_dir / "listener-state.json")
+        with self.assertRaises(maw_office.BridgeError) as ctx:
+            maw_office.read_runtime_state(root, "maw-synth-001")
+        self.assertEqual(ctx.exception.code, "unsafe-file-type")
+
+    def test_consistency_read_refuses_a_symlink_swapped_after_the_first_read(self):
+        root = fixtures.build_runtime(fixtures.uuid_tmp())
+        outside = fixtures.uuid_tmp() / "swapped.json"
+        outside.write_text("{}", encoding="utf-8")
+        workflow = root / RUNTIME_REL / "maw-synth-001" / "workflow.json"
+        original = workflow.read_text()
+        workflow.unlink()
+        os.symlink(outside, workflow)
+        workflow.unlink()
+        workflow.write_text(original, encoding="utf-8")
+        calls = {"n": 0}
+        real_read = maw_office.read_runtime_state
+
+        def swap_mid_read(project_root, task_id):
+            calls["n"] += 1
+            if calls["n"] == 2:  # the fingerprint re-read sees the hostile swap
+                workflow.unlink()
+                os.symlink(outside, workflow)
+            return real_read(project_root, task_id)
+
+        with mock.patch.object(maw_office, "read_runtime_state", swap_mid_read):
+            with self.assertRaises(maw_office.BridgeError) as ctx:
+                maw_office.read_with_consistency(root, "maw-synth-001", 30)
+        self.assertEqual(ctx.exception.code, "unsafe-file-type")
+
 
 if __name__ == "__main__":
     unittest.main()
