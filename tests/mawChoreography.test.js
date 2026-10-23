@@ -498,6 +498,46 @@ describe('startMawChoreography (controller)', () => {
     }
   })
 
+  it('a stale-died enter re-dispatches even when older delayed callbacks interleave', () => {
+    // Rapid rest/task toggles stack several pendingEnter records for ONE member.
+    // An older callback firing late used to delete the NEWER record (unconditional
+    // delete), so the stale reap could not roll that walk back and recovery
+    // stranded the member at the work seat (review P2 regression).
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    try {
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('m1x', 'executor', 'working'),
+        mawMember('m2x', 'executor', 'working'),
+        mawMember('m3x', 'executor', 'working'),
+        mawMember('rev01', 'reviewer', 'working'),
+      ]))
+      vi.advanceTimersByTime(2_000) // rev01's old enter is pending at +4500ms
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('m1x', 'executor', 'working'),
+        mawMember('m2x', 'executor', 'idle'),
+        mawMember('m3x', 'executor', 'idle'),
+        mawMember('rev01', 'reviewer', 'idle'),
+      ], 2)) // newer pending walk (back to rest) at +3000ms — created BEFORE the old fires
+      vi.advanceTimersByTime(2_700) // t≈4700: the OLD callback (4500ms) fired ACROSS the newer record (callback at 5000ms)
+      expect(store.getState().agents['rev01~reviewer'].inGroupEvent).toBe(false)
+
+      useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, quality: 'stale' } })
+      vi.advanceTimersByTime(100) // stale cancels the pending rest walk
+      useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, quality: 'ok' } })
+      vi.advanceTimersByTime(30_000)
+
+      const settled = store.getState().agents['rev01~reviewer']
+      const restSeat = restSeatFor('rev01~reviewer').seat
+      expect(settled.inGroupEvent).toBe(false)
+      expect(settled.position).toEqual(restSeat) // recovery re-dispatched the swallowed rest walk
+      expect(settled.behavior).toBe('idle')
+    } finally {
+      cleanup()
+    }
+  })
+
   it('a member who finishes walks to their stable rest seat and the rest animation is honest', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)

@@ -268,7 +268,8 @@ export function startMawChoreography(store) {
   let choreoEpoch = 0 // bumped when the channel degrades (stale / terminal): every pending callback dies with its generation
   let lastSeenQuality = null
   let lastSeenTerminal = false
-  const pendingEnter = new Map() // agentId -> phase BEFORE the scheduled walk — rolled back if the generation dies pre-fire
+  let pendingSeq = 0
+  const pendingEnter = new Map() // agentId -> { seq, from } — rolled back if the generation dies pre-fire
 
   function later(fn, ms) {
     if (torn) return
@@ -564,7 +565,7 @@ export function startMawChoreography(store) {
       // Walks scheduled but not yet fired: roll their recorded phase back so the
       // transition replays (on recovery) instead of being swallowed by the
       // already-updated prevPhase (review P2: the enter never re-dispatched).
-      for (const [id, from] of pendingEnter) prevPhase[id] = from
+      for (const [id, pending] of pendingEnter) prevPhase[id] = pending.from
       pendingEnter.clear()
     }
     // Channel stale (producer lease expired): the snapshot already rests the figures
@@ -598,9 +599,15 @@ export function startMawChoreography(store) {
       // Delivering members hurry back to the work seat and wait for the manager.
       const delay = member.status === 'awaiting-approval' ? 0 : batchStagger * STAGGER_MS
       batchStagger += 1
-      pendingEnter.set(agentId, previous ?? null) // rolled back if this walk dies pre-fire
+      // The pending record is owned by ITS callback only: rapid rest/task toggles
+      // stack several scheduled walks, and an older callback firing late must
+      // never delete a newer pending record — the stale reap could no longer roll
+      // that walk back and recovery would swallow it (review P2 regression).
+      const seq = ++pendingSeq
+      pendingEnter.set(agentId, { seq, from: previous ?? null }) // rolled back if this walk dies pre-fire
       later(() => {
-        pendingEnter.delete(agentId)
+        const mine = pendingEnter.get(agentId)
+        if (mine?.seq === seq) pendingEnter.delete(agentId)
         const live = store.getState().agents[agentId]
         if (!live || phaseOf(live.status) !== phase) return // the phase moved on — its own transition owns the walk
         walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null })
