@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { useOfficeStore, STATUS_COLORS } from '../systems/store.js'
 import { getNextBehavior } from '../systems/behaviorEngine'
-import { getTargetForBehavior, pickSocialTarget, calcFacing, calculateJourney, needsLocationChange, HOME_POSITIONS, resolveClaimAwareHomePosition, resolveFocusFacing, SOCIAL_BEHAVIORS, visuallyOverlapping, avoidOverlap } from '../systems/movementSystem'
+import { getTargetForBehavior, pickSocialTarget, calcFacing, calculateJourney, needsLocationChange, HOME_POSITIONS, resolveClaimAwareHomePosition, resolveFocusFacing, SOCIAL_BEHAVIORS, visuallyOverlapping, avoidOverlap, doorPassageRect } from '../systems/movementSystem'
 import { eventBubble, charName, useLocale, t } from '../i18n'
 import { BlockedReasonBadge } from './blockedReasonBadge'
 import { recurringInfo } from '../systems/recurringFailure'
@@ -789,6 +789,10 @@ function AgentCharacter({ agent }) {
   const timerRef = useRef(null)
   const pathRef = useRef([])
   const activeDoorJourneyRef = useRef(null)
+  // Door ids whose claims this journey currently holds — released early once the
+  // walker has cleared every claimed door passage (see onWaypointReached).
+  const claimedDoorIdsRef = useRef([])
+  const DOOR_CLEAR_MARGIN_PX = 16
   const pendingDoorJourneyRef = useRef(null)
   const lastGroupTargetRef = useRef(null)
   const movingRef = useRef(false)
@@ -1151,8 +1155,10 @@ function AgentCharacter({ agent }) {
         return 'queued'
       }
       activeDoorJourneyRef.current = journeyId
+      claimedDoorIdsRef.current = journey.doorIds.slice()
     } else {
       activeDoorJourneyRef.current = null
+      claimedDoorIdsRef.current = []
     }
 
     pendingDoorJourneyRef.current = null
@@ -1172,7 +1178,28 @@ function AgentCharacter({ agent }) {
     if (pathRef.current.length > 0) {
       const next = pathRef.current.shift()
       if (activeDoorJourneyRef.current) {
-        store.renewAgentDoorClaims(id, activeDoorJourneyRef.current)
+        // Release the claims as soon as the walker has CLEARED every claimed
+        // door passage (+ margin): holding them until final arrival serialized
+        // group entrances — the next queued walker's journey stayed stationary
+        // until the previous one SAT DOWN. Early release lets it start crossing
+        // while the previous walker is still en route to its desk; the passage
+        // itself stays single-occupant (the margin keeps the next crossing
+        // behind the released walker, preserving the AVO-187 anti-stack fence).
+        // Idempotent with the arrival/abort release paths.
+        const pos = visualPosRef.current
+        const stillInside = claimedDoorIdsRef.current.filter((doorId) => {
+          const rect = doorPassageRect(doorId)
+          if (!rect || !pos) return true
+          return pos.x >= rect.x1 - DOOR_CLEAR_MARGIN_PX && pos.x <= rect.x2 + DOOR_CLEAR_MARGIN_PX &&
+            pos.y >= rect.y1 - DOOR_CLEAR_MARGIN_PX && pos.y <= rect.y2 + DOOR_CLEAR_MARGIN_PX
+        })
+        if (stillInside.length === 0) {
+          store.releaseAgentDoorClaims(id, activeDoorJourneyRef.current)
+          claimedDoorIdsRef.current = []
+          activeDoorJourneyRef.current = null
+        } else {
+          store.renewAgentDoorClaims(id, activeDoorJourneyRef.current)
+        }
       }
       // Continue to next waypoint
       targetPosRef.current = { ...next }
@@ -1190,6 +1217,7 @@ function AgentCharacter({ agent }) {
     } else {
       store.setAgentArrived(id, activeDoorJourneyRef.current)
       activeDoorJourneyRef.current = null
+      claimedDoorIdsRef.current = []
       movingRef.current = false
       setIsWalking(false)  // FINAL arrival — the only legitimate walk-complete clear (see animate())
       // Apply deferred behavior now that character has arrived at destination.

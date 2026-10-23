@@ -645,6 +645,23 @@ function appendZoneRoute(path, from, to, zone) {
   for (const pt of routeWithinZone(from, to, zone)) pushPoint(path, pt)
 }
 
+// Claim-door id (calculateJourney's ROUTE names) → the physical door-passage
+// rect in FLOOR_ZONES. The entrance flow releases a walker's door claims once it
+// has cleared this rect (see AgentCharacter's waypoint handler), letting the
+// next queued walker start its crossing instead of waiting for the full walk
+// to finish.
+const DOOR_PASSAGE_BY_ROUTE = {
+  entranceToMain: 'door-entrance',
+  mainToLounge: 'door-lounge',
+  mainToResearch: 'door-research',
+  mainToMeeting: 'door-meeting',
+}
+
+export function doorPassageRect(doorId) {
+  const zone = FLOOR_ZONES.find((z) => z.id === DOOR_PASSAGE_BY_ROUTE[doorId])
+  return zone ? { x1: zone.x1, y1: zone.y1, x2: zone.x2, y2: zone.y2 } : null
+}
+
 export function calculateJourney(from, to) {
   const fromZone = getZone(from.x, from.y)
   const toZone = getZone(to.x, to.y)

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { calculateJourney, calculatePath, DOOR_SIDES, visuallyOverlapping } from '../src/systems/movementSystem.js'
+import { calculateJourney, calculatePath, DOOR_SIDES, visuallyOverlapping, doorPassageRect } from '../src/systems/movementSystem.js'
 import { DOOR_JITTER } from '../src/systems/constants.js'
 import { STACK_DIST_PX } from '../scripts/soakInvariants.mjs'
 
@@ -86,5 +86,18 @@ describe('calculateJourney — physical door identity', () => {
     const journey = calculateJourney({ x: 180, y: 490 }, { x: 620, y: 490 })
     expect(journey.doorIds).toEqual(['mainToLounge', 'mainToResearch'])
     vi.restoreAllMocks()
+  })
+})
+
+describe('doorPassageRect — claim-door id to physical passage rect', () => {
+  it('maps every ROUTE door id to its floor-zone passage rect', () => {
+    expect(doorPassageRect('mainToMeeting')).toEqual({ x1: 593, y1: 187, x2: 628, y2: 233 })
+    expect(doorPassageRect('mainToLounge')).toEqual({ x1: 215, y1: 394, x2: 266, y2: 424 })
+    expect(doorPassageRect('mainToResearch')).toEqual({ x1: 510, y1: 394, x2: 561, y2: 424 })
+    expect(doorPassageRect('entranceToMain')).toEqual({ x1: 90, y1: 133, x2: 138, y2: 168 })
+  })
+
+  it('returns null for unknown door ids', () => {
+    expect(doorPassageRect('not-a-door')).toBeNull()
   })
 })

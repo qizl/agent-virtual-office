@@ -55,6 +55,19 @@ describe('doorClaims — bounded physical-door arbitration', () => {
     expect(grantedFirst.status).toBe('granted')
   })
 
+  it('a released door grants the queued walker at once — the entrance stream (CR-1)', () => {
+    // The entrance flow releases a walker's claims as soon as it CLEARS the door
+    // passage (AgentCharacter waypoint handler), so the next queued walker starts
+    // crossing while the previous one still walks to its desk.
+    const a = request(createDoorClaimState(), 'a', 'a:1', ['mainToMeeting'])
+    const b = request(a.state, 'b', 'b:1', ['mainToMeeting'], 1001)
+    expect(b.status).toBe('queued')
+    const released = releaseDoorClaims(a.state, { agentId: 'a', journeyId: 'a:1' })
+    const resumed = request(released, 'b', 'b:1', ['mainToMeeting'], 1002)
+    expect(resumed.status).toBe('granted')
+    expect(resumed.state.ownerByDoor.mainToMeeting).toBe('b:1')
+  })
+
   it('uses the journey id as a fencing token for release and renewal', () => {
     const granted = request(createDoorClaimState(), 'a', 'a:2', ['mainToLounge'])
     const staleRelease = releaseDoorClaims(granted.state, { agentId: 'a', journeyId: 'a:1' })
