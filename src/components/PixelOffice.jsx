@@ -804,6 +804,10 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
       return rosterId ? { ...d, label: t(`characters.${rosterId}.name`) } : { ...d, label: '' }
     })
   }, [isMaw])
+  // Only re-render PixelOffice when agent IDs change, not on every property update.
+  // AgentCharacter subscribes to its own agent state independently.
+  const agentOrderSignature = useOfficeStore(useShallow((s) => getAgentOrderSignature(s.agents)))
+
   // CR-10: MAW work-seat nameplates — one per member's ASSIGNED seat (the stable
   // maw.workSeat stamp), covering the overflow seats the four base desks don't
   // reach. Seats already labeled through the base-desk mapping are skipped.
@@ -821,9 +825,6 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
     }
     return out
   }, [isMaw, agentOrderSignature])
-  // Only re-render PixelOffice when agent IDs change, not on every property update.
-  // AgentCharacter subscribes to its own agent state independently.
-  const agentOrderSignature = useOfficeStore(useShallow((s) => getAgentOrderSignature(s.agents)))
   // Targeted selector — only re-renders when desk-item counts change, not on every
   // agent tick. The three growth items (coffee/sticky/books) are read in ONE flat
   // selector instead of three: a separate useShallow per item ran the selector and
