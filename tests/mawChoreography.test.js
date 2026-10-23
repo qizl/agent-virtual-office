@@ -14,10 +14,10 @@ import {
   clampToMemberZone,
 } from '../src/systems/mawChoreography.js'
 
-// Zone rules (plan §4.1): the manager may enter every area; other members may
+// Zone rules (plan §5.1): the manager may enter every area; other members may
 // enter the meeting room, the main office and BOTH bottom rooms (lounge,
 // research) — never the entrance area where the gate sits. Rest SEATS live in
-// the meeting room only (§3.2: the bottom rooms are wander scenery).
+// the meeting room only (§4.2: the bottom rooms are wander scenery).
 
 const ENTRANCE = { x1: 0, y1: 0, x2: 598, y2: 148 }
 const MEETING = ZONE_FLOOR_RECTS.meetingRoom

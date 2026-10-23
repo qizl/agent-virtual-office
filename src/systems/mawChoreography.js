@@ -9,7 +9,7 @@
 // a lock release (clearAgentGroupEvent + status presentation) — a walk that
 // never releases would pin the transit animation onto the member forever.
 //
-// Position rules (plan §4.1, multi-agent-workflow-office-animation-choreography):
+// Position rules (plan §5.1, multi-agent-workflow-office-animation-choreography):
 //   - default rest seats: the meeting room — member-id hash maps to MEETING_CHAIRS,
 //     overflow fills the free floor below the meeting table (still inside the
 //     meeting-room rect); the bottom rooms are wander scenery, NEVER seats;
@@ -38,9 +38,9 @@ const ARRIVE_TIMEOUT_MS = 20_000
 const ARRIVE_MAX_REISSUES = 3 // a timeout is not success — re-issue, then bail without the chained step
 const ARRIVE_EPSILON_PX = 8 // "arrived" = the figure physically reached its published target
 
-// Wander areas (plan §4.1 rest): the meeting room plus the two bottom rooms —
+// Wander areas (plan §5.1 rest): the meeting room plus the two bottom rooms —
 // low-frequency leg-stretch walks sample all three. Rest SEATS are a different
-// rule (plan §3.2 non-goal): lounge/research are wander scenery, never seats.
+// rule (plan §4.2 non-goal): lounge/research are wander scenery, never seats.
 const WANDER_RECTS = [ZONE_FLOOR_RECTS.meetingRoom, ZONE_FLOOR_RECTS.lounge, ZONE_FLOOR_RECTS.research].filter(Boolean)
 
 export const MAW_ROLE_WORK_BEHAVIOR = { manager: 'gantt-chart', 'decision-maker': 'whiteboard', executor: 'typing', reviewer: 'magnifier' }
@@ -61,7 +61,7 @@ function seatKey(point) {
   return `${point.x},${point.y}`
 }
 
-// Rest seats (plan §4.1 rest): the member-id hash maps into the 8 MEETING_CHAIRS
+// Rest seats (plan §5.1 rest): the member-id hash maps into the 8 MEETING_CHAIRS
 // first; overflow fills a deterministic grid on the free floor BELOW the meeting
 // table (the table obstacle ends at y=195, the meeting-room rect runs to y=413),
 // so every rest seat — default and overflow — stays inside the meeting room.
@@ -577,7 +577,7 @@ export function startMawChoreography(store) {
 
     // member transitions (manager handled by the handover queue only)
     const now = Date.now()
-    let batchStagger = 0 // i×1.5s WITHIN one migration batch (plan §4.1) — never cumulative across the session
+    let batchStagger = 0 // i×1.5s WITHIN one migration batch (plan §5.1) — never cumulative across the session
     for (const member of members) {
       if (member.maw?.role === 'manager') continue
       if (phaseOf(member.status) === 'task') {
