@@ -126,27 +126,34 @@ export const MAW_EXTRA_WORK_SEATS = [...HAND_EXTRA_WORK_SEATS, ...GENERATED_EXTR
 // groups RANDOMLY on every page load (CR-3 随机分配), and each role's members
 // sit ADJACENTLY within its group (同一角色工位相邻) — the group order is
 // shuffled, the seats inside a group keep their geographic order.
-// Seat UNITS (adjacent real desks): executor deals itself two units (4 desks —
-// the largest team), decision-maker and reviewer take one each. The units are
-// SHUFFLED on every page load (CR-3 随机分配) and every unit is a real desk, so
-// no member ever lands on an invisible floor spot.
-const WORK_UNIT_SEATS = [
-  [{ x: 340, y: 364 }, { x: 460, y: 364 }], // dev + ops (bottom row)
-  [{ x: 400, y: 244 }, { x: 520, y: 244 }], // qa + research (top row)
-  [{ x: 260, y: 264 }],                     // arch
-  [{ x: 140, y: 264 }],                     // pm
-]
+// Role blocks: GEOGRAPHICALLY CONTIGUOUS desk groups. The executor (largest
+// crew) takes the 4-seat right block; decision-maker and reviewer randomly
+// split the remaining two blocks on every page load (CR-3 随机分配). Seat order
+// inside a block is shuffled too, so member→desk is random while same-role
+// seats stay adjacent.
+const WORK_BLOCKS = {
+  block4: [{ x: 340, y: 364 }, { x: 460, y: 364 }, { x: 400, y: 244 }, { x: 520, y: 244 }],
+  row2: [{ x: 260, y: 264 }, { x: 140, y: 264 }],
+  corner: [{ x: 140, y: 384 }],
+}
 const ROLE_WORK_CLUSTERS = (() => {
-  const units = WORK_UNIT_SEATS.map((u) => u.map((s) => ({ ...s })))
-  for (let i = units.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1))
-    ;[units[i], units[j]] = [units[j], units[i]]
+  const shuffle = (list) => {
+    // `list` may be an ARRAY OF ARRAYS (desk groups) — copy deeply; a naive
+    // {...group} spread would turn each group into an index-keyed OBJECT.
+    const out = list.map((item) => Array.isArray(item) ? item.map((s) => ({ ...s })) : { ...item })
+    for (let i = out.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1))
+      ;[out[i], out[j]] = [out[j], out[i]]
+    }
+    return out
   }
-  const map = { manager: [] }
-  map.executor = [...units[0], ...units[1]] // two units — the biggest crew
-  map['decision-maker'] = units[2] ?? []
-  map.reviewer = units[3] ?? []
-  return map
+  const dmAndRev = shuffle([WORK_BLOCKS.row2, WORK_BLOCKS.corner])
+  return {
+    executor: shuffle(WORK_BLOCKS.block4),
+    'decision-maker': dmAndRev[0],
+    reviewer: dmAndRev[1],
+    manager: [],
+  }
 })()
 
 /** Working seat: the role's cluster seat (adjacent per role, random group per
@@ -499,9 +506,22 @@ export function startMawChoreography(store) {
     const bound = workSeatsByMember.get(member.id)
     if (bound) return bound
     const role = member.maw?.role ?? member.role
-    let sameRole = 0
-    for (const id of workSeatsByMember.keys()) if (id.endsWith(`~${role}`)) sameRole += 1
-    const seat = workSeatFor(role, sameRole)
+    if (role === 'manager') return MANAGER_GATE // the gate booth is the manager's work seat
+    // Scan the role's cluster seats first, then the overflow pool, and take the
+    // FIRST seat not claimed by a CURRENT member — count-based indexes collide
+    // after departures (a joiner reused the seat of a member still present,
+    // collapsing their nameplates). Occupancy scan is churn-safe.
+    const claimed = new Set()
+    for (const [id, boundSeat] of workSeatsByMember) {
+      if (store.getState().agents[id]) claimed.add(seatKey(boundSeat))
+    }
+    let seat = null
+    for (const candidate of [...(ROLE_WORK_CLUSTERS[role] ?? []), ...MAW_EXTRA_WORK_SEATS]) {
+      if (claimed.has(seatKey(candidate))) continue
+      seat = { ...candidate }
+      break
+    }
+    if (!seat) seat = { ...MAW_EXTRA_WORK_SEATS[0] } // exhausted — pack (valid snapshots ≤ 50 ≤ seats)
     workSeatsByMember.set(member.id, seat)
     // Write the authoritative binding back so the nameplate follows the walk target.
     const agent = store.getState().agents[member.id]
@@ -662,14 +682,17 @@ export function startMawChoreography(store) {
         const current = store.getState().agents[agent.id]
         if (!current) return
         if (current.status !== statusAtDeparture) return restorePresentation(agent.id) // the transition owns the new walk
-        const home = working ? stableWorkSeat(current) : stableRestSeat(current)
+        // CR-3/CR-1/CR-11: the home follows the member's POST — a working member
+        // or a standby member returns to its DESK; only an off-duty resting
+        // member returns to the meeting-room chair (the ZONE BOUND and the
+        // DESTINATION must both follow the post — review P2: the bound changed
+        // but the destination stayed the meeting room).
+        const workflowLive = store.getState().mawMeta?.workflow != null
+        const postIsDesk = working || workflowLive
+        const home = postIsDesk ? stableWorkSeat(current) : stableRestSeat(current)
         const back = working
           ? { behavior: MAW_ROLE_WORK_BEHAVIOR[current.maw?.role] || 'typing', expression: 'normal', bubble: null }
           : { behavior: 'idle', expression: current.status === 'done' ? 'happy' : 'normal', bubble: null }
-        // CR-3/CR-1/CR-11: the home follows the member's POST — a working member
-        // or a standby member returns to its DESK; only an off-duty resting
-        // member returns to the meeting-room chair.
-        const postIsDesk = working || store.getState().mawMeta?.workflow != null
         walk(agent.id, home, { ...back, zoneBound: postIsDesk ? 'member' : 'meeting' })
         arriveThen(agent.id, 0, () => restorePresentation(agent.id))
         if (working) workingSince.set(agent.id, Date.now())
