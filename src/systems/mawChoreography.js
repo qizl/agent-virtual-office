@@ -30,7 +30,10 @@ import { MEETING_CHAIRS, HOME_POSITIONS, ZONE_FLOOR_RECTS, clampToFloor } from '
 
 export const MANAGER_GATE = { x: 100, y: 80 }
 const HANDOVER_DWELL_MS = 3000
-const STAGGER_MS = 1500
+// Entrance launch spacing: members start in quick succession and flow through
+// the (single-occupant) door passages as a stream — the door early-release
+// keeps the queue moving, so launches overlap instead of serializing.
+export const STAGGER_MS = 600
 const WANDER_INTERVAL_MS = 15_000
 const LONG_WORK_MS = 90_000 // a member on the same work/rest stretch this long may take a walk
 const ARRIVAL_POLL_MS = 400

@@ -11,6 +11,7 @@ import {
   wanderCandidates,
   planChoreography,
   startMawChoreography,
+  STAGGER_MS,
   MANAGER_GATE,
   clampToMemberZone,
 } from '../src/systems/mawChoreography.js'
@@ -138,7 +139,7 @@ describe('maw choreography planning', () => {
     const members = [member('e1xxxx', 'executor', 'working'), member('r1xxxx', 'reviewer', 'working'), member('m1xxxx', 'manager', 'working')]
     const actions = planChoreography({ prevPhase, members })
     expect(actions).toHaveLength(3)
-    expect(actions.map((a) => a.staggerMs)).toEqual([0, 1500, 3000])
+    expect(actions.map((a) => a.staggerMs)).toEqual([0, STAGGER_MS, STAGGER_MS * 2])
     expect(actions.every((a) => inRect(a.target, MAIN) || a.id === 'm1xxxx')).toBe(true)
     // phases are now recorded — a second plan produces no actions
     expect(planChoreography({ prevPhase, members })).toHaveLength(0)
@@ -460,7 +461,7 @@ describe('startMawChoreography (controller)', () => {
         mawMember('m4x', 'reviewer', 'idle'),
       ]))
       vi.advanceTimersByTime(100)
-      // batch 1: m1x enters at 0ms, m2x at 1500ms
+      // batch 1: m1x launches at 0ms, m2x at STAGGER_MS
       store.getState().applyMawSnapshot(envelope([
         mawMember('m1x', 'executor', 'working'),
         mawMember('m2x', 'reviewer', 'working'),
@@ -469,10 +470,10 @@ describe('startMawChoreography (controller)', () => {
       ], 2))
       vi.advanceTimersByTime(100)
       expect(store.getState().agents['m1x~executor'].inGroupEvent).toBe(true)
-      expect(store.getState().agents['m2x~reviewer'].inGroupEvent).toBe(false) // still waiting on 1500ms
+      expect(store.getState().agents['m2x~reviewer'].inGroupEvent).toBe(false) // still waiting on STAGGER_MS
 
-      // batch 2 at t=200ms: with cumulative stagger m3x would owe 2×1500ms —
-      // per-batch it walks at 0ms.
+      // batch 2 at t=200ms: with cumulative stagger m3x would owe 2×STAGGER_MS —
+      // per-batch it launches at 0ms.
       store.getState().applyMawSnapshot(envelope([
         mawMember('m1x', 'executor', 'working'),
         mawMember('m2x', 'reviewer', 'working'),
@@ -480,13 +481,18 @@ describe('startMawChoreography (controller)', () => {
         mawMember('m4x', 'reviewer', 'working'),
       ], 3))
       vi.advanceTimersByTime(50)
-      expect(store.getState().agents['m3x~decision-maker'].inGroupEvent).toBe(true) // walked without the batch-1 debt
-      expect(store.getState().agents['m4x~reviewer'].inGroupEvent).toBe(false) // its own batch slot is 1500ms
-      expect(store.getState().agents['m2x~reviewer'].inGroupEvent).toBe(false) // fires at t≈1600ms, unchanged
+      expect(store.getState().agents['m3x~decision-maker'].inGroupEvent).toBe(true) // launched without the batch-1 debt
+      expect(store.getState().agents['m4x~reviewer'].inGroupEvent).toBe(false) // its own batch slot is STAGGER_MS
+      expect(store.getState().agents['m2x~reviewer'].inGroupEvent).toBe(false) // fires at t≈700ms, unchanged
 
+      // by t=1850 all four launched at their batch slots; with the walker
+      // simulated the early launchers have already ARRIVED and released
       vi.advanceTimersByTime(1_600)
-      expect(store.getState().agents['m2x~reviewer'].inGroupEvent).toBe(true)
-      expect(store.getState().agents['m4x~reviewer'].inGroupEvent).toBe(true)
+      for (const id of ['m1x~executor', 'm2x~reviewer', 'm3x~decision-maker', 'm4x~reviewer']) {
+        const a = store.getState().agents[id]
+        expect(a.inGroupEvent).toBe(false) // walked in AND released
+        expect(behaviorFor({ role: a.maw?.role, status: a.status })).not.toBe('idle')
+      }
     } finally {
       cleanup()
     }

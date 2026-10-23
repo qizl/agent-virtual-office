@@ -43,18 +43,19 @@ function m(key, role, status, label, extra = {}) {
   return { id: key, role, status, label, detail: null, round: null, task_kind: null, verdict: null, terminate: null, stalled: false, ...extra }
 }
 
-// 14-beat workday (0–13): standup → develop (two long-hold beats so the
-// 90s CR-6 wander window opens on any playback) → deliver ×2 → review
-// fail → rework → deliver round 2 → evaluate → shutdown → completed →
-// (loop at the calm head beat). The calm head beat dwells 5× and the
-// completed beat 3×, so the walk home and the idle stretch that follows
-// get time to play out — echoing the default office's ambient rhythm.
+// 16-beat workday (0–15, ~5 minutes at the default 8s cadence):
+// standup → develop (two long-hold beats so the 90s CR-6 wander window
+// opens on any playback) → deliver → review fail → rework → deliver
+// round 2 → review pass → evaluate → shutdown → completed → a long calm
+// tail (dwell-extended) where idle members stretch around the rest
+// areas — echoing the default office's ambient rhythm.
 const BEATS = [
-  // loop head — dwells 5×: the rest tail lets idle members stretch around the
-  // rest areas before the next workday starts
+  // loop head — dwells 8×: the rest tail lets idle members stretch around the
+  // rest areas before the next workday starts (CR-1: everyone at the meeting
+  // room; the walk-in plays when the first task beat lands).
   {
     workflow: null,
-    dwell: 5,
+    dwell: 8,
     members: [
       m(M.mgr, 'manager', 'idle', null),
       m(M.dm, 'decision-maker', 'idle', null),
@@ -67,7 +68,7 @@ const BEATS = [
     workflow: 'MAW 执行与审核流程 · team',
     members: [
       m(M.mgr, 'manager', 'working', '晨会 · 团队就绪'),
-      m(M.dm, 'decision-maker', 'idle', null),
+      m(M.dm, 'decision-maker', 'planning', '排期 · slice-001/002'),
       m(M.exe1, 'executor', 'planning', 'slice-001 · round 1', { round: 1, task_kind: 'dev' }),
       m(M.exe2, 'executor', 'idle', null),
       m(M.rev, 'reviewer', 'idle', null),
@@ -77,7 +78,7 @@ const BEATS = [
     workflow: 'MAW 执行与审核流程 · develop',
     members: [
       m(M.mgr, 'manager', 'working', '节点 develop 进行中'),
-      m(M.dm, 'decision-maker', 'idle', null),
+      m(M.dm, 'decision-maker', 'working', '✏️ 排期确认 · slice-001/002', { round: 1, task_kind: 'plan-review' }),
       m(M.exe1, 'executor', 'working', '✏️ slice-001 · round 1', { round: 1, task_kind: 'dev' }),
       m(M.exe2, 'executor', 'idle', '待命'),
       m(M.rev, 'reviewer', 'idle', '待命'),
@@ -87,22 +88,22 @@ const BEATS = [
     workflow: 'MAW 执行与审核流程 · develop',
     members: [
       m(M.mgr, 'manager', 'working', '节点 develop 进行中'),
-      m(M.dm, 'decision-maker', 'working', '权衡 slice-002 范围'),
+      m(M.dm, 'decision-maker', 'working', '✏️ 排期确认 · slice-001/002', { round: 1, task_kind: 'plan-review' }),
       m(M.exe1, 'executor', 'working', '✏️ slice-001 · round 1', { round: 1, task_kind: 'dev' }),
       m(M.exe2, 'executor', 'working', '✏️ slice-002 · round 1', { round: 1, task_kind: 'dev' }),
       m(M.rev, 'reviewer', 'idle', '待命'),
     ],
   },
-  // long-hold beats (dwell 5× each): identical facts, time passing — the
+  // long-hold beats (dwell 6× each): identical facts, time passing — the
   // developers cross the 90s threshold on ANY playback and take CR-6 wander
   // breaks, which sample the rest areas only (CR-7: never the middle office;
   // the manager never wanders — gate duty).
   {
     workflow: 'MAW 执行与审核流程 · develop',
-    dwell: 5,
+    dwell: 6,
     members: [
       m(M.mgr, 'manager', 'working', '节点 develop 进行中 · 持续'),
-      m(M.dm, 'decision-maker', 'working', '权衡 slice-002 范围 · 持续'),
+      m(M.dm, 'decision-maker', 'working', '✏️ 排期确认 · 持续', { round: 1, task_kind: 'plan-review' }),
       m(M.exe1, 'executor', 'working', '✏️ slice-001 · round 1', { round: 1, task_kind: 'dev' }),
       m(M.exe2, 'executor', 'working', '✏️ slice-002 · round 1', { round: 1, task_kind: 'dev' }),
       m(M.rev, 'reviewer', 'idle', '待命'),
@@ -110,10 +111,10 @@ const BEATS = [
   },
   {
     workflow: 'MAW 执行与审核流程 · develop',
-    dwell: 5,
+    dwell: 6,
     members: [
       m(M.mgr, 'manager', 'working', '节点 develop 进行中 · 持续'),
-      m(M.dm, 'decision-maker', 'working', '权衡 slice-002 范围 · 持续'),
+      m(M.dm, 'decision-maker', 'working', '✏️ 排期确认 · 持续', { round: 1, task_kind: 'plan-review' }),
       m(M.exe1, 'executor', 'working', '✏️ slice-001 · round 1', { round: 1, task_kind: 'dev' }),
       m(M.exe2, 'executor', 'working', '✏️ slice-002 · round 1', { round: 1, task_kind: 'dev' }),
       m(M.rev, 'reviewer', 'idle', '待命'),
@@ -123,7 +124,7 @@ const BEATS = [
     workflow: 'MAW 执行与审核流程 · develop',
     members: [
       m(M.mgr, 'manager', 'working', '节点 develop 进行中'),
-      m(M.dm, 'decision-maker', 'idle', null),
+      m(M.dm, 'decision-maker', 'working', '✏️ 排期确认 · 持续', { round: 1, task_kind: 'plan-review' }),
       m(M.exe1, 'executor', 'awaiting-approval', '已交付待评审 · round 1', { round: 1, task_kind: 'dev' }),
       m(M.exe2, 'executor', 'working', '✏️ slice-002 · round 1', { round: 1, task_kind: 'dev' }),
       m(M.rev, 'reviewer', 'working', '🔍 评审 slice-001', { round: 1, task_kind: 'review' }),
@@ -133,10 +134,20 @@ const BEATS = [
     workflow: 'MAW 执行与审核流程 · develop',
     members: [
       m(M.mgr, 'manager', 'working', '节点 develop 进行中'),
+      m(M.dm, 'decision-maker', 'working', '权衡 slice-002 范围'),
+      m(M.exe1, 'executor', 'awaiting-approval', '已交付 · 评审中 round 1', { round: 1, task_kind: 'dev' }),
+      m(M.exe2, 'executor', 'working', '✏️ slice-002 · round 1', { round: 1, task_kind: 'dev' }),
+      m(M.rev, 'reviewer', 'working', '🔍 评审 slice-001 · attempt', { round: 1, task_kind: 'review' }),
+    ],
+  },
+  {
+    workflow: 'MAW 执行与审核流程 · develop',
+    members: [
+      m(M.mgr, 'manager', 'working', '节点 develop 进行中'),
       m(M.dm, 'decision-maker', 'idle', null),
       m(M.exe1, 'executor', 'awaiting-approval', '已交付 · 评审中 round 1', { round: 1, task_kind: 'dev' }),
       m(M.exe2, 'executor', 'awaiting-approval', '已交付待评审 · round 1', { round: 1, task_kind: 'dev' }),
-      m(M.rev, 'reviewer', 'working', '🔍 评审 slice-001 · attempt', { round: 1, task_kind: 'review' }),
+      m(M.rev, 'reviewer', 'working', '🔍 评审 slice-001', { round: 1, task_kind: 'review' }),
     ],
   },
   {
@@ -170,10 +181,20 @@ const BEATS = [
     ],
   },
   {
+    workflow: 'MAW 执行与审核流程 · review-pass',
+    members: [
+      m(M.mgr, 'manager', 'working', '节点 review · 汇总通过'),
+      m(M.dm, 'decision-maker', 'done', '✅ 排期完成', { round: 1, task_kind: 'plan-review', verdict: 'pass' }),
+      m(M.exe1, 'executor', 'done', '✅ round 2 通过', { round: 2, task_kind: 'dev', verdict: 'pass' }),
+      m(M.exe2, 'executor', 'done', '✅ round 2 通过', { round: 2, task_kind: 'dev', verdict: 'pass' }),
+      m(M.rev, 'reviewer', 'done', '✅ 评审通过 · round 2', { round: 2, task_kind: 'review', verdict: 'pass' }),
+    ],
+  },
+  {
     workflow: 'MAW 执行与审核流程 · evaluate',
     members: [
       m(M.mgr, 'manager', 'awaiting-approval', '等待交付评估 · finish-required'),
-      m(M.dm, 'decision-maker', 'idle', null),
+      m(M.dm, 'decision-maker', 'done', '✅ 排期完成'),
       m(M.exe1, 'executor', 'done', '✅ round 2 通过', { round: 2, task_kind: 'dev', verdict: 'pass' }),
       m(M.exe2, 'executor', 'done', '✅ round 2 通过', { round: 2, task_kind: 'dev', verdict: 'pass' }),
       m(M.rev, 'reviewer', 'done', '✅ 评审通过 · round 2', { round: 2, task_kind: 'review', verdict: 'pass' }),
@@ -192,7 +213,7 @@ const BEATS = [
   {
     workflow: 'MAW 执行与审核流程 · 已收尾',
     terminal: 'completed',
-    dwell: 3, // the walk home takes a few staggered legs — hold the frame
+    dwell: 4, // the walk home takes a few staggered legs — hold the frame
     members: [
       m(M.mgr, 'manager', 'done', '流程收尾完成'),
       m(M.dm, 'decision-maker', 'done', '已退出 🏁', { terminate: 'confirmed' }),
