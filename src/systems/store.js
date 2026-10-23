@@ -14,7 +14,7 @@ import { PET_TYPES, nextPetType } from './petState.js'
 import { pruneRecentPicks } from './behaviorEngine.js'  // AVO-180: prune on eviction
 import { isValidTheme, DEFAULT_THEME } from './theme.js'
 import { recordEpisode, isNewBlockedEpisode } from './recurringFailure.js'
-import { workSeatFor, restSeatFor, phaseOf, clampToMemberZone, clampToRestZone, clampToMeetingZone } from './mawChoreography.js' // shared MAW seat planner (store and choreography must agree)
+import { workSeatFor, restSeatFor, phaseOf, clampToMemberZone, clampToRestZone, clampToMeetingZone, clampToVisible } from './mawChoreography.js' // shared MAW seat planner (store and choreography must agree)
 import { AGENT_CARRY_FIELDS } from '../utils/statusFields.js'
 import {
   createDoorClaimState,
@@ -832,12 +832,14 @@ export const useOfficeStore = create((set) => ({
         // entrance rect. The member band wins over non-overlap — fold it back after
         // the push (the manager is exempt: gate duty lives inside the entrance).
         const actor = s.agents[id]
-        if (actor.mawMember && actor.maw?.role !== 'manager') {
+        if (actor.mawMember) {
           // Final-target bounds by WALK INTENT (the choreography declares it):
           // seat-return walks stay inside the meeting room (CR-1, however
           // crowded), free-roam walks inside the rest areas (CR-8), task walks
-          // in the main-office band.
-          if (zoneBound === 'meeting') gt = clampToMeetingZone(gt)
+          // in the main-office band. The manager keeps its ZONE exemption but
+          // every role gets the CR-9 visibility fold (review P2: clipped head).
+          if (actor.maw?.role === 'manager') gt = clampToVisible(gt)
+          else if (zoneBound === 'meeting') gt = clampToMeetingZone(gt)
           else if (zoneBound === 'rest-areas') gt = clampToRestZone(gt)
           else gt = clampToMemberZone(gt)
         }

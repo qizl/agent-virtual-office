@@ -203,12 +203,12 @@ describe('maw choreography planning', () => {
 // below stands in for the React journey engine (groupTarget → position), which
 // headless tests must simulate for "physical arrival" to mean anything.
 
-function envelope(members, seq = 1) {
+function envelope(members, seq = 1, workflow = 'MAW 执行与审核流程 · develop') {
   return {
     server_epoch: 1,
     seq,
     snapshot: {
-      workflow: 'MAW 执行与审核流程 · develop',
+      workflow,
       quality: 'ok',
       quality_detail: null,
       terminal: null,
@@ -598,12 +598,13 @@ describe('startMawChoreography (controller)', () => {
       vi.advanceTimersByTime(30_000)
 
       const settled = store.getState().agents['rev01~reviewer']
-      const restSeat = restSeatFor('rev01~reviewer').seat
+      const desk = workSeatFor('reviewer', 0)
       expect(settled.inGroupEvent).toBe(false)
-      // recovery re-dispatched the swallowed rest walk — avoidOverlap may
-      // side-step the published target inside the crowded meeting room
-      expect(Math.hypot(settled.position.x - restSeat.x, settled.position.y - restSeat.y)).toBeLessThan(60)
-      expect(settled.behavior).toBe('idle')
+      // recovery re-dispatched the swallowed enter — the workflow is active, so
+      // the IDLE reviewer stands by at its WORK seat (avoidOverlap may side-step
+      // in a crowded room)
+      expect(Math.hypot(settled.position.x - desk.x, settled.position.y - desk.y)).toBeLessThan(60)
+      expect(settled.behavior).toBe('idle') // honest 待命 animation
     } finally {
       cleanup()
     }
@@ -728,7 +729,7 @@ describe('startMawChoreography (controller)', () => {
     }
   })
 
-  it('a crowded rest room keeps every rest walk target INSIDE the meeting room (CR-1)', () => {
+  it('CR-11 standby: a crowded workflow start relocates idle members to their work seats (never the entrance)', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
     try {
@@ -743,16 +744,19 @@ describe('startMawChoreography (controller)', () => {
         mawMember('e4x', 'executor', 'idle'),
         mawMember('rev01', 'reviewer', 'idle'),
       ]))
-      vi.advanceTimersByTime(6_000) // all rest walks published
+      vi.advanceTimersByTime(6_000) // all standby walks published
+      const main = ZONE_FLOOR_RECTS.mainOffice
+      const entrance = { x1: 0, y1: 0, x2: 598, y2: 148 }
       const meeting = ZONE_FLOOR_RECTS.meetingRoom
       for (const a of Object.values(store.getState().agents)) {
         if (!a?.inGroupEvent || !a.groupTarget) continue
-        // CR-1: rest targets stay in the meeting room — avoidOverlap shoves are
-        // folded back by the store's phase-aware clamp
-        expect(a.groupTarget.x).toBeGreaterThanOrEqual(meeting.x1)
-        expect(a.groupTarget.x).toBeLessThanOrEqual(meeting.x2)
-        expect(a.groupTarget.y).toBeGreaterThanOrEqual(meeting.y1)
-        expect(a.groupTarget.y).toBeLessThanOrEqual(meeting.y2)
+        const inMain = a.groupTarget.x >= main.x1 && a.groupTarget.x <= main.x2 && a.groupTarget.y >= main.y1 && a.groupTarget.y <= main.y2
+        const inMeeting = a.groupTarget.x >= meeting.x1 && a.groupTarget.x <= meeting.x2 && a.groupTarget.y >= meeting.y1 && a.groupTarget.y <= meeting.y2
+        // CR-11: idle members stand by at their WORK seats (main office);
+        // CR-5: never the entrance
+        expect(inMain || inMeeting).toBe(true)
+        expect(violatesMemberZone(a.groupTarget)).toBe(false)
+        void entrance
       }
     } finally {
       cleanup()
@@ -905,7 +909,9 @@ describe('startMawChoreography (controller)', () => {
         ...Array.from({ length: 16 }, (_, i) => mawMember(`e${String(i).padStart(2, '0')}`, 'executor', 'idle')),
         mawMember('rev01', 'reviewer', 'idle'),
       ]
-      store.getState().applyMawSnapshot(envelope(members))
+      // calm office (no workflow): standby off — idle members rest in the
+      // meeting room and the timeout re-issue must KEEP that meeting bound
+      store.getState().applyMawSnapshot(envelope(members, 1, null))
       // no walker: every rest walk times out and re-issues — the re-issued
       // target must KEEP its meeting bound (review P2: it degraded to the
       // main-office band and landed in the wall gap)
@@ -982,6 +988,56 @@ describe('startMawChoreography (controller)', () => {
       expect(back.behavior).toBe('scratch-head')
     } finally {
       randomSpy.mockRestore()
+      cleanup()
+    }
+  })
+
+  it('CR-11 standby: with a workflow active, idle members relocate to their work seats', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    try {
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('rev01', 'reviewer', 'idle'),
+        mawMember('exe01', 'executor', 'idle'),
+      ]))
+      vi.advanceTimersByTime(3_500) // the workflow is active from the first
+      // snapshot — idle members stand by AT THEIR WORK SEATS (CR-11); the
+      // meeting-room opening only applies to a calm (no-workflow) office
+      const rev = store.getState().agents['rev01~reviewer']
+      const qaSeat = workSeatFor('reviewer', 0)
+      expect(Math.hypot(rev.position.x - qaSeat.x, rev.position.y - qaSeat.y)).toBeLessThan(60) // standby at the desk
+      expect(rev.behavior).toBe('idle') // waiting, honest animation
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('CR-11: when the workflow ends, standby members return to the meeting room', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    try {
+      store.getState().applyMawSnapshot((() => {
+        const e = envelope([mawMember('rev01', 'reviewer', 'idle')], 1)
+        e.snapshot.workflow = 'MAW 执行与审核流程 · team'
+        return e
+      })())
+      vi.advanceTimersByTime(3_000)
+      const qaSeat = workSeatFor('reviewer', 0)
+      let rev = store.getState().agents['rev01~reviewer']
+      expect(Math.hypot(rev.position.x - qaSeat.x, rev.position.y - qaSeat.y)).toBeLessThan(60) // standing by
+      // workflow ends → back to the meeting-room rest seat
+      const ended = envelope([mawMember('rev01', 'reviewer', 'idle')], 2, null)
+      store.getState().applyMawSnapshot(ended)
+      vi.advanceTimersByTime(3_000)
+      rev = store.getState().agents['rev01~reviewer']
+      const meeting = ZONE_FLOOR_RECTS.meetingRoom
+      expect(rev.position.x).toBeGreaterThanOrEqual(meeting.x1)
+      expect(rev.position.x).toBeLessThanOrEqual(meeting.x2)
+      expect(rev.position.y).toBeGreaterThanOrEqual(meeting.y1)
+      expect(rev.position.y).toBeLessThanOrEqual(meeting.y2)
+    } finally {
       cleanup()
     }
   })

@@ -203,6 +203,15 @@ export function clampToRestZone(point) {
   return best
 }
 
+/** CR-9 visibility-only fold — applies to EVERY role including the manager (whose
+ * zone exemption must not reintroduce clipping). */
+export function clampToVisible(point) {
+  return {
+    x: Math.min(778, Math.max(24, point.x)),
+    y: Math.min(500, Math.max(64, point.y)),
+  }
+}
+
 export function phaseOf(status) {
   return status === 'idle' || status === 'done' ? 'rest' : 'task'
 }
@@ -345,12 +354,14 @@ export function startMawChoreography(store) {
   let lastWanderAt = 0
   const walkTokens = new Map() // agentId -> latest walk token — a superseding walk invalidates the old chain
   const walkBounds = new Map() // agentId -> the zone bound of its CURRENT walk — timeout re-issues must keep it
-  const seatTargets = new Map() // agentId -> published target of its last SEAT walk — the CR-3 audit's compliance spot
+  const seatTargets = new Map() // agentId -> published target of its last SEAT walk (desk/gate) — the CR-3 audit's compliance spot
+  const restTargets = new Map() // agentId -> published target of its last REST walk (meeting room) — informational
   const breakUntil = new Map() // agentId -> timestamp until which a sanctioned CR-6/CR-8 break may keep the figure away
   const walkTargets = new Map() // agentId -> last PUBLISHED walk target (post avoidOverlap/re-clamp) — where the walk actually goes
   let choreoEpoch = 0 // bumped when the channel degrades (stale / terminal): every pending callback dies with its generation
   let lastSeenQuality = null
   let lastSeenTerminal = false
+  let prevWorkflowActive = null // null = not yet observed (no flip on the first snapshot)
   let pendingSeq = 0
   const pendingEnter = new Map() // agentId -> { seq, from } — rolled back if the generation dies pre-fire
 
@@ -387,7 +398,8 @@ export function startMawChoreography(store) {
     // check must judge THIS point, never the requested one (avoidOverlap moves it).
     const published = store.getState().agents[agentId]?.groupTarget ?? null
     walkTargets.set(agentId, published)
-    if (zoneBound === 'member' || zoneBound === 'meeting') seatTargets.set(agentId, published)
+    if (zoneBound === 'member') seatTargets.set(agentId, published)
+    if (zoneBound === 'meeting') restTargets.set(agentId, published)
   }
 
   /** Release the walk lock and dress the member in their CURRENT status animation. */
@@ -463,23 +475,23 @@ export function startMawChoreography(store) {
     awaitWalk()
   }
 
-  /** Stable work seat for a member: assigned ONCE, never recomputed from live counts. */
+  /** Stable work seat for a member: assigned ONCE, never recomputed from live counts.
+   * Delegates to workSeatFor (spare-desk mapping included) so the walk target and the
+   * CR-10 nameplate share ONE assignment; the binding is written back to the agent's
+   * maw.workSeat stamp (PixelOffice reads it). */
   function stableWorkSeat(member) {
     const bound = workSeatsByMember.get(member.id)
     if (bound) return bound
-    const role = member.maw?.role
-    if (role === 'manager') return MANAGER_GATE // the gate booth is the manager's work seat
-    let seat = null
-    const base = HOME_POSITIONS[role]
-    if (base && !occupiedWorkSeats.has(seatKey(base))) seat = { ...base }
-    else {
-      for (const candidate of MAW_EXTRA_WORK_SEATS) {
-        if (!occupiedWorkSeats.has(seatKey(candidate))) { seat = { ...candidate }; break }
-      }
-    }
-    if (!seat) seat = { ...MAW_EXTRA_WORK_SEATS[0] } // unreachable for valid snapshots (56+4 seats ≥ 50)
-    occupiedWorkSeats.add(seatKey(seat))
+    const role = member.maw?.role ?? member.role
+    let sameRole = 0
+    for (const id of workSeatsByMember.keys()) if (id.endsWith(`~${role}`)) sameRole += 1
+    const seat = workSeatFor(role, sameRole)
     workSeatsByMember.set(member.id, seat)
+    // Write the authoritative binding back so the nameplate follows the walk target.
+    const agent = store.getState().agents[member.id]
+    if (agent && JSON.stringify(agent.maw?.workSeat ?? {}) !== JSON.stringify(seat)) {
+      store.setState({ agents: { ...store.getState().agents, [member.id]: { ...agent, maw: { ...agent.maw, workSeat: { ...seat } } } } })
+    }
     return seat
   }
 
@@ -507,7 +519,7 @@ export function startMawChoreography(store) {
         restSeatsByMember.delete(id)
       }
     }
-    for (const map of [prevHandover, workingSince, restingSince, walkTokens, walkTargets, pendingEnter, walkBounds, seatTargets, breakUntil]) {
+    for (const map of [prevHandover, workingSince, restingSince, walkTokens, walkTargets, pendingEnter, walkBounds, seatTargets, restTargets, breakUntil]) {
       for (const id of [...map.keys()]) {
         if (!memberIds.has(id)) map.delete(id)
       }
@@ -589,6 +601,7 @@ export function startMawChoreography(store) {
       // CR-8: after ALL work completes (terminal) the whole team — manager
       // included — free-roams the rest areas on every tick, no 90s threshold.
       const freeRoam = s.mawMeta?.terminal != null
+      // CR-11 standby relocation (workflowActive/standbyFlip hoisted above).
       // CR-3 audit runs EVERY tick (before the wander cadence gate): a WORKING
       // member stands at its own desk. Figures displaced by timeout bail-outs /
       // stale holds / supersede remnants are walked back to their stable seat;
@@ -637,9 +650,11 @@ export function startMawChoreography(store) {
         const back = working
           ? { behavior: MAW_ROLE_WORK_BEHAVIOR[current.maw?.role] || 'typing', expression: 'normal', bubble: null }
           : { behavior: 'idle', expression: current.status === 'done' ? 'happy' : 'normal', bubble: null }
-        // CR-3/CR-1: a WORKING member's home is its DESK (office band); a resting
-        // member returns to its meeting-room chair.
-        walk(agent.id, home, { ...back, zoneBound: working ? 'member' : 'meeting' })
+        // CR-3/CR-1/CR-11: the home follows the member's POST — a working member
+        // or a standby member returns to its DESK; only an off-duty resting
+        // member returns to the meeting-room chair.
+        const postIsDesk = working || store.getState().mawMeta?.workflow != null
+        walk(agent.id, home, { ...back, zoneBound: postIsDesk ? 'member' : 'meeting' })
         arriveThen(agent.id, 0, () => restorePresentation(agent.id))
         if (working) workingSince.set(agent.id, Date.now())
         else restingSince.set(agent.id, Date.now())
@@ -670,6 +685,32 @@ export function startMawChoreography(store) {
     const members = Object.values(s.agents).filter((a) => a?.mawMember)
     const quality = s.mawMeta?.quality ?? null
     const terminal = s.mawMeta?.terminal != null
+    // CR-11 standby: while a workflow is ACTIVE, members with no task stand by
+    // at their WORK seats (waiting for assignments) instead of the meeting room.
+    const workflowActive = s.mawMeta?.workflow != null
+    const standbyFlip = prevWorkflowActive !== null && workflowActive !== prevWorkflowActive
+    prevWorkflowActive = workflowActive
+    if (standbyFlip) {
+      console.log('[DBG] standby sweep flip, workflowActive =', workflowActive, 'members =', members.length)
+      // CR-11: the workday started/ended — relocate every RESTING member
+      // between its meeting-room seat and its standby work seat, staggered.
+      let sweep = 0
+      for (const member of members) {
+        if (member.maw?.role === 'manager') continue
+        if (phaseOf(member.status) !== 'rest') continue
+        if (member.isMoving || member.journeyTarget) continue
+        const agentId = member.id
+        const seat = workflowActive ? stableWorkSeat(member) : stableRestSeat(member)
+        const delay = sweep * STAGGER_MS
+        sweep += 1
+        later(() => {
+          const live = store.getState().agents[agentId]
+          if (!live || phaseOf(live.status) !== 'rest') return
+          walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null, zoneBound: workflowActive ? 'member' : 'meeting' })
+          arriveThen(agentId, 0, () => restorePresentation(agentId))
+        }, delay)
+      }
+    }
     const enteringStale = quality === 'stale' && lastSeenQuality !== 'stale'
     const enteringTerminal = terminal !== lastSeenTerminal
     if (quality !== lastSeenQuality) lastSeenQuality = quality
@@ -738,7 +779,7 @@ export function startMawChoreography(store) {
       // and send the manager to someone else's desk.
       const seat = isManager
         ? (phase === 'task' ? MANAGER_GATE : stableRestSeat(member))
-        : phase === 'task' ? stableWorkSeat(member) : stableRestSeat(member)
+        : phase === 'task' || workflowActive ? stableWorkSeat(member) : stableRestSeat(member)
       // Delivering members hurry back to the work seat and wait for the manager.
       const delay = member.status === 'awaiting-approval' ? 0 : batchStagger * STAGGER_MS
       batchStagger += 1
@@ -755,7 +796,7 @@ export function startMawChoreography(store) {
         pendingEnter.delete(agentId)
         const live = store.getState().agents[agentId]
         if (!live || phaseOf(live.status) !== phase) return // the phase moved on — its own transition owns the walk
-        walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null, zoneBound: isManager ? undefined : phase === 'rest' ? 'meeting' : 'member' })
+        walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null, zoneBound: isManager ? undefined : phase === 'rest' && !workflowActive ? 'meeting' : 'member' })
         arriveThen(agentId, 0, () => restorePresentation(agentId))
       }, delay)
     }
