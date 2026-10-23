@@ -14,7 +14,7 @@ import { PET_TYPES, nextPetType } from './petState.js'
 import { pruneRecentPicks } from './behaviorEngine.js'  // AVO-180: prune on eviction
 import { isValidTheme, DEFAULT_THEME } from './theme.js'
 import { recordEpisode, isNewBlockedEpisode } from './recurringFailure.js'
-import { workSeatFor, restSeatFor, phaseOf, clampToMemberZone, clampToRestZone } from './mawChoreography.js' // shared MAW seat planner (store and choreography must agree)
+import { workSeatFor, restSeatFor, phaseOf, clampToMemberZone, clampToRestZone, clampToMeetingZone } from './mawChoreography.js' // shared MAW seat planner (store and choreography must agree)
 import { AGENT_CARRY_FIELDS } from '../utils/statusFields.js'
 import {
   createDoorClaimState,
@@ -807,7 +807,7 @@ export const useOfficeStore = create((set) => ({
     }),
 
   // Group event: lock agent into event behavior + set movement target
-  setAgentGroupEvent: (id, { behavior, expression, bubble, groupTarget }) =>
+  setAgentGroupEvent: (id, { behavior, expression, bubble, groupTarget, zoneBound }) =>
     set((s) => {
       if (!s.agents[id]) return s
       let gt = null
@@ -825,10 +825,13 @@ export const useOfficeStore = create((set) => ({
         // the push (the manager is exempt: gate duty lives inside the entrance).
         const actor = s.agents[id]
         if (actor.mawMember && actor.maw?.role !== 'manager') {
-          // CR-1 phase bounds: a RESTING member's walk target stays inside the
-          // meeting room (avoidOverlap shoves tightly-packed rest seats across
-          // the wall); task targets fold back into the main-office band.
-          gt = phaseOf(actor.status) === 'rest' ? clampToRestZone(gt) : clampToMemberZone(gt)
+          // Final-target bounds by WALK INTENT (the choreography declares it):
+          // seat-return walks stay inside the meeting room (CR-1, however
+          // crowded), free-roam walks inside the rest areas (CR-8), task walks
+          // in the main-office band.
+          if (zoneBound === 'meeting') gt = clampToMeetingZone(gt)
+          else if (zoneBound === 'rest-areas') gt = clampToRestZone(gt)
+          else gt = clampToMemberZone(gt)
         }
       } else {
         // React-in-place participant (spiller, caller, dog-reactor): the event FREEZES them

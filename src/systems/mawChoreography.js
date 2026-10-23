@@ -151,12 +151,22 @@ export function clampToMemberZone(point) {
   }
 }
 
+const MEETING_RECT = ZONE_FLOOR_RECTS.meetingRoom
 const REST_AREA_RECTS = [ZONE_FLOOR_RECTS.meetingRoom, ZONE_FLOOR_RECTS.lounge, ZONE_FLOOR_RECTS.research]
 
-/** Fold any point back into the NEAREST rest-area rect. Bounds every REST-phase
- * walk away from the middle office (CR-1: an avoidOverlap shove must not eject a
- * rest seat into the office band) while PASSING THROUGH legitimate CR-8 free-roam
- * targets — lounge/research walks are rest-area walks, not homecomings. */
+/** Fold any point back into the MEETING ROOM — the bound for SEAT-RETURN walks
+ * (CR-1: 归座目标必须在会议室, however crowded the room gets). */
+export function clampToMeetingZone(point) {
+  return {
+    x: Math.min(MEETING_RECT.x2 - 2, Math.max(MEETING_RECT.x1 + 2, point.x)),
+    y: Math.min(MEETING_RECT.y2 - 2, Math.max(MEETING_RECT.y1 + 2, point.y)),
+  }
+}
+
+/** Fold any point back into the NEAREST rest-area rect — the bound for FREE-ROAM
+ * walks (CR-8: lounge/research wander targets must survive) and the middle-office
+ * guard for everything else (CR-1: an avoidOverlap shove must not eject a rest
+ * walk into the office band). */
 export function clampToRestZone(point) {
   if (REST_AREA_RECTS.some((r) => point.x >= r.x1 && point.x <= r.x2 && point.y >= r.y1 && point.y <= r.y2)) {
     return { x: point.x, y: point.y }
@@ -331,7 +341,7 @@ export function startMawChoreography(store) {
     pendingTimers.add(t)
   }
 
-  function walk(agentId, target, { behavior, expression = 'normal', bubble = null }) {
+  function walk(agentId, target, { behavior, expression = 'normal', bubble = null, zoneBound = 'member' }) {
     const s = store.getState()
     if (!s.agents[agentId]) return
     const token = (walkTokens.get(agentId) || 0) + 1
@@ -342,6 +352,7 @@ export function startMawChoreography(store) {
       expression,
       bubble,
       groupTarget: safe,
+      zoneBound, // how the store must bound the FINAL published target
     })
     // Record where the store actually published the walk to — the queue's settle
     // check must judge THIS point, never the requested one (avoidOverlap moves it).
@@ -561,7 +572,7 @@ export function startMawChoreography(store) {
       if (!point) return
       const statusAtDeparture = agent.status
       const working = statusAtDeparture === 'working' || statusAtDeparture === 'planning'
-      walk(agent.id, point, { behavior: 'idle', expression: 'normal', bubble: null })
+      walk(agent.id, point, { behavior: 'idle', expression: 'normal', bubble: null, zoneBound: 'rest-areas' })
       arriveThen(agent.id, 8000 + Math.random() * 8000, () => {
         const current = store.getState().agents[agent.id]
         if (!current) return
@@ -570,7 +581,7 @@ export function startMawChoreography(store) {
         const back = working
           ? { behavior: MAW_ROLE_WORK_BEHAVIOR[current.maw?.role] || 'typing', expression: 'normal', bubble: null }
           : { behavior: 'idle', expression: current.status === 'done' ? 'happy' : 'normal', bubble: null }
-        walk(agent.id, home, back)
+        walk(agent.id, home, { ...back, zoneBound: 'meeting' })
         arriveThen(agent.id, 0, () => restorePresentation(agent.id))
         if (working) workingSince.set(agent.id, Date.now())
         else restingSince.set(agent.id, Date.now())
@@ -686,7 +697,7 @@ export function startMawChoreography(store) {
         pendingEnter.delete(agentId)
         const live = store.getState().agents[agentId]
         if (!live || phaseOf(live.status) !== phase) return // the phase moved on — its own transition owns the walk
-        walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null })
+        walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null, zoneBound: isManager ? undefined : phase === 'rest' ? 'meeting' : 'member' })
         arriveThen(agentId, 0, () => restorePresentation(agentId))
       }, delay)
     }

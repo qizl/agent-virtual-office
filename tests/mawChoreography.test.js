@@ -734,37 +734,60 @@ describe('startMawChoreography (controller)', () => {
     const cleanup = startMawChoreography(store)
     installWalker(store)
     try {
-      // member order gives the manager the LAST launch slot (1800ms) so its
-      // pending enter fires right after the first handover takes over
+      // snapshot2 makes FOUR members transition, so the manager's pending enter
+      // lands at slot 3 = 1800ms — right after the first handover takes the
+      // manager over (~800ms). This is exactly the wedge race: pre-fix, the
+      // late enter re-walked the manager to the gate and superseded the chat
+      // walk's token, killing the handover chain without finish().
       store.getState().applyMawSnapshot(envelope([
         mawMember('m1x', 'executor', 'idle'),
         mawMember('m2x', 'executor', 'idle'),
         mawMember('e9x', 'executor', 'idle'),
         mawMember('mgr01', 'manager', 'idle'),
       ]))
-      vi.advanceTimersByTime(50)
+      vi.advanceTimersByTime(3_500) // every opening rest walk settles
+      const order = []
+      let launched = new Set()
+      const bubbles = []
+      let lastBubble = null
+      const unsubscribe = store.subscribe(() => {
+        for (const a of Object.values(store.getState().agents)) {
+          if (a?.inGroupEvent && !launched.has(a.id)) {
+            launched.add(a.id)
+            order.push(a.id)
+          }
+        }
+        const m = store.getState().agents['mgr01~manager']
+        const b = m?.behavior === 'chat' && m.inGroupEvent ? m.bubble : null
+        if (b && b !== lastBubble) {
+          lastBubble = b
+          bubbles.push(b)
+        }
+      })
+
       store.getState().applyMawSnapshot(envelope([
         mawMember('m1x', 'executor', 'awaiting-approval'),
-        mawMember('m2x', 'executor', 'idle'),
-        mawMember('e9x', 'executor', 'idle'),
+        mawMember('m2x', 'executor', 'working'),
+        mawMember('e9x', 'executor', 'working'),
         mawMember('mgr01', 'manager', 'working'),
       ], 2))
-      vi.advanceTimersByTime(950) // handover #1 in flight; mgr pending enter fires at t≈1800
+      vi.advanceTimersByTime(950) // handover #1 in flight; mgr pending enter fires at t≈2400
       store.getState().applyMawSnapshot(envelope([
         mawMember('m1x', 'executor', 'awaiting-approval'),
         mawMember('m2x', 'executor', 'awaiting-approval'),
-        mawMember('e9x', 'executor', 'idle'),
+        mawMember('e9x', 'executor', 'working'),
         mawMember('mgr01', 'manager', 'working'),
       ], 3))
-      vi.advanceTimersByTime(12_000) // old callback fires at 1800; both handovers must complete
+      vi.advanceTimersByTime(15_000) // old callback fires at ~2400; BOTH handovers must complete
 
-      const bubbles = []
-      // (recorded implicitly by completion below) — assert both handovers ran
+      unsubscribe()
+      // both handovers REALly visited their members, in order
+      expect(bubbles).toHaveLength(2)
+      expect(bubbles[0]).toContain('m1x')
+      expect(bubbles[1]).toContain('m2x')
       const mgr = store.getState().agents['mgr01~manager']
       expect(mgr.inGroupEvent).toBe(false) // the queue did NOT wedge
       expect(mgr.behavior).toBe('gantt-chart')
-      // both deliverers were visited: their seats show await-approval and the
-      // manager returned to the gate after the SECOND visit
       expect(store.getState().agents['m1x~executor'].behavior).toBe('await-approval')
       expect(store.getState().agents['m2x~executor'].behavior).toBe('await-approval')
     } finally {
