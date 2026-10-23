@@ -140,4 +140,7 @@ RUNTIME_REL = maw_office.RUNTIME_REL
 
 def uuid_tmp():
     """Fresh sanitized temp project root per test."""
-    return Path(tempfile.mkdtemp(prefix="maw-office-test-"))
+    # macOS tempfile can spell the trusted system temp path through /var's
+    # symlink. Tests supply the actual canonical project root to exercise the
+    # same no-symlink ancestor contract as the Dashboard registry.
+    return Path(tempfile.mkdtemp(prefix="maw-office-test-")).resolve()

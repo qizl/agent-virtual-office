@@ -628,6 +628,8 @@ function applyMawSnapshotImpl(s, envelope) {
   if (s.mode !== 'maw' || !envelope || typeof envelope !== 'object') return {}
   const snapshot = envelope.snapshot
   const stale = snapshot ? snapshot.quality === 'stale' : false
+  const recovering = s.integration === 'dashboard'
+    && (envelope.dashboard_recovery ?? 0) !== (s.mawMeta?.dashboard_recovery ?? 0)
   const meta = {
     server_epoch: envelope.server_epoch ?? null,
     seq: envelope.seq ?? null,
@@ -686,25 +688,25 @@ function applyMawSnapshotImpl(s, envelope) {
       // choreography owns a walk (inGroupEvent) its behavior/expression/bubble are
       // authoritative — a snapshot refresh must not reset the transit animation
       // (mawChoreography restores the status animation on arrival).
-      const preserved = existing.inGroupEvent
+      const preserved = existing.inGroupEvent && !recovering
         ? { behavior: existing.behavior, expression: existing.expression, bubble: existing.bubble }
         : {}
       agents[agentId] = {
         ...built,
         ...preserved,
         position: existing.position,
-        targetPosition: existing.targetPosition,
-        isMoving: existing.isMoving,
+        targetPosition: recovering ? { ...existing.position } : existing.targetPosition,
+        isMoving: recovering ? false : existing.isMoving,
         facing: existing.facing,
-        journeyTarget: existing.journeyTarget,
-        inGroupEvent: existing.inGroupEvent,
-        groupTarget: existing.groupTarget,
+        journeyTarget: recovering ? null : existing.journeyTarget,
+        inGroupEvent: recovering ? false : existing.inGroupEvent,
+        groupTarget: recovering ? null : existing.groupTarget,
       }
     } else {
       agents[agentId] = built
     }
   }
-  return { agents, mawMeta: meta }
+  return { agents, mawMeta: meta, ...(recovering ? { doorTraffic: createDoorClaimState() } : {}) }
 }
 
 export const useOfficeStore = create((set) => ({

@@ -49,6 +49,7 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
   let lastContent = null
   let lastValidAt = null
   let isStale = false
+  let needsRecovery = false
   let retryVersion = store.getState().dashboardRetry
   let reportedFailure = null
   let recovery = 0
@@ -56,6 +57,7 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
 
   function sync(state, code = null) {
     if (torn) return
+    if (['error', 'missing', 'stale'].includes(state)) needsRecovery = true
     if (['error', 'missing', 'configuration-error', 'stale'].includes(state) && code && code !== reportedFailure) {
       console.warn('[Dashboard] synchronization:', code)
       reportedFailure = code
@@ -84,7 +86,8 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     lastContent = content
     lastValidAt = Date.now()
     // Recovery is a baseline of the currently observed facts, never replay of unobserved work.
-    if (isStale) recovery += 1
+    if (needsRecovery || isStale) recovery += 1
+    needsRecovery = false
     store.getState().applyMawSnapshot({ ...envelope, dashboard_recovery: recovery })
     isStale = envelope.snapshot?.quality === 'stale'
     if (isStale) store.getState().freezeMawSnapshot(envelope.snapshot.quality_detail || 'source-stale')

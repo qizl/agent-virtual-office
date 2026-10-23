@@ -219,6 +219,25 @@ describe('Dashboard fixed binding and lifecycle', () => {
     expect(useOfficeStore.getState().agents['member1~executor']).toMatchObject({ status: 'awaiting-approval', inGroupEvent: false })
   })
 
+  it('baselines current facts after a transient failure without replaying unseen handovers', async () => {
+    const members = [...envelope().snapshot.members,
+      { ...envelope().snapshot.members[0], id: 'manager', role: 'manager' }]
+    const fetchMock = vi.fn().mockResolvedValueOnce(reply({ ok: true, data: envelope(1, { members }) }))
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValue(reply({ ok: true, data: envelope(2, { members: [
+        { ...members[0], status: 'awaiting-approval' }, members[1],
+      ] }) }))
+    vi.stubGlobal('fetch', fetchMock)
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(useOfficeStore.getState().dashboardSync.state).toBe('error')
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(useOfficeStore.getState().dashboardSync.state).toBe('synced')
+    expect(useOfficeStore.getState().mawMeta.dashboard_recovery).toBe(1)
+    expect(useOfficeStore.getState().agents['manager~manager'].inGroupEvent).toBe(false)
+    expect(useOfficeStore.getState().agents['member1~executor']).toMatchObject({ status: 'awaiting-approval', inGroupEvent: false })
+  })
+
 
   it.each([404, 410])('clears removed projects with the backend project-not-registered code (HTTP %s)', async (status) => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply({ ok: false, error: { code: 'project-not-registered' } }, status)))
