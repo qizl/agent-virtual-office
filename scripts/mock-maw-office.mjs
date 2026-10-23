@@ -8,6 +8,10 @@
  * and the storyline exercises the honest states (working / awaiting-approval /
  * rework / terminal) — never fabricated tool activity.
  *
+ * Member ids mirror the REAL multi-agent-workflow runtime identities (the role
+ * folders the bridge reads: manager-1, decision-maker-1, executor-1, …), so the
+ * demo is indistinguishable from production data shape.
+ *
  * Usage:
  *   node scripts/mock-maw-office.mjs [--office-url=http://127.0.0.1:5173] [--every=5000] [--once]
  *   (space-separated --every 5000 also works)
@@ -23,27 +27,34 @@ function argOf(name, fallback) {
 const hasFlag = (name) => args.includes(`--${name}`)
 
 const BASE_URL = argOf('office-url', 'http://127.0.0.1:5173')
-const EVERY = Math.max(500, parseInt(argOf('every', '5000'), 10) || 5000)
+const EVERY = Math.max(500, parseInt(argOf('every', '8000'), 10) || 8000)
 const ONCE = hasFlag('once')
 
-// Stable opaque member keys — identity persists across rounds (plan §4.1.1).
+// Real multi-agent-workflow member identities — stable across rounds.
 const M = {
-  mgr: 'mgr0001',
-  dm: 'dm000001',
-  exe1: 'exe00001',
-  exe2: 'exe00002',
-  rev: 'rev00001',
+  mgr: 'manager-1',
+  dm: 'decision-maker-1',
+  exe1: 'executor-1',
+  exe2: 'executor-2',
+  rev: 'reviewer-1',
 }
 
 function m(key, role, status, label, extra = {}) {
   return { id: key, role, status, label, detail: null, round: null, task_kind: null, verdict: null, terminate: null, stalled: false, ...extra }
 }
 
-// 12-beat workday: standup → develop ×2 → deliver → review → fail → rework →
-// pass → evaluate → shutdown → completed → (loop).
+// 14-beat workday (0–13): standup → develop (two long-hold beats so the
+// 90s CR-6 wander window opens on any playback) → deliver ×2 → review
+// fail → rework → deliver round 2 → evaluate → shutdown → completed →
+// (loop at the calm head beat). The calm head beat dwells 5× and the
+// completed beat 3×, so the walk home and the idle stretch that follows
+// get time to play out — echoing the default office's ambient rhythm.
 const BEATS = [
+  // loop head — dwells 5×: the rest tail lets idle members stretch around the
+  // rest areas before the next workday starts
   {
     workflow: null,
+    dwell: 5,
     members: [
       m(M.mgr, 'manager', 'idle', null),
       m(M.dm, 'decision-maker', 'idle', null),
@@ -77,6 +88,29 @@ const BEATS = [
     members: [
       m(M.mgr, 'manager', 'working', '节点 develop 进行中'),
       m(M.dm, 'decision-maker', 'working', '权衡 slice-002 范围'),
+      m(M.exe1, 'executor', 'working', '✏️ slice-001 · round 1', { round: 1, task_kind: 'dev' }),
+      m(M.exe2, 'executor', 'working', '✏️ slice-002 · round 1', { round: 1, task_kind: 'dev' }),
+      m(M.rev, 'reviewer', 'idle', '待命'),
+    ],
+  },
+  // long-hold beats: identical facts, time passing — the developers cross the
+  // 90s threshold and take CR-6 wander breaks (position only; the manager
+  // never wanders — gate duty).
+  {
+    workflow: 'MAW 执行与审核流程 · develop',
+    members: [
+      m(M.mgr, 'manager', 'working', '节点 develop 进行中 · 持续'),
+      m(M.dm, 'decision-maker', 'working', '权衡 slice-002 范围 · 持续'),
+      m(M.exe1, 'executor', 'working', '✏️ slice-001 · round 1', { round: 1, task_kind: 'dev' }),
+      m(M.exe2, 'executor', 'working', '✏️ slice-002 · round 1', { round: 1, task_kind: 'dev' }),
+      m(M.rev, 'reviewer', 'idle', '待命'),
+    ],
+  },
+  {
+    workflow: 'MAW 执行与审核流程 · develop',
+    members: [
+      m(M.mgr, 'manager', 'working', '节点 develop 进行中 · 持续'),
+      m(M.dm, 'decision-maker', 'working', '权衡 slice-002 范围 · 持续'),
       m(M.exe1, 'executor', 'working', '✏️ slice-001 · round 1', { round: 1, task_kind: 'dev' }),
       m(M.exe2, 'executor', 'working', '✏️ slice-002 · round 1', { round: 1, task_kind: 'dev' }),
       m(M.rev, 'reviewer', 'idle', '待命'),
@@ -145,7 +179,7 @@ const BEATS = [
   {
     workflow: 'MAW 执行与审核流程 · shutdown',
     members: [
-      m(M.mgr, 'manager', 'awaiting-approval', '等待成员退出确认'),
+      m(M.mgr, 'manager', 'working', '退出确认 · 调度中'),
       m(M.dm, 'decision-maker', 'done', '已退出 🏁', { terminate: 'confirmed' }),
       m(M.exe1, 'executor', 'awaiting-approval', '收尾确认中', { terminate: 'initialized' }),
       m(M.exe2, 'executor', 'awaiting-approval', '收尾确认中', { terminate: 'initialized' }),
@@ -155,6 +189,7 @@ const BEATS = [
   {
     workflow: 'MAW 执行与审核流程 · 已收尾',
     terminal: 'completed',
+    dwell: 3, // the walk home takes a few staggered legs — hold the frame
     members: [
       m(M.mgr, 'manager', 'done', '流程收尾完成'),
       m(M.dm, 'decision-maker', 'done', '已退出 🏁', { terminate: 'confirmed' }),
@@ -163,21 +198,12 @@ const BEATS = [
       m(M.rev, 'reviewer', 'done', '已退出 🏁', { terminate: 'confirmed' }),
     ],
   },
-  // calm tail: everything idle before the next loop (no stale terminal marker)
-  {
-    workflow: null,
-    members: [
-      m(M.mgr, 'manager', 'idle', null),
-      m(M.dm, 'decision-maker', 'idle', null),
-      m(M.exe1, 'executor', 'idle', null),
-      m(M.exe2, 'executor', 'idle', null),
-      m(M.rev, 'reviewer', 'idle', null),
-    ],
-  },
 ]
 
 let seq = 0
 let beat = 0
+
+const beatDataDwell = (index) => BEATS[index % BEATS.length].dwell
 
 async function healthCheck() {
   const res = await fetch(`${BASE_URL}/api/health`)
@@ -250,9 +276,9 @@ if (ONCE) {
 let alive = true
 while (alive) {
   alive = await publish(beat)
-  // The calm tail beat dwells 5x so the walk back to the meeting room is visible
-  // before the next storyline loop starts.
-  const dwell = beat % BEATS.length === 0 ? EVERY * 5 : EVERY
+  // Per-beat dwell (calm head 5×, completed 3×) so the walk home and the
+  // idle stretch that follows are visible before the next storyline loop.
+  const dwell = EVERY * (beatDataDwell(beat) ?? 1)
   beat += 1
   if (alive) await new Promise((r) => setTimeout(r, dwell))
 }
