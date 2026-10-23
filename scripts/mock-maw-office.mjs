@@ -93,11 +93,13 @@ const BEATS = [
       m(M.rev, 'reviewer', 'idle', '待命'),
     ],
   },
-  // long-hold beats: identical facts, time passing — the developers cross the
-  // 90s threshold and take CR-6 wander breaks (position only; the manager
-  // never wanders — gate duty).
+  // long-hold beats (dwell 5× each): identical facts, time passing — the
+  // developers cross the 90s threshold on ANY playback and take CR-6 wander
+  // breaks, which sample the rest areas only (CR-7: never the middle office;
+  // the manager never wanders — gate duty).
   {
     workflow: 'MAW 执行与审核流程 · develop',
+    dwell: 5,
     members: [
       m(M.mgr, 'manager', 'working', '节点 develop 进行中 · 持续'),
       m(M.dm, 'decision-maker', 'working', '权衡 slice-002 范围 · 持续'),
@@ -108,6 +110,7 @@ const BEATS = [
   },
   {
     workflow: 'MAW 执行与审核流程 · develop',
+    dwell: 5,
     members: [
       m(M.mgr, 'manager', 'working', '节点 develop 进行中 · 持续'),
       m(M.dm, 'decision-maker', 'working', '权衡 slice-002 范围 · 持续'),

@@ -243,6 +243,10 @@ describe('startMawChoreography (controller)', () => {
       const walking = store.getState().agents['exe01~executor']
       expect(walking.inGroupEvent).toBe(true) // wander walk started (no ReferenceError)
       expect(violatesMemberZone(walking.groupTarget)).toBe(false)
+      // CR-7: a working member's wander ONLY samples the rest areas — never the
+      // middle office
+      const inRest = inRect(walking.groupTarget, MEETING) || inRect(walking.groupTarget, LOUNGE) || inRect(walking.groupTarget, RESEARCH)
+      expect(inRest).toBe(true)
       vi.advanceTimersByTime(120_000) // arrival dwell (8–16s) + walk home + restore
       const back = store.getState().agents['exe01~executor']
       expect(back.inGroupEvent).toBe(false)
