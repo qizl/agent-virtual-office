@@ -1042,6 +1042,34 @@ describe('startMawChoreography (controller)', () => {
     }
   })
 
+  it('CR-11: a stale interruption cannot lose a staggered standby launch (review P1/P2)', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    try {
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('rev01', 'reviewer', 'idle'),
+        mawMember('exe01', 'executor', 'idle'),
+      ]))
+      // flip: rev01 launches at readyAt 0, exe01 at +600ms
+      vi.advanceTimersByTime(100)
+      // stale BEFORE exe01's stagger slot — the queued launch must survive
+      useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, quality: 'stale' } })
+      vi.advanceTimersByTime(1_500) // past exe01's slot, still stale — holds
+      const held = store.getState().agents['exe01~executor']
+      expect(held.inGroupEvent).toBe(false)
+      // recovery: the pass completes the queued launch
+      useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, quality: 'ok' } })
+      vi.advanceTimersByTime(5_000)
+      const standby = store.getState().agents['exe01~executor']
+      const ownSeat = workSeatFor('executor', 0) // exe01's own cluster seat
+      expect(Math.hypot(standby.position.x - ownSeat.x, standby.position.y - ownSeat.y)).toBeLessThan(60)
+      expect(standby.behavior).toBe('idle')
+    } finally {
+      cleanup()
+    }
+  })
+
   it('a member who finishes walks to their stable rest seat and the rest animation is honest', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
