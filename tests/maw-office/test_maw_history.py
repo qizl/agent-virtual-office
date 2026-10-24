@@ -109,7 +109,7 @@ class HistoryTest(unittest.TestCase):
         self.assertEqual(result["task"], TASK)
         first = result["steps"][0]
         self.assertEqual(first["id"], op["op_id"])
-        self.assertEqual(first["recorded_at"], op["created_at"])
+        self.assertEqual(first["recorded_at"], "2026-10-23T04:00:00+00:00")
         self.assertEqual(executor(first)["status"], "planning")
         self.assertIsNone(executor(first)["verdict"])
         self.assertIsNone(first["snapshot"]["terminal"])
@@ -171,6 +171,107 @@ class HistoryTest(unittest.TestCase):
         self.assertIn("task-record-invalid", result["warnings"])
         self.assertEqual(result["steps"][0]["source_refs"], ["executor-1/task-001.json"])
 
+    def test_damaged_review_publication_is_skipped_without_losing_valid_history(self):
+        for publication in ("damaged", ["damaged"], 1, True, None, {}):
+            with self.subTest(publication=publication):
+                root, directory = runtime(executor_tasks=[fixtures.task(1, status="dev-complete")])
+                valid = operation(directory, {"action": "complete-node", "node": "develop"})
+                damaged = operation(directory, {
+                    "action": "create-review-task", "owner": "reviewer-1", "seq": 2,
+                    "task": fixtures.task(2, type_="review", status="initialized"),
+                    "publication": publication,
+                }, revision=2)
+                result = read(root)
+                self.assertTrue(result["eligible"])
+                self.assertFalse(result["complete"])
+                self.assertIn("operation-record-invalid", result["warnings"])
+                self.assertEqual([step["id"] for step in result["steps"]], [
+                    valid["op_id"], "task-result:executor-1/task-001", "final-observation"])
+                self.assertNotIn(damaged["op_id"], json.dumps(result))
+
+    def test_damaged_close_finish_is_skipped_without_losing_valid_history(self):
+        for finish in ("damaged", ["damaged"], 1, True, None, {}):
+            with self.subTest(finish=finish):
+                root, directory = runtime(executor_tasks=[fixtures.task(1, status="dev-complete")])
+                valid = operation(directory, {"action": "complete-node", "node": "develop"})
+                damaged = close_operation(directory)
+                damaged["action"]["workflow"]["finish"] = finish
+                damaged["writes"]["workflow.json"]["after"] = history._written_digest(damaged["action"]["workflow"])
+                fixtures.write(directory / "context" / "operations" / f"{damaged['op_id']}.json", damaged)
+                result = read(root)
+                self.assertTrue(result["eligible"])
+                self.assertFalse(result["complete"])
+                self.assertIn("operation-record-invalid", result["warnings"])
+                self.assertEqual([step["id"] for step in result["steps"]], [
+                    valid["op_id"], "task-result:executor-1/task-001", "final-observation"])
+                self.assertNotIn("terminal-conflict", result["warnings"])
+                self.assertNotIn(damaged["op_id"], json.dumps(result))
+
+    def test_deeply_nested_inputs_are_skipped_at_each_file_boundary(self):
+        for target in ("operation", "task"):
+            for depth in (600, 2000):
+                with self.subTest(target=target, depth=depth):
+                    root, directory = runtime(executor_tasks=[fixtures.task(1, status="dev-complete")])
+                    valid = operation(directory, {"action": "complete-node", "node": "develop"})
+                    if target == "operation":
+                        damaged = operation(directory, {"action": "complete-node", "node": "evaluate"}, revision=2)
+                        path = directory / "context" / "operations" / f"{damaged['op_id']}.json"
+                    else:
+                        damaged = fixtures.task(2)
+                        path = directory / "executor-1" / "task-002.json"
+                    raw = json.dumps(damaged)[:-1] + ',"nested":' + "[" * depth + "0" + "]" * depth + "}"
+                    self.assertLess(len(raw.encode()), history.projection.MAX_FILE_BYTES)
+                    fixtures.write(path, None, raw=raw)
+                    result = read(root)
+                    self.assertTrue(result["eligible"])
+                    self.assertFalse(result["complete"])
+                    self.assertIn(f"{target}-record-invalid", result["warnings"])
+                    self.assertEqual([step["id"] for step in result["steps"]], [
+                        valid["op_id"], "task-result:executor-1/task-001", "final-observation"])
+
+    def test_damaged_current_finish_marks_incomplete_without_erasing_valid_history(self):
+        for status in ("active", "completed"):
+            for finish in ("damaged", ["damaged"], 1, True):
+                with self.subTest(status=status, finish=finish):
+                    root, directory = runtime(status=status, executor_tasks=[fixtures.task(1, status="dev-complete")])
+                    valid = operation(directory, {"action": "complete-node", "node": "develop"})
+                    workflow = json.loads((directory / "workflow.json").read_text())
+                    workflow["finish"] = finish
+                    fixtures.write(directory / "workflow.json", workflow)
+                    result = read(root)
+                    self.assertEqual(result["eligible"], status == "completed")
+                    self.assertFalse(result["complete"])
+                    self.assertIn("current-input-incomplete", result["warnings"])
+                    self.assertNotIn("terminal-conflict", result["warnings"])
+                    self.assertEqual([step["id"] for step in result["steps"]], [
+                        valid["op_id"], "task-result:executor-1/task-001", "final-observation"])
+
+    def test_json_decoder_recursion_failure_degrades_only_the_affected_file(self):
+        for target in ("operation", "task"):
+            with self.subTest(target=target):
+                root, directory = runtime(executor_tasks=[fixtures.task(1, status="dev-complete")])
+                valid = operation(directory, {"action": "complete-node", "node": "develop"})
+                if target == "operation":
+                    damaged = operation(directory, {"action": "complete-node", "node": "evaluate"}, revision=2)
+                    path = directory / "context" / "operations" / f"{damaged['op_id']}.json"
+                else:
+                    path = directory / "executor-1" / "task-002.json"
+                    fixtures.write(path, fixtures.task(2))
+                original = history._projection_read_json_capped
+
+                def recursion_failure(input_path):
+                    if input_path == path:
+                        raise RecursionError("excessive JSON nesting")
+                    return original(input_path)
+
+                with mock.patch.object(history, "_projection_read_json_capped", side_effect=recursion_failure):
+                    result = read(root)
+                self.assertTrue(result["eligible"])
+                self.assertFalse(result["complete"])
+                self.assertIn(f"{target}-record-invalid", result["warnings"])
+                self.assertEqual([step["id"] for step in result["steps"]], [
+                    valid["op_id"], "task-result:executor-1/task-001", "final-observation"])
+
     def test_schema_shaped_damaged_task_is_omitted_with_warning(self):
         root, directory = runtime(executor_tasks=[fixtures.task(1, status="dev-complete")])
         damaged = fixtures.task(2)
@@ -231,6 +332,20 @@ class HistoryTest(unittest.TestCase):
         self.assertIsNone(result["steps"][0]["recorded_at"])
         self.assertIn("recorded-time-unavailable", result["warnings"])
         self.assertNotIn("duration", json.dumps(result))
+
+    def test_recorded_time_normalizes_iso_variants_to_the_client_contract(self):
+        for recorded, expected in (
+                ("2026-10-23 12:00:00+0800", "2026-10-23T04:00:00+00:00"),
+                ("20261023T120000+0800", "2026-10-23T04:00:00+00:00"),
+                ("2026-10-23T12:00:00.123456+08:00", "2026-10-23T04:00:00.123456+00:00"),
+                ("2026-10-23T04:00:00Z", "2026-10-23T04:00:00+00:00")):
+            with self.subTest(recorded=recorded):
+                root, directory = runtime()
+                operation(directory, {"action": "complete-node", "node": "develop"}, created_at=recorded)
+                result = read(root)
+                self.assertEqual(result["steps"][0]["recorded_at"], expected)
+                self.assertRegex(result["steps"][0]["recorded_at"],
+                                 r"^\d{4}-\d\d-\d\dT.*(?:Z|[+-]\d\d:\d\d)$")
 
     def test_close_operations_validate_frozen_hashes_without_leaking_final_conclusions_early(self):
         root, directory = runtime(executor_tasks=[fixtures.task(1, status="review-passed")])

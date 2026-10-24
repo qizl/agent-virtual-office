@@ -28,6 +28,7 @@ SCHEMA = "avo.maw-history/1"
 MAX_OPERATIONS = 200
 MAX_STEPS = 200
 MAX_RESPONSE_BYTES = 1_048_576
+MAX_JSON_DEPTH = 64
 HASH_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 OP_RE = re.compile(r"op-([0-9]{6,})-([A-Za-z0-9-]{1,80})\Z")
 TASK_REF_RE = re.compile(r"((?:decision-maker|executor|reviewer)-[0-9]+)/task-([0-9]{3,})(?:\.json)?\Z")
@@ -37,6 +38,34 @@ ACTION_KINDS = {"assign-dev", "create-plan-review-task", "create-review-task", "
                 "cancel-request", "cancel-close", "finish-close", "add-role"}
 PUBLICATIONS = {"assign-dev", "create-plan-review-task", "create-review-task", "create-aggregate-review-task"}
 CLOSE = {"finish-close", "cancel-close"}
+
+
+_projection_read_json_capped = projection.read_json_capped
+
+
+def _read_history_json_capped(path):
+    """Reject recursion-heavy files before fingerprints or frame copies use them."""
+    try:
+        data, why = _projection_read_json_capped(path)
+    except RecursionError:
+        return None, "corrupt"
+    if why is not None:
+        return data, why
+    pending = [(data, 0)]
+    while pending:
+        value, depth = pending.pop()
+        if depth > MAX_JSON_DEPTH:
+            return None, "corrupt"
+        if isinstance(value, dict):
+            pending.extend((child, depth + 1) for child in value.values())
+        elif isinstance(value, list):
+            pending.extend((child, depth + 1) for child in value)
+    return data, None
+
+
+# This projection module is loaded privately for history. Its per-file boundary
+# also covers the consistency reader without changing the live projection API.
+projection.read_json_capped = _read_history_json_capped
 
 
 def _integer(value, minimum=1):
@@ -65,7 +94,7 @@ def _recorded_time(value):
     parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("recorded time needs an offset")
-    return value
+    return parsed.astimezone(dt.timezone.utc).isoformat()
 
 
 def _warning(warnings, code):
@@ -77,7 +106,8 @@ def _terminal(state):
     manifest = state["manifest"]
     status = manifest.get("status")
     terminal = status if status in projection.TERMINAL_MANIFEST else None
-    finish = (state.get("workflow") or {}).get("finish") or {}
+    finish = (state.get("workflow") or {}).get("finish")
+    finish = finish if isinstance(finish, dict) else {}
     declared = [value for value in (manifest.get("terminal_outcome"), finish.get("outcome")) if value is not None]
     conflict = any(value not in projection.TERMINAL_MANIFEST or value != terminal for value in declared)
     return terminal, conflict
@@ -85,7 +115,11 @@ def _terminal(state):
 
 def _dashboard_snapshot(state, sampled_at):
     producer = "history-" + hashlib.sha256(f"{state['project_root'].resolve()}|{state['task_id']}".encode()).hexdigest()[:24]
-    raw = projection.validate_snapshot(projection.build_snapshot(copy.deepcopy(state), producer, 1, sampled_at))
+    snapshot_state = copy.deepcopy(state)
+    workflow = snapshot_state.get("workflow")
+    if isinstance(workflow, dict) and not isinstance(workflow.get("finish"), (dict, type(None))):
+        workflow["finish"] = None
+    raw = projection.validate_snapshot(projection.build_snapshot(snapshot_state, producer, 1, sampled_at))
     return {"schema": raw["schema"], "workflow": raw["workflow"], "quality": raw["quality"],
             "quality_detail": raw["quality_detail"], "terminal": raw["terminal"], "sampled_at": sampled_at,
             "producer_id": producer, "producer_seq": 1, "accepted_at": sampled_at, "members": raw["members"]}
@@ -205,8 +239,10 @@ def _validate_operation(op, name, state):
         if (action.get("seq") != task["seq"] or path not in writes
                 or writes[path]["after"] != _written_digest(task)):
             raise ValueError("publication fingerprint is invalid")
-        if kind != "assign-dev" and (action.get("publication") or {}).get("task_file") != path:
-            raise ValueError("publication path is invalid")
+        if kind != "assign-dev":
+            publication = action.get("publication")
+            if not isinstance(publication, dict) or publication.get("task_file") != path:
+                raise ValueError("publication path is invalid")
         if kind == "assign-dev" and task["type"] != "dev":
             raise ValueError("development task type is invalid")
         if kind != "assign-dev" and task["type"] != {"create-plan-review-task": "plan-review", "create-review-task": "review", "create-aggregate-review-task": "aggregate-review"}[kind]:
@@ -220,8 +256,9 @@ def _validate_operation(op, name, state):
                 or writes["task.json"]["after"] != _written_digest(final_manifest)):
             raise ValueError("close record binding is invalid")
         terminal = final_manifest.get("status")
-        if (terminal not in projection.TERMINAL_MANIFEST or final_manifest.get("terminal_outcome") != terminal
-                or (final_workflow.get("finish") or {}).get("outcome") != terminal
+        finish = final_workflow.get("finish")
+        if (not isinstance(finish, dict) or terminal not in projection.TERMINAL_MANIFEST
+                or final_manifest.get("terminal_outcome") != terminal or finish.get("outcome") != terminal
                 or (kind == "cancel-close" and terminal != "cancelled")
                 or (kind == "finish-close" and terminal not in ("completed", "completed-with-findings"))):
             raise ValueError("close outcome is invalid")
@@ -367,6 +404,9 @@ def read_history(project_root: Path, task_id: str, *, project: str, now=None) ->
             raise BridgeError("input-inconsistent", "task inputs changed during observation", projection.EXIT_NO_DATA)
         baseline = _current_signature(state)
         warnings = []
+        workflow = state.get("workflow")
+        if isinstance(workflow, dict) and not isinstance(workflow.get("finish"), (dict, type(None))):
+            _warning(warnings, "current-input-incomplete")
         # Damaged member records are omitted from the final projection as well
         # as from replay, while their incompleteness remains visible.
         for role in state["roles"].values():
@@ -412,7 +452,7 @@ def read_history(project_root: Path, task_id: str, *, project: str, now=None) ->
             for _revision, identity, op, action in operations:
                 kind, label = _operation_fact(frame, state, action)
                 # Terminal conclusions belong to their actual final snapshot only.
-                append(identity, kind, label, op.get("created_at"), [f"context/operations/{identity}.json"])
+                append(identity, kind, label, _recorded_time(op.get("created_at")), [f"context/operations/{identity}.json"])
             for ref, task in tasks:
                 _task_fact(frame, state, ref.split("/", 1)[0], task)
                 append("task-result:" + ref, "task-record", "任务记录补充 · 时间未记录", None, [ref + ".json"])

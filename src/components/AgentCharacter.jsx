@@ -1571,6 +1571,8 @@ function AgentCharacter({ agent }) {
   }, [])
 
   const firePoke = useCallback(() => {
+    const state = useOfficeStore.getState()
+    if (state.integration === 'dashboard' && state.mawMeta?.dashboard_history) return
     const now = Date.now()
     // Read the agent's REAL status fresh from the store at call time (stable empty-deps
     // closure; never stale). Honest by construction — we only READ status, never write.

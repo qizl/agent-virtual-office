@@ -46,7 +46,9 @@ function nearTarget(from) {
 
 export default function OfficePet() {
   const officePet = useOfficeStore((s) => s.officePet)
-  const reducedMotion = useOfficeStore((s) => s.reducedMotion)
+  const historical = useOfficeStore((s) => s.integration === 'dashboard' && Boolean(s.mawMeta?.dashboard_history))
+  // Recorded scenes have no ambient journeys or newly generated reaction beats.
+  const reducedMotion = useOfficeStore((s) => s.reducedMotion) || historical
   const mood = useOfficeStore((s) => s.mood)
   // live blocked count — primitive, so the pet re-renders only when it actually changes.
   // AVO-171: counts `blocked` AND `awaiting-approval` (a permission-prompt wait is still a real
@@ -75,8 +77,8 @@ export default function OfficePet() {
   // beat the pet was missing after a run-to-desk). Both are honest positive signals.
   const [celebrate, fireCelebrate] = useTransientFlag(2500)
   useEffect(() => {
-    if (activeEventId === 'eureka' || activeEventId === 'deploy-success') fireCelebrate()
-  }, [activeEventId, fireCelebrate])
+    if (!historical && (activeEventId === 'eureka' || activeEventId === 'deploy-success')) fireCelebrate()
+  }, [activeEventId, fireCelebrate, historical])
 
   // alert: a NEW blocker appeared (blockedCount rose) — ears-up "noticing" beat that settles back into
   // hide. A blocker CLEARING (count fell to 0) fires the relief celebrate above.
@@ -85,15 +87,16 @@ export default function OfficePet() {
   useEffect(() => {
     const prev = prevBlockedRef.current
     prevBlockedRef.current = blockedCount
+    if (historical) return
     if (blockedCount > prev) fireAlert()
     else if (blockedCount === 0 && prev > 0) fireCelebrate() // a real blocker cleared → relief
-  }, [blockedCount, fireAlert, fireCelebrate])
+  }, [blockedCount, fireAlert, fireCelebrate, historical])
   // keep the latest blocked-agent position handy for the run-to-desk effect (below, after pos exists)
   const blockedPosRef = useRef(blockedAgentPos)
   useEffect(() => { blockedPosRef.current = blockedAgentPos }, [blockedAgentPos])
 
   const baseMode = derivePetState({ mood, blockedCount })
-  const mode = resolvePetMode({ base: baseMode, alert, celebrate })
+  const mode = historical ? baseMode : resolvePetMode({ base: baseMode, alert, celebrate })
 
   // #39 delight: click-to-pet — a purely cosmetic, user-initiated ♥ beat (no mode/state change, never
   // affects the honest reading). Gated in render so it can't co-occur with a real-signal beat.
@@ -134,7 +137,7 @@ export default function OfficePet() {
   // interval effect above has already cleared its timer (its `mobile` guard), so this is the SOLE
   // writer of `pos`/`posRef` during the beat — no contention with the random-wander setInterval.
   useEffect(() => {
-    if (!alert || !officePet) return
+    if (!alert || !officePet || historical) return
     const raw = blockedPosRef.current
     if (!raw) return
     const [bx, by] = raw.split(',').map(Number)
@@ -144,7 +147,7 @@ export default function OfficePet() {
     setFacing(dest.x >= posRef.current.x ? 1 : -1)
     posRef.current = dest
     setPos(dest)
-  }, [alert, officePet])
+  }, [alert, officePet, historical])
 
   if (!officePet) return null
 
@@ -167,12 +170,12 @@ export default function OfficePet() {
     <g
       data-office-pet={mode}
       data-pet-type={petType}
-      data-petted={petted ? '1' : undefined}
+      data-petted={petted && !historical ? '1' : undefined}
       aria-hidden="true"
       transform={`translate(${pos.x}, ${pos.y})`}
       style={reducedMotion ? { cursor: 'pointer' } : { transition: `transform ${glideMs}ms ${grammar.easing}`, cursor: 'pointer' }}
       pointerEvents="auto"
-      onClick={firePetted}
+      onClick={historical ? undefined : firePetted}
     >
       <g transform={`scale(${facing * petScale}, ${petScale})`} style={hop}>
         <g key={mode} style={pop}>
@@ -196,7 +199,7 @@ export default function OfficePet() {
         )}
         {/* click-♥ shows ONLY in a calm/neutral base mode so it can never compete with — or visually
             contradict — a real-signal beat (a ♥ over a hiding/alerting pet would read dishonestly). */}
-        {petted && (mode === PET_MODES.WANDER || mode === PET_MODES.NAP || mode === PET_MODES.EXCITED) && (
+        {petted && !historical && (mode === PET_MODES.WANDER || mode === PET_MODES.NAP || mode === PET_MODES.EXCITED) && (
           <text x={0} y={-9} fontSize="6" textAnchor="middle" fill="#E2588B" aria-hidden="true"
             style={reducedMotion ? undefined : { animation: 'pet-heart 1s ease-out both' }}>♥</text>
         )}
