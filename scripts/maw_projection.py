@@ -355,9 +355,11 @@ def pick_task(runtime: Path, wanted: str | None) -> str:
 # ─── reading (plan §4.2.3) ───────────────────────────────────────────────────
 
 
-def read_runtime_state(project_root: Path, task_id: str) -> dict:
+def read_runtime_state(project_root: Path, task_id: str, *, task_validator=None) -> dict:
     """Read the Dashboard-identical file set for one task. Returns the raw state
-    plus per-input degradation markers; never writes anything."""
+    plus per-input degradation markers; never writes anything. A caller may
+    validate task records before sorting; the default live contract is unchanged.
+    """
     task_dir = safe_resolve(project_root, f"{RUNTIME_REL}/{task_id}")
     degraded: list[str] = []
 
@@ -406,7 +408,12 @@ def read_runtime_state(project_root: Path, task_id: str) -> dict:
             degraded.append(f"{folder}/tasks:limit")
             children = children[:MAX_TASK_FILES]
         for child in children:
-            task, why = read_json_schema(checked_path(entry, child.name), TASK_SCHEMAS)
+            if task_validator is None:
+                task, why = read_json_schema(checked_path(entry, child.name), TASK_SCHEMAS)
+            else:
+                task, why = read_json_capped(checked_path(entry, child.name))
+                if why is None and not task_validator(task):
+                    task, why = None, "invalid-task"
             if task is None:
                 if why != "missing":
                     degraded.append(f"{folder}/{child.name}:{why}")
@@ -739,17 +746,22 @@ def build_snapshot(state: dict, producer_id: str, seq: int, sampled_at: int) -> 
     }
 
 
-def read_with_consistency(project_root: Path, task_id: str, stall_minutes: int) -> dict:
+def read_with_consistency(project_root: Path, task_id: str, stall_minutes: int, *, task_validator=None) -> dict:
     """Read, fingerprint, re-read; a still-moving tree publishes concurrent-update
     degraded instead of pretending the mix is valid (plan §4.2.4)."""
-    state = read_runtime_state(project_root, task_id)
+    def read():
+        if task_validator is None:
+            return read_runtime_state(project_root, task_id)
+        return read_runtime_state(project_root, task_id, task_validator=task_validator)
+
+    state = read()
     state["_stall_minutes"] = stall_minutes
     before = fingerprint(state)
-    after_state = read_runtime_state(project_root, task_id)
+    after_state = read()
     after_state["_stall_minutes"] = stall_minutes
     after = fingerprint(after_state)
     if before != after:
-        third = fingerprint(read_runtime_state(project_root, task_id))
+        third = fingerprint(read())
         if third != after:
             after_state["_inconsistent"] = True
     return after_state

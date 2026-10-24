@@ -18,6 +18,7 @@ export default function App() {
   const integration = useMemo(() => detectIntegrationConfig().integration, [])
   const config = useMemo(() => getPlatformConfig(platform, integration), [platform, integration])
   const mode = useMemo(() => integration === 'dashboard' ? 'full' : getDisplayMode(), [integration])
+  const playbackState = useOfficeStore((s) => s.dashboardHistory?.state)
 
   // Global keyboard shortcuts: Space = pause, L = switch language
   useEffect(() => {
@@ -58,7 +59,7 @@ export default function App() {
 
   return (
     <ErrorBoundary>
-      <div className="w-screen h-screen bg-[#F5F2EB] dark:bg-[#1a1814] flex flex-col items-center justify-center overflow-hidden">
+      <div data-dashboard-playback={integration === 'dashboard' ? playbackState : undefined} className="w-screen h-screen bg-[#F5F2EB] dark:bg-[#1a1814] flex flex-col items-center justify-center overflow-hidden">
         <PixelOffice animationQuality={config.animationQuality} />
         {config.showControlPanel && <ControlPanel platform={platform} />}
         <ActivityFeed mode={mode} />

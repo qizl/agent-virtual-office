@@ -114,6 +114,19 @@ describe('ControlPanel — presence rail render contract', () => {
     expect(wrapper).not.toContain('data-dashboard-controls')
   })
 
+  it('labels historical scenes and derives pause controls from the replay clock', async () => {
+    const { html } = await renderControlPanelWithMockStore({
+      integration: 'dashboard', isPaused: true,
+      dashboardSync: { state: 'synced' },
+      dashboardHistory: { state: 'playing', message: '任务记录回顾 · 非实时 · 时间未记录', label: 'Recorded result' },
+    })
+    expect(html).toContain('data-dashboard-history="playing"')
+    expect(html).toContain('任务记录回顾 · 非实时 · 时间未记录')
+    expect(html).toContain('Recorded result')
+    expect(html).toContain('aria-label="Pause"')
+    expect(html).not.toContain('data-dashboard-sync')
+  })
+
   it('renders the normalized external status for the rail dot and screen-reader text', async () => {
     const { html, statusColors } = await renderControlPanelWithMockStore()
 

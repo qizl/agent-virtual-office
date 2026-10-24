@@ -67,7 +67,10 @@ export default function ControlPanel({ platform = 'browser', mode = 'full' }) {
   const agentList = useOfficeStore(useShallow((s) => Object.values(s.agents)))
   const isDashboard = useOfficeStore((s) => s.integration === 'dashboard')
   const dashboardSync = useOfficeStore((s) => s.dashboardSync)
+  const dashboardHistory = useOfficeStore((s) => s.dashboardHistory)
   const isPaused = useOfficeStore((s) => s.isPaused)
+  const inHistory = isDashboard && ['playing', 'paused', 'ended'].includes(dashboardHistory?.state)
+  const displayPaused = inHistory ? dashboardHistory.state !== 'playing' : isPaused
   const togglePause = useOfficeStore((s) => s.togglePause)
   const rosterMode = useOfficeStore((s) => s.rosterMode)
   const toggleRosterMode = useOfficeStore((s) => s.toggleRosterMode)
@@ -246,7 +249,13 @@ export default function ControlPanel({ platform = 'browser', mode = 'full' }) {
   // ─── Full mode: standard control panel ───
   return (
     <div data-dashboard-controls={isDashboard || undefined} className={`${isDashboard ? 'relative w-full shrink-0' : 'fixed bottom-0 left-0 right-0'} bg-white/90 dark:bg-gray-900/90 backdrop-blur border-t border-gray-200 dark:border-gray-700 px-3 py-1.5 text-xs select-none z-50`}>
-      {isDashboard && dashboardSync && (
+      {inHistory && (
+        <div className="mb-1 flex flex-wrap items-center justify-center gap-2 text-[11px] text-gray-600 dark:text-gray-300" role="status" data-dashboard-history={dashboardHistory.state}>
+          <span>{dashboardHistory.message}</span>
+          {dashboardHistory.label && <strong>{dashboardHistory.label}</strong>}
+        </div>
+      )}
+      {isDashboard && !inHistory && dashboardSync && (
         <div className="mb-1 flex flex-wrap items-center justify-center gap-2 text-[11px] text-gray-600 dark:text-gray-300" role="status" data-dashboard-sync={dashboardSync.state}>
           <span>{t(`dashboard.${dashboardSync.state}`, dashboardSync.state)}</span>
           {dashboardSync.code && <span>{t(`dashboard.${dashboardSync.code}`, dashboardSync.code)}</span>}
@@ -478,8 +487,8 @@ export default function ControlPanel({ platform = 'browser', mode = 'full' }) {
             the persistent cluster is just the health dot + pause + gear. */}
 
         <div className="flex items-center gap-1.5 shrink-0">
-          <button onClick={togglePause} className="px-2 py-1 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors text-gray-600 dark:text-gray-300" title={`${isPaused ? t('aria.resume', 'Resume') : t('aria.pause', 'Pause')} (Space)`} aria-label={isPaused ? t('aria.resume', 'Resume') : t('aria.pause', 'Pause')}>
-            {isPaused ? '▶' : '⏸'}
+          <button onClick={togglePause} className="px-2 py-1 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors text-gray-600 dark:text-gray-300" title={`${displayPaused ? t('aria.resume', 'Resume') : t('aria.pause', 'Pause')} (Space)`} aria-label={displayPaused ? t('aria.resume', 'Resume') : t('aria.pause', 'Pause')}>
+            {displayPaused ? '▶' : '⏸'}
           </button>
           {/* #39 + AVO-130: ⚙ menu now also holds language, view-mode, run-workflow, and help,
               alongside the cosmetic toggles + notifications + dev test, so the bar stays lean. */}

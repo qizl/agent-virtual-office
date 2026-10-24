@@ -461,12 +461,13 @@ export const CharacterPixelSprite = React.memo(function CharacterPixelSprite({ c
 const BehaviorIndicator = React.memo(function BehaviorIndicator({ behavior }) {
   const [frame, setFrame] = useState(0)
   const reducedMotion = useOfficeStore((s) => s.reducedMotion)
+  const historyPaused = useOfficeStore((s) => ['paused', 'ended'].includes(s.dashboardHistory?.state))
 
   useEffect(() => {
     // Animate indicator every 600ms
-    const iv = reducedMotion ? null : setInterval(() => setFrame(f => (f + 1) % 4), 600)
+    const iv = reducedMotion || historyPaused ? null : setInterval(() => setFrame(f => (f + 1) % 4), 600)
     return () => { if (iv) clearInterval(iv) }
-  }, [reducedMotion])
+  }, [reducedMotion, historyPaused])
 
   // Position: to the right of character
   const ox = 14, oy = -8
@@ -816,6 +817,8 @@ function AgentCharacter({ agent }) {
     const handle = setTimeout(() => {
       deferredTimersRef.current.delete(handle)
       if (isUnmountedRef.current) return
+      // Old live bubble/handoff callbacks cannot rewrite a recorded history frame.
+      if (['playing', 'paused', 'ended'].includes(useOfficeStore.getState().dashboardHistory?.state)) return
       fn()
     }, ms)
     deferredTimersRef.current.add(handle)

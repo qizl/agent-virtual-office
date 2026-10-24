@@ -628,6 +628,7 @@ function applyMawSnapshotImpl(s, envelope) {
   if (s.mode !== 'maw' || !envelope || typeof envelope !== 'object') return {}
   const snapshot = envelope.snapshot
   const stale = snapshot ? snapshot.quality === 'stale' : false
+  const historical = envelope.dashboard_history === true && s.integration === 'dashboard'
   const recovering = s.integration === 'dashboard'
     && (envelope.dashboard_recovery ?? 0) !== (s.mawMeta?.dashboard_recovery ?? 0)
   const meta = {
@@ -640,14 +641,14 @@ function applyMawSnapshotImpl(s, envelope) {
     terminal: snapshot ? snapshot.terminal : null,
     dashboard_recovery: envelope.dashboard_recovery ?? 0,
   }
-  const agents = { ...s.agents }
+  const agents = historical ? {} : { ...s.agents }
   const desired = new Map()
   // CR-1 opening action: the FIRST snapshot after load spawns EVERYONE at the
   // default meeting-room seats, so the choreography's staggered walk-in plays
   // on every page load. Later newcomers spawn by phase (rest → meeting room,
   // task → desk). The probing set matches the choreography's own binding order,
   // so opening spawn seats equal its stable rest-seat bindings exactly.
-  const opening = !Object.values(agents).some((a) => a?.mawMember)
+  const opening = !historical && !Object.values(agents).some((a) => a?.mawMember)
   const openingTaken = new Set()
   if (snapshot && Array.isArray(snapshot.members)) {
     const perRoleCount = {}
@@ -683,7 +684,7 @@ function applyMawSnapshotImpl(s, envelope) {
     // CR-10: the assigned work seat is stamped ONCE and stays stable across
     // snapshots — PixelOffice renders the seat nameplate from it.
     built.maw.workSeat = existing?.maw?.workSeat ?? { ...workSeat }
-    if (existing) {
+    if (existing && !historical) {
       // Preserve live motion state; refresh only the projected facts. While the
       // choreography owns a walk (inGroupEvent) its behavior/expression/bubble are
       // authoritative — a snapshot refresh must not reset the transit animation
@@ -706,7 +707,7 @@ function applyMawSnapshotImpl(s, envelope) {
       agents[agentId] = built
     }
   }
-  return { agents, mawMeta: meta, ...(recovering ? { doorTraffic: createDoorClaimState() } : {}) }
+  return { agents, mawMeta: meta, ...(recovering || historical ? { doorTraffic: createDoorClaimState() } : {}) }
 }
 
 export const useOfficeStore = create((set) => ({
@@ -714,6 +715,9 @@ export const useOfficeStore = create((set) => ({
   integration: detectIntegrationConfig().integration,
   dashboardSync: null,
   dashboardRetry: 0,
+  dashboardHistory: null,
+  dashboardHistoryToggle: 0,
+  setDashboardHistory: (history) => set({ dashboardHistory: history }),
   setDashboardSync: (sync) => set({ dashboardSync: sync }),
   requestDashboardSync: () => set((s) => s.integration === 'dashboard' ? { dashboardRetry: s.dashboardRetry + 1 } : {}),
   // The action owns the observation boundary; hiding a UI control alone is insufficient.
@@ -1245,6 +1249,9 @@ export const useOfficeStore = create((set) => ({
   // WhiteboardAnimation). Skip the write when the state would not change.
   clearActiveEvent: () => set((s) => (s.activeEvent === null ? {} : { activeEvent: null })),
   togglePause: () => set((s) => {
+    if (s.integration === 'dashboard' && ['playing', 'paused', 'ended'].includes(s.dashboardHistory?.state)) {
+      return { dashboardHistoryToggle: s.dashboardHistoryToggle + 1 }
+    }
     const next = !s.isPaused
     try { if (typeof window !== 'undefined') localStorage.setItem('office-paused', String(next)) } catch {}
     return { isPaused: next }

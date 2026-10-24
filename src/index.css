@@ -3,6 +3,16 @@
 @source "./";
 @source "../index.html";
 
+/* Historical playback owns its clock; decorative CSS freezes with it. */
+[data-dashboard-playback="paused"] *,
+[data-dashboard-playback="paused"] *::before,
+[data-dashboard-playback="paused"] *::after,
+[data-dashboard-playback="ended"] *,
+[data-dashboard-playback="ended"] *::before,
+[data-dashboard-playback="ended"] *::after {
+  animation-play-state: paused !important;
+}
+
 html, body, #root {
   margin: 0;
   padding: 0;
