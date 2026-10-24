@@ -246,6 +246,18 @@ class HistoryTest(unittest.TestCase):
                     self.assertEqual([step["id"] for step in result["steps"]], [
                         valid["op_id"], "task-result:executor-1/task-001", "final-observation"])
 
+    def test_malformed_declared_finish_outcomes_disable_replay_as_conflicting(self):
+        for outcome in ([], {}, 1, True, "damaged"):
+            with self.subTest(outcome=outcome):
+                root, directory = runtime(executor_tasks=[fixtures.task(1, status="dev-complete")])
+                workflow = json.loads((directory / "workflow.json").read_text())
+                workflow["finish"]["outcome"] = outcome
+                fixtures.write(directory / "workflow.json", workflow)
+                result = read(root)
+                self.assertFalse(result["eligible"])
+                self.assertEqual(result["steps"], [])
+                self.assertIn("terminal-conflict", result["warnings"])
+
     def test_json_decoder_recursion_failure_degrades_only_the_affected_file(self):
         for target in ("operation", "task"):
             with self.subTest(target=target):
