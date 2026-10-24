@@ -245,9 +245,9 @@ export default function ControlPanel({ platform = 'browser', mode = 'full' }) {
 
   // ─── Full mode: standard control panel ───
   return (
-    <div className="fixed bottom-0 left-0 right-0 bg-white/90 dark:bg-gray-900/90 backdrop-blur border-t border-gray-200 dark:border-gray-700 px-3 py-1.5 text-xs select-none z-50">
+    <div data-dashboard-controls={isDashboard || undefined} className={`${isDashboard ? 'relative w-full shrink-0' : 'fixed bottom-0 left-0 right-0'} bg-white/90 dark:bg-gray-900/90 backdrop-blur border-t border-gray-200 dark:border-gray-700 px-3 py-1.5 text-xs select-none z-50`}>
       {isDashboard && dashboardSync && (
-        <div className="mb-1 flex items-center justify-center gap-2 text-[11px] text-gray-600 dark:text-gray-300" role="status" data-dashboard-sync={dashboardSync.state}>
+        <div className="mb-1 flex flex-wrap items-center justify-center gap-2 text-[11px] text-gray-600 dark:text-gray-300" role="status" data-dashboard-sync={dashboardSync.state}>
           <span>{t(`dashboard.${dashboardSync.state}`, dashboardSync.state)}</span>
           {dashboardSync.code && <span>{t(`dashboard.${dashboardSync.code}`, dashboardSync.code)}</span>}
           {dashboardSync.lastValidAt != null && <span>{t('maw.lastSample')}: {new Date(dashboardSync.lastValidAt).toLocaleTimeString()}</span>}

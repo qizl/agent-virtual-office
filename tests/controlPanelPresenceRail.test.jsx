@@ -95,6 +95,25 @@ async function renderControlPanelWithMockStore(overrides = {}) {
 }
 
 describe('ControlPanel — presence rail render contract', () => {
+  it('reserves the actual Dashboard footer height in the office flex layout', async () => {
+    const { html } = await renderControlPanelWithMockStore({
+      integration: 'dashboard',
+      dashboardSync: { state: 'error', code: 'read-failed', lastValidAt: null },
+    })
+    const wrapper = html.slice(0, html.indexOf('>') + 1)
+    expect(wrapper).toContain('data-dashboard-controls="true"')
+    expect(wrapper).toContain('relative w-full shrink-0')
+    expect(wrapper).not.toContain('fixed')
+    expect(html).toContain('flex flex-wrap items-center justify-center')
+  })
+
+  it('preserves the standalone fixed footer', async () => {
+    const { html } = await renderControlPanelWithMockStore()
+    const wrapper = html.slice(0, html.indexOf('>') + 1)
+    expect(wrapper).toContain('fixed bottom-0 left-0 right-0')
+    expect(wrapper).not.toContain('data-dashboard-controls')
+  })
+
   it('renders the normalized external status for the rail dot and screen-reader text', async () => {
     const { html, statusColors } = await renderControlPanelWithMockStore()
 
