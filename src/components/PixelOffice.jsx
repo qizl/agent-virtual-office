@@ -1089,7 +1089,11 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
   // Full-office mode must fit the whole authored 800x560 scene inside the available pane.
   // Let the SVG viewport take the container box and rely on `meet` so wide panes letterbox
   // horizontally instead of cropping the entrance/lounge edges.
-  const svgClassName = isPanel ? 'w-full h-full' : 'w-full h-full'
+  // Paint the entire Dashboard viewport, including `meet` letterboxing. Safari can retain
+  // pixels from the previous scene scale in transparent gutters when the footer changes height.
+  const svgClassName = isDashboard
+    ? 'w-full h-full bg-[#F5F2EB] dark:bg-[#1a1814]'
+    : 'w-full h-full'
 
   const svgElement = (
     <svg
