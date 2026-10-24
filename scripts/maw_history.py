@@ -38,6 +38,8 @@ ACTION_KINDS = {"assign-dev", "create-plan-review-task", "create-review-task", "
                 "cancel-request", "cancel-close", "finish-close", "add-role"}
 PUBLICATIONS = {"assign-dev", "create-plan-review-task", "create-review-task", "create-aggregate-review-task"}
 CLOSE = {"finish-close", "cancel-close"}
+ACTIVITIES = {"ready", "publication", "work", "delivery", "result", "rework", "coordination", "terminal"}
+MAX_TASK_REF_LENGTH = 128
 
 
 _projection_read_json_capped = projection.read_json_capped
@@ -348,6 +350,106 @@ def _member_for(frame, state, folder):
     return next((member for member in frame["members"] if member["id"] == identity), None)
 
 
+def _task_ref(value):
+    if not isinstance(value, str) or len(value) > MAX_TASK_REF_LENGTH or not TASK_REF_RE.fullmatch(value):
+        return None
+    normalized = value if value.endswith(".json") else value + ".json"
+    return normalized if len(normalized) <= MAX_TASK_REF_LENGTH else None
+
+
+def _neutral_frame(template):
+    frame = copy.deepcopy(template)
+    frame.update(terminal=None, workflow="MAW · 任务记录回顾", quality="ok", quality_detail=None)
+    for member in frame["members"]:
+        member.update(status="idle", label="此步无活动记录", detail=None, round=None,
+                      task_kind=None, verdict=None, terminate=None, stalled=False)
+    return frame
+
+
+def _validate_cue(cue, snapshot):
+    """Keep presentation hints as bounded references to this frame's own facts."""
+    if cue is None:
+        return
+    member_ids = {member["id"] for member in snapshot["members"]}
+    if (not isinstance(cue, dict) or set(cue) != {"actor_member_id", "activity", "task", "related_member_ids"}
+            or not isinstance(cue["activity"], str) or cue["activity"] not in ACTIVITIES
+            or (cue["actor_member_id"] is not None and (not isinstance(cue["actor_member_id"], str)
+                                                       or cue["actor_member_id"] not in member_ids))):
+        raise ValueError("invalid history cue")
+    related = cue["related_member_ids"]
+    if (not isinstance(related, list) or len(related) > 1
+            or any(not isinstance(identity, str) or identity not in member_ids
+                   or identity == cue["actor_member_id"] for identity in related)):
+        raise ValueError("invalid related history member")
+    task = cue["task"]
+    if task is not None:
+        if (not isinstance(task, dict) or set(task) != {"seq", "round", "type", "source_ref", "ref_task"}
+                or cue["actor_member_id"] is None or not _integer(task["seq"]) or not _integer(task["round"])
+                or not isinstance(task["type"], str) or task["type"] not in projection.TASK_KINDS
+                or not isinstance(task["source_ref"], str) or _task_ref(task["source_ref"]) != task["source_ref"]
+                or (task["ref_task"] is not None and _task_ref(task["ref_task"]) != task["ref_task"])):
+            raise ValueError("invalid history cue task")
+
+
+def _cue(actor, activity, task=None, related=()):
+    return {"actor_member_id": actor["id"] if actor else None, "activity": activity,
+            "task": task, "related_member_ids": list(related)}
+
+
+def _task_cue(frame, state, folder, task, known_tasks):
+    actor = _member_for(frame, state, folder)
+    source = _task_ref(f"{folder}/task-{task['seq']:03d}.json")
+    if actor is None or source is None:
+        return None
+    parent = _task_ref(task.get("ref_task"))
+    previous = known_tasks.get(parent[:-5]) if parent else None
+    counterpart = _member_for(frame, state, parent.split("/", 1)[0]) if previous is not None else None
+    related = [counterpart["id"]] if counterpart and counterpart["id"] != actor["id"] else []
+    status, kind = task["status"], task["type"]
+    if status == "initialized":
+        activity = "rework" if (kind == "dev" and previous and previous["type"] == "dev"
+                                and task["round"] > previous["round"]) else "publication"
+    elif status == "in-progress" or (status == "reviewing" and kind != "dev"):
+        activity = "work"
+    elif status in ("dev-complete", "reviewing"):
+        activity = "delivery"
+    else:
+        activity = "result"
+    return _cue(actor, activity, {"seq": task["seq"], "round": task["round"], "type": kind,
+                                 "source_ref": source, "ref_task": parent}, related)
+
+
+def _manager(frame):
+    managers = [member for member in frame["members"] if member["role"] == "manager"]
+    return managers[0] if len(managers) == 1 else None
+
+
+def _delivery_predecessor(op, action, state, warnings):
+    """A frozen source state is evidence at the transaction, not a guessed time."""
+    if action["action"] != "create-review-task":
+        return None
+    if not any(key in action for key in ("dev_task_before", "dev_task_after")):
+        return None
+    before, after = action.get("dev_task_before"), action.get("dev_task_after")
+    source = _task_ref(action.get("dev_task"))
+    fingerprint = (op.get("writes") or {}).get(source) or {}
+    publication = action["publication"]["task_file"]
+    if (not _task_shape(before) or not _task_shape(after) or source is None
+            or before["type"] != "dev" or after["type"] != "dev"
+            or before["status"] != "dev-complete" or after["status"] != "reviewing"
+            or before["seq"] != after["seq"] or before["round"] != after["round"]
+            or _task_ref(before.get("ref_task")) != _task_ref(after.get("ref_task"))
+            or source != f"{source.split('/', 1)[0]}/task-{before['seq']:03d}.json"
+            or source.split("/", 1)[0] not in state["roles"]
+            or _task_ref(action["task"].get("ref_task")) != source
+            or not isinstance(after.get("review"), dict) or after["review"].get("review_task_file") != publication
+            or fingerprint.get("before") != _written_digest(before)
+            or fingerprint.get("after") != _written_digest(after)):
+        _warning(warnings, "task-transition-invalid")
+        return None
+    return source.split("/", 1)[0], before
+
+
 def _task_fact(frame, state, folder, task, *, publication=False):
     member = _member_for(frame, state, folder)
     if member is None:
@@ -357,36 +459,39 @@ def _task_fact(frame, state, folder, task, *, publication=False):
     verdict = "fail" if status == "review-failed" else "pass" if status == "review-passed" else None
     status_map = {"initialized": "planning", "in-progress": "working", "dev-complete": "awaiting-approval",
                   "reviewing": "awaiting-approval", "review-passed": "done", "review-failed": "blocked"}
+    if kind != "dev":
+        status_map.update(reviewing="working", **{"review-failed": "done"})
     label = "任务派发已记录" if publication else {"initialized": "记录状态：已派发", "in-progress": "记录状态：进行中",
-            "dev-complete": "记录结果：开发交付", "reviewing": "记录状态：待评审", "review-passed": "记录结果：通过",
-            "review-failed": "记录结果：失败 · 需返修"}[status]
+            "dev-complete": "记录结果：任务交付", "reviewing": "记录状态：待评审" if kind == "dev" else "记录状态：评审中",
+            "review-passed": "记录结果：通过", "review-failed": "记录结果：失败 · 需返修" if kind == "dev" else "记录结果：评审不通过"}[status]
     member.update(status=status_map[status], label=f"{label} · round {task['round']}", round=task["round"],
                   task_kind=kind, verdict=verdict, terminate=None, stalled=False)
 
 
-def _operation_fact(frame, state, action):
+def _operation_fact(frame, state, action, known_tasks):
     kind = action["action"]
     if kind in PUBLICATIONS:
         owner = action.get("role") if kind == "assign-dev" else action["owner"]
         _task_fact(frame, state, owner, action["task"], publication=True)
-        return "task-publication", "开发任务派发记录" if kind == "assign-dev" else "评审任务派发记录"
+        return ("task-publication", "开发任务派发记录" if kind == "assign-dev" else "评审任务派发记录",
+                _task_cue(frame, state, owner, action["task"], known_tasks))
     if kind == "confirm-ready":
         member = _member_for(frame, state, action["role"])
         if member:
             member.update(status="idle", label="就绪确认已记录")
-        return "ready-confirmed", "成员就绪确认记录"
+        return "ready-confirmed", "成员就绪确认记录", _cue(member, "ready")
     if kind == "add-role":
-        return "role-added", "成员加入记录"
+        return "role-added", "成员加入记录", _cue(_member_for(frame, state, action["role"]), "coordination")
     if kind in CLOSE:
-        return "terminal-record", "流程终局记录"
+        return "terminal-record", "流程终局事务记录", _cue(_manager(frame), "coordination")
     if kind == "cancel-request":
-        return "cancellation-record", "取消请求记录"
+        return "cancellation-record", "取消请求记录", _cue(_manager(frame), "coordination")
     label = {"set-node": "节点状态变更记录", "complete-node": "节点完成记录", "release-node": "节点带问题释放记录",
              "append-release-association": "返修关联记录"}[kind]
-    for member in frame["members"]:
-        if member["role"] == "manager":
-            member.update(status="working", label=label)
-    return "workflow-record", label
+    member = _manager(frame)
+    if member:
+        member.update(status="working", label=label)
+    return "workflow-record", label, _cue(member, "coordination")
 
 
 def read_history(project_root: Path, task_id: str, *, project: str, now=None) -> dict:
@@ -429,38 +534,49 @@ def read_history(project_root: Path, task_id: str, *, project: str, now=None) ->
                 conflict = True
         if conflict:
             _warning(warnings, "terminal-conflict")
-        frame = copy.deepcopy(final_snapshot)
-        frame.update(terminal=None, workflow="MAW · 任务记录回顾", quality="ok", quality_detail=None)
-        for member in frame["members"]:
-            member.update(status="idle", label="尚未回顾的角色记录", detail=None, round=None,
-                          task_kind=None, verdict=None, terminate=None, stalled=False)
+        known_tasks = dict(tasks)
         steps = []
 
-        def append(identity, kind, label, recorded_at, refs, snapshot=None):
+        def append(identity, kind, label, recorded_at, refs, snapshot, cue):
             if len(steps) >= MAX_STEPS - 1:
                 _warning(warnings, "milestone-output-limit")
                 return
             if recorded_at is None:
                 _warning(warnings, "recorded-time-unavailable")
-            current = copy.deepcopy(snapshot or frame)
+            current = copy.deepcopy(snapshot)
             current["producer_seq"] = len(steps) + 1
             _validate_frame(current)
+            _validate_cue(cue, current)
             steps.append({"id": identity, "kind": kind, "label": label, "recorded_at": recorded_at,
-                          "source_refs": refs, "snapshot": current})
+                          "source_refs": refs, "snapshot": current, "cue": cue})
 
         if not conflict:
             for _revision, identity, op, action in operations:
-                kind, label = _operation_fact(frame, state, action)
+                recorded_at = _recorded_time(op.get("created_at"))
+                refs = [f"context/operations/{identity}.json"]
+                predecessor = _delivery_predecessor(op, action, state, warnings)
+                if predecessor:
+                    folder, task = predecessor
+                    frame = _neutral_frame(final_snapshot)
+                    _task_fact(frame, state, folder, task)
+                    append(identity + ":source-state", "task-transition", "评审派发事务中记录的交付状态",
+                           recorded_at, refs, frame, _task_cue(frame, state, folder, task, known_tasks))
+                frame = _neutral_frame(final_snapshot)
+                kind, label, cue = _operation_fact(frame, state, action, known_tasks)
                 # Terminal conclusions belong to their actual final snapshot only.
-                append(identity, kind, label, _recorded_time(op.get("created_at")), [f"context/operations/{identity}.json"])
+                append(identity, kind, label, recorded_at, refs, frame, cue)
             for ref, task in tasks:
-                _task_fact(frame, state, ref.split("/", 1)[0], task)
-                append("task-result:" + ref, "task-record", "任务记录补充 · 时间未记录", None, [ref + ".json"])
+                frame = _neutral_frame(final_snapshot)
+                folder = ref.split("/", 1)[0]
+                _task_fact(frame, state, folder, task)
+                append("task-result:" + ref, "task-record", "任务记录补充 · 时间未记录", None, [ref + ".json"],
+                       frame, _task_cue(frame, state, folder, task, known_tasks))
             if steps:
                 final = copy.deepcopy(final_snapshot)
                 final["producer_seq"] = len(steps) + 1
                 steps.append({"id": "final-observation", "kind": "final-snapshot", "label": "当前终局记录",
-                              "recorded_at": None, "source_refs": ["task.json", "workflow.json"], "snapshot": final})
+                              "recorded_at": None, "source_refs": ["task.json", "workflow.json"], "snapshot": final,
+                              "cue": _cue(None, "terminal" if terminal else "coordination")})
         if not steps:
             _warning(warnings, "playable-history-unavailable")
         result = {"schema": SCHEMA, "project": project, "task": task_id, "terminal": terminal,

@@ -75,7 +75,149 @@ def executor(step):
     return next(member for member in step["snapshot"]["members"] if member["role"] == "executor")
 
 
+def review_publication(directory, *, before=None, after=None):
+    before = copy.deepcopy(before or fixtures.task(1, status="dev-complete"))
+    after = copy.deepcopy(after or before)
+    after["status"] = "reviewing"
+    after["review"] = {"review_task_file": "reviewer-1/task-002.json"}
+    task = fixtures.task(2, type_="review", status="initialized", ref_task="executor-1/task-001")
+    action = {"action": "create-review-task", "node": "develop", "owner": "reviewer-1", "seq": 2,
+              "task": task, "publication": {"task_file": "reviewer-1/task-002.json"},
+              "dev_task": "executor-1/task-001.json", "dev_task_before": before, "dev_task_after": after}
+    op = operation(directory, action)
+    op["writes"]["executor-1/task-001.json"] = {
+        "before": history._written_digest(before), "after": history._written_digest(after)}
+    fixtures.write(directory / "context" / "operations" / f"{op['op_id']}.json", op)
+    return op
+
+
 class HistoryTest(unittest.TestCase):
+    def test_steps_have_safe_cues_and_reset_non_actor_facts(self):
+        root, directory = runtime(executor_tasks=[fixtures.task(1, status="in-progress")])
+        operation(directory, {"action": "complete-node", "node": "develop"})
+        result = read(root)
+        coordination, task_step, final = result["steps"]
+        self.assertEqual(coordination["cue"]["activity"], "coordination")
+        self.assertEqual(task_step["cue"]["activity"], "work")
+        self.assertEqual(task_step["cue"]["actor_member_id"], executor(task_step)["id"])
+        self.assertEqual(task_step["cue"]["task"], {
+            "seq": 1, "round": 1, "type": "dev", "source_ref": "executor-1/task-001.json", "ref_task": None})
+        manager = next(member for member in task_step["snapshot"]["members"] if member["role"] == "manager")
+        self.assertEqual(manager["status"], "idle")
+        self.assertIsNone(manager["verdict"])
+        self.assertIsNone(manager["round"])
+        self.assertEqual(final["cue"], {"actor_member_id": None, "activity": "terminal", "task": None, "related_member_ids": []})
+        for step in result["steps"]:
+            history._validate_cue(step["cue"], step["snapshot"])
+
+    def test_reviewer_result_is_done_while_developer_failure_is_blocked(self):
+        dev = fixtures.task(1, status="review-failed")
+        review = fixtures.task(2, type_="review", status="review-failed", ref_task="executor-1/task-001")
+        root, _directory = runtime(executor_tasks=[dev], reviewer_tasks=[review])
+        result = read(root)
+        dev_step, review_step = result["steps"][:2]
+        self.assertEqual(executor(dev_step)["status"], "blocked")
+        reviewer = next(member for member in review_step["snapshot"]["members"] if member["role"] == "reviewer")
+        self.assertEqual((reviewer["status"], reviewer["verdict"]), ("done", "fail"))
+        self.assertEqual(review_step["cue"]["activity"], "result")
+        self.assertEqual(review_step["cue"]["related_member_ids"], [executor(review_step)["id"]])
+        self.assertEqual(executor(review_step)["status"], "idle")
+        self.assertIsNone(executor(review_step)["verdict"])
+
+    def test_reviewing_task_work_and_rework_require_the_recorded_type_and_reference(self):
+        dev = fixtures.task(1, status="review-failed")
+        rework = fixtures.task(3, status="initialized", round_=2, ref_task="executor-1/task-001")
+        review = fixtures.task(2, type_="review", status="reviewing", ref_task="executor-1/task-001")
+        root, _directory = runtime(executor_tasks=[dev, rework], reviewer_tasks=[review])
+        steps = read(root)["steps"]
+        review_step = next(step for step in steps if step["id"] == "task-result:reviewer-1/task-002")
+        rework_step = next(step for step in steps if step["id"] == "task-result:executor-1/task-003")
+        reviewer = next(member for member in review_step["snapshot"]["members"] if member["role"] == "reviewer")
+        self.assertEqual((reviewer["status"], review_step["cue"]["activity"]), ("working", "work"))
+        self.assertEqual(rework_step["cue"]["activity"], "rework")
+        self.assertEqual(rework_step["cue"]["related_member_ids"], [])  # same member, never a duplicate counterpart
+        self.assertEqual(review_step["cue"]["task"]["ref_task"], "executor-1/task-001.json")
+
+    def test_hash_bound_delivery_precedes_review_publication_without_future_verdict(self):
+        root, directory = runtime(executor_tasks=[fixtures.task(1, status="review-passed")],
+                                  reviewer_tasks=[fixtures.task(2, type_="review", status="review-passed",
+                                                               ref_task="executor-1/task-001")])
+        op = review_publication(directory)
+        result = read(root)
+        delivery, published = result["steps"][:2]
+        self.assertEqual(delivery["kind"], "task-transition")
+        self.assertEqual(delivery["cue"]["activity"], "delivery")
+        self.assertEqual(executor(delivery)["status"], "awaiting-approval")
+        self.assertIsNone(executor(delivery)["verdict"])
+        self.assertEqual(delivery["source_refs"], published["source_refs"])
+        self.assertEqual(delivery["recorded_at"], published["recorded_at"])
+        self.assertEqual(published["id"], op["op_id"])
+        self.assertEqual(published["cue"]["activity"], "publication")
+        self.assertEqual(published["cue"]["related_member_ids"], [executor(published)["id"]])
+        self.assertEqual(executor(published)["status"], "idle")
+        self.assertNotIn("duration", json.dumps(result))
+
+    def test_unbound_delivery_is_omitted_without_losing_valid_publication(self):
+        for patch in (lambda op: op["writes"]["executor-1/task-001.json"].update(before=BEFORE),
+                      lambda op: op["writes"]["executor-1/task-001.json"].update(after=AFTER),
+                      lambda op: op["action"]["dev_task_before"].update(seq=9),
+                      lambda op: op["action"]["dev_task_after"].update(review="damaged"),
+                      lambda op: op["action"]["task"].update(ref_task="executor-1/task-009")):
+            with self.subTest(patch=patch):
+                root, directory = runtime(executor_tasks=[fixtures.task(1, status="review-passed")])
+                op = review_publication(directory)
+                patch(op)
+                # Rebind the action identity/publication digest so only the optional source evidence is damaged.
+                op["op_id"] = "op-000001-" + history._canonical_digest(op["action"])[:10]
+                op["writes"]["reviewer-1/task-002.json"]["after"] = history._written_digest(op["action"]["task"])
+                old = next((directory / "context" / "operations").iterdir())
+                old.unlink()
+                fixtures.write(directory / "context" / "operations" / f"{op['op_id']}.json", op)
+                result = read(root)
+                self.assertEqual(result["steps"][0]["kind"], "task-publication")
+                self.assertIn("task-transition-invalid", result["warnings"])
+                self.assertFalse(any(step["kind"] == "task-transition" for step in result["steps"]))
+
+    def test_missing_reference_does_not_create_counterpart_or_work(self):
+        root, _directory = runtime(reviewer_tasks=[fixtures.task(2, type_="review", status="initialized",
+                                                               ref_task="executor-1/task-099")])
+        step = read(root)["steps"][0]
+        self.assertEqual(step["cue"]["related_member_ids"], [])
+        self.assertEqual(step["cue"]["activity"], "publication")
+
+    def test_cue_validation_rejects_unknown_fields_foreign_members_and_unbounded_refs(self):
+        root, _directory = runtime(executor_tasks=[fixtures.task(1)])
+        step = read(root)["steps"][0]
+        for patch in (lambda cue: cue.update(actor_member_id="foreign-member"),
+                      lambda cue: cue.update(actor_member_id=[]),
+                      lambda cue: cue.update(activity=[]),
+                      lambda cue: cue.update(activity="guessed-work"),
+                      lambda cue: cue.update(extra="unlisted"),
+                      lambda cue: cue.update(related_member_ids=["foreign-member"]),
+                      lambda cue: cue.update(related_member_ids=[cue["actor_member_id"]]),
+                      lambda cue: cue["task"].update(type=[]),
+                      lambda cue: cue["task"].update(seq=True),
+                      lambda cue: cue["task"].update(source_ref=None),
+                      lambda cue: cue["task"].update(source_ref="../private.json"),
+                      lambda cue: cue["task"].update(ref_task="executor-" + "1" * 120 + "/task-001.json")):
+            with self.subTest(patch=patch):
+                cue = copy.deepcopy(step["cue"])
+                patch(cue)
+                with self.assertRaises(ValueError):
+                    history._validate_cue(cue, step["snapshot"])
+
+    def test_delivery_predecessor_counts_toward_the_existing_milestone_cap(self):
+        root, directory = runtime(executor_tasks=[fixtures.task(1, status="review-passed")],
+                                  reviewer_tasks=[fixtures.task(2, type_="review", status="review-passed",
+                                                               ref_task="executor-1/task-001")])
+        review_publication(directory)
+        with mock.patch.object(history, "MAX_STEPS", 4):
+            result = read(root)
+        self.assertEqual(len(result["steps"]), 4)
+        self.assertEqual(result["steps"][0]["kind"], "task-transition")
+        self.assertEqual(result["steps"][-1]["kind"], "final-snapshot")
+        self.assertIn("milestone-output-limit", result["warnings"])
+
     def test_no_operation_history_does_not_disqualify_recorded_task_results(self):
         root, _directory = runtime(executor_tasks=[fixtures.task(1, status="review-failed")])
         result = read(root)
