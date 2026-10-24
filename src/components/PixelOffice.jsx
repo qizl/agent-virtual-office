@@ -723,6 +723,12 @@ const GRID_LINES = (() => {
 export const SCENE_W = 800
 export const SCENE_H = 560
 
+// Historical snapshots replace the complete presentation, including locally cached
+// fading bubbles. Live updates retain character identity for uninterrupted motion.
+export function agentRenderKey(id, meta) {
+  return meta?.dashboard_history ? `${id}:history:${meta.seq}` : id
+}
+
 // POINT 2: the office renders with preserveAspectRatio="xMidYMid meet", so its on-screen scale
 // is the SMALLER of the width/height fit ratios — that is what shrinks every in-scene label when
 // the office is docked small. AgentCharacter counter-scales labels by 1/this. Pure for unit test.
@@ -1464,7 +1470,7 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
 
       {/* ═══ AGENTS ═══ */}
       {agentList.map((agent) => (
-        <AgentCharacter key={agent.id} agent={agent} />
+        <AgentCharacter key={agentRenderKey(agent.id, mawMeta)} agent={agent} />
       ))}
 
       {/* ═══ SPECIAL EVENT CHARACTERS ═══ */}

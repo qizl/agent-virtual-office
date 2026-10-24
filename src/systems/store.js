@@ -640,6 +640,7 @@ function applyMawSnapshotImpl(s, envelope) {
     quality_detail: snapshot ? snapshot.quality_detail : null,
     terminal: snapshot ? snapshot.terminal : null,
     dashboard_recovery: envelope.dashboard_recovery ?? 0,
+    dashboard_history: historical,
   }
   const agents = historical ? {} : { ...s.agents }
   const desired = new Map()
@@ -2017,8 +2018,12 @@ let _storageHandler = null
 if (typeof window !== 'undefined') {
   _storageHandler = (e) => {
     if (e.key === 'office-paused') {
+      const state = useOfficeStore.getState()
+      // History owns a stationary scene and its own playback clock. A preference
+      // from another tab must not wake this iframe's organic behavior scheduler.
+      if (state.integration === 'dashboard' && ['playing', 'paused', 'ended'].includes(state.dashboardHistory?.state)) return
       const paused = e.newValue === 'true'
-      if (useOfficeStore.getState().isPaused !== paused) {
+      if (state.isPaused !== paused) {
         useOfficeStore.setState({ isPaused: paused })
       }
     }

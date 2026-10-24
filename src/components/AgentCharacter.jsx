@@ -1081,7 +1081,10 @@ function AgentCharacter({ agent }) {
       // A live passive-effect teardown reconnects synchronously and flips the ref back to false.
       // A true removal stays unmounted through this microtask and must clear store motion truth.
       const removalJourneyId = activeDoorJourneyRef.current || pendingDoorJourneyRef.current?.journeyId || null
-      if (movingRef.current || removalJourneyId) {
+      // A history frame has already replaced motion and door claims atomically.
+      // Its fresh keyed character must not receive the previous live walk's abort.
+      const replacedByHistory = store.integration === 'dashboard' && store.mawMeta?.dashboard_history
+      if (!replacedByHistory && (movingRef.current || removalJourneyId)) {
         scheduleRemovedWalkAbort(isUnmountedRef, visualPosRef.current, (position) => {
           const latest = useOfficeStore.getState()
           if (movingRef.current) latest.abortAgentMovement(id, position, removalJourneyId)

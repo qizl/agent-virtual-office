@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createDashboardHistoryController, validateDashboardHistory } from '../src/inference/dashboardHistory.js'
 import { startDashboardIntegration } from '../src/inference/dashboardIntegration.js'
 import { useOfficeStore } from '../src/systems/store.js'
+import { agentRenderKey } from '../src/components/PixelOffice.jsx'
 
 const config = { integration: 'dashboard', project: 'project a', task: 'task&1', error: null }
 function snapshot(status = 'blocked', terminal = null) {
@@ -219,6 +220,23 @@ describe('Iframe-owned playback lifecycle', () => {
 })
 
 describe('History owns the office scene', () => {
+  it('replaces live terminal presentation and each historical frame with a fresh character identity', () => {
+    const id = 'executor~executor'
+    useOfficeStore.getState().applyMawSnapshot({ server_epoch: 1, seq: 1, snapshot: snapshot('done', 'completed-with-findings') })
+    const liveKey = agentRenderKey(id, useOfficeStore.getState().mawMeta)
+    const neutral = snapshot('idle')
+    neutral.members[0].label = 'Role record not yet reviewed'
+    for (const seq of [1, 2, 3]) {
+      useOfficeStore.getState().applyMawSnapshot({ server_epoch: 0, seq, snapshot: neutral, dashboard_history: true })
+      const state = useOfficeStore.getState()
+      expect(state.mawMeta).toMatchObject({ terminal: null, dashboard_history: true, seq })
+      expect(state.agents[id]).toMatchObject({ name: 'Role record not yet reviewed', bubble: 'Role record not yet reviewed', status: 'idle' })
+      expect(agentRenderKey(id, state.mawMeta)).toBe(`${id}:history:${seq}`)
+      expect(agentRenderKey(id, state.mawMeta)).not.toBe(liveKey)
+    }
+    expect(agentRenderKey(id, { seq: 999 })).toBe(liveKey)
+  })
+
   it('stops live polling and choreography, rebuilds stationary frames and routes Space/pause without changing the animation preference', async () => {
     const data = fixture()
     const live = { server_epoch: 1, seq: 1, snapshot: data.final_snapshot }
