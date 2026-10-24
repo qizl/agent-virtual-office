@@ -458,21 +458,29 @@ export const CharacterPixelSprite = React.memo(function CharacterPixelSprite({ c
 // change. BehaviorIndicator's only prop is `behavior` (a stable string) — memo prevents a
 // parent-triggered re-render when the behavior is unchanged. Its own 600ms `frame` interval
 // still drives the icon animation independently.
-const BehaviorIndicator = React.memo(function BehaviorIndicator({ behavior }) {
-  const [frame, setFrame] = useState(0)
+const BehaviorIndicator = React.memo(function BehaviorIndicator({ behavior, frame: controlledFrame }) {
+  const [ambientFrame, setFrame] = useState(0)
+  const controlled = Number.isInteger(controlledFrame)
+  const frame = controlled ? controlledFrame : ambientFrame
   const reducedMotion = useOfficeStore((s) => s.reducedMotion)
   const historyPaused = useOfficeStore((s) => ['paused', 'ended'].includes(s.dashboardHistory?.state))
 
   useEffect(() => {
     // Animate indicator every 600ms
-    const iv = reducedMotion || historyPaused ? null : setInterval(() => setFrame(f => (f + 1) % 4), 600)
+    const iv = reducedMotion || historyPaused || controlled ? null : setInterval(() => setFrame(f => (f + 1) % 4), 600)
     return () => { if (iv) clearInterval(iv) }
-  }, [reducedMotion, historyPaused])
+  }, [reducedMotion, historyPaused, controlled])
 
   // Position: to the right of character
   const ox = 14, oy = -8
 
   switch (behavior) {
+    case 'pass-document': return controlled ? (
+      <g transform={`translate(${ox}, ${oy})`}>
+        <rect x={frame % 2} y={0} width={9} height={12} fill="#fff" stroke="#666" />
+        <path d="M2 3h5M2 6h5M2 9h3" stroke="#5382a2" strokeWidth="1" />
+      </g>
+    ) : null
     case 'typing': {
       // Tiny keyboard with blinking cursor
       const cursorOn = frame % 2 === 0
@@ -745,6 +753,10 @@ function AgentCharacter({ agent }) {
   useLocale() // re-render on language change
   const name = charName(id)
   const agentState = useOfficeStore((s) => s.agents[id])
+  const historical = useOfficeStore((s) => s.integration === 'dashboard' && Boolean(s.mawMeta?.dashboard_history))
+  const historyAgent = useOfficeStore((s) => s.dashboardHistoryPresentation?.agents[id])
+  const historyStep = useOfficeStore((s) => s.dashboardHistoryPresentation?.step_id)
+  const historyStage = useOfficeStore((s) => s.dashboardHistoryPresentation?.stage)
   const reducedMotion = useOfficeStore((s) => s.reducedMotion)
   // AVO-132: session effort level intensifies the working glow ring (folded in from the
   // removed ThinkingAura). Subscribe to just `effort` so we re-render only when it changes.
@@ -1611,8 +1623,13 @@ function AgentCharacter({ agent }) {
     else if (e.key === ' ') { e.preventDefault(); firePoke() }
   }, [handleClick, firePoke])
 
-  const state = agentState || {}
-  const pos = renderPos || state.position || { x: 0, y: 0 }
+  // History overrides only presentation. Recorded status/verdict stay in agentState.
+  const state = historical && historyAgent ? { ...agentState,
+    behavior: historyAgent.behavior, expression: historyAgent.expression,
+    bubble: historyAgent.active ? `${historyStage} · ${agentState?.bubble || ''}` : null,
+  } : agentState || {}
+  const pos = historical && historyAgent ? historyAgent.position : renderPos || state.position || { x: 0, y: 0 }
+  const displayedWalking = historical && historyAgent ? historyAgent.isMoving : isWalking
   const session = state.session || null
 
   // Name tag dimensions — memoized on `name`. estimateTextWidth runs a per-codepoint
@@ -1626,7 +1643,7 @@ function AgentCharacter({ agent }) {
   const tagFill = state.status !== 'idle' ? (STATUS_COLORS[state.status] || color) : color
   const glowColor = STATUS_COLORS[state.status]
   // AVO-128: show the name only when the agent is doing something or is being inspected.
-  const showName = hovered || (state.status && state.status !== 'idle')
+  const showName = hovered || historyAgent?.active || (state.status && state.status !== 'idle')
 
   return (
     <g transform={`translate(${pos.x}, ${pos.y}) scale(${CHAR_SCALE})`}
@@ -1635,13 +1652,21 @@ function AgentCharacter({ agent }) {
       data-agent-id={id}
       data-agent-status={state.status || 'idle'}
       data-agent-behavior={state.behavior || 'idle'}
+      data-history-step={historical ? historyStep : undefined}
+      data-history-actor={historical && historyAgent?.active ? '1' : undefined}
+      data-history-related={historical && historyAgent?.related ? '1' : undefined}
+      data-history-moving={historical ? String(Boolean(displayedWalking)) : undefined}
       data-supervising={hasActiveHelper ? '1' : '0'}
       role="button" aria-label={`${name} — ${t(`statusLabels.${state.status || 'idle'}`, state.status || 'idle')}`} tabIndex={0}
       onKeyDown={handleKeyDown}>
+      {historical && (historyAgent?.active || historyAgent?.related) && <ellipse
+        data-history-actor-marker={historyAgent.active ? 'actor' : 'related'}
+        cx="0" cy="2" rx="16" ry="5" fill={historyAgent.active ? '#3b82f6' : '#8b5cf6'}
+        fillOpacity="0.2" stroke={historyAgent.active ? '#2563eb' : '#7c3aed'} strokeWidth="1.5" />}
       {/* AVO-158 Poke: a brief in-place acknowledge bob, additive on top of the base
           translate/scale. key={seq} remounts per poke so each click replays. Reduced-motion
           drops the motion (the quip bubble still acknowledges the poke). Decorative → aria-hidden. */}
-      {!reducedMotion && pokeBob && (
+      {!historical && !reducedMotion && pokeBob && (
         <OneShotSmil key={`poke-${pokeBob.seq}`}>
           <animateTransform attributeName="transform" type="translate" additive="sum"
             values={pokeBob.intensity === 'turnaway' ? '0 0;-3 0;3 0;-2 0;0 0'
@@ -1719,9 +1744,9 @@ function AgentCharacter({ agent }) {
       <CharacterPixelSprite
         charId={id}
         expression={state.expression || 'normal'}
-        isMoving={isWalking}
-        walkFrame={walkFrame}
-        facing={state.facing || 'down'}
+        isMoving={displayedWalking}
+        walkFrame={historical && historyAgent ? historyAgent.walkFrame : walkFrame}
+        facing={historical && historyAgent ? historyAgent.facing : state.facing || 'down'}
       />
 
       {/* Behavior-specific indicator icon */}
@@ -1731,7 +1756,7 @@ function AgentCharacter({ agent }) {
       {/* AVO-110: while blocked, the reason badge OVERRIDES the BehaviorIndicator glyph (a block is
           the dominant state). Keyed on reasonCode so a reason CHANGE replays the entry-pop, but a
           same-reason re-render reuses the element → no re-fire (ANTI-NAG). reducedMotion → static. */}
-      {!isWalking && (
+      {!displayedWalking && (
         state.status === 'blocked' ? (
           <g key={`reason-${reasonCode || 'unknown'}`}>
             {!reducedMotion && (
@@ -1754,7 +1779,7 @@ function AgentCharacter({ agent }) {
                   values="0 0;1.15 0.9;1 1" keyTimes="0;0.6;1" dur="0.3s" repeatCount="1" fill="freeze" />
               </OneShotSmil>
             )}
-            <BehaviorIndicator behavior={state.behavior} />
+            <BehaviorIndicator behavior={state.behavior} frame={historical ? historyAgent?.frame : undefined} />
           </g>
         )
       )}
@@ -1820,7 +1845,7 @@ function AgentCharacter({ agent }) {
           // off-screen anyway (the same honest-suppression rule as the bubble cap).
           const offScreenSpeaker = !isSpeakerOnScreen({ posX: pos.x, posY: pos.y, sceneMinX, sceneMinY, sceneW, sceneH })
             && !BLOCKED_FAMILY.has(state.status)
-          const bubbleMsg = offScreenSpeaker ? null : (pokeQuip || (bubbleVisible ? state.bubble : null))
+          const bubbleMsg = offScreenSpeaker ? null : historical ? state.bubble : (pokeQuip || (bubbleVisible ? state.bubble : null))
           return (
             <g transform={`translate(0, ${below ? 6 : -68}) scale(${labelScale})`}
               role={pokeQuip ? 'status' : undefined}
@@ -1829,7 +1854,7 @@ function AgentCharacter({ agent }) {
               {/* #47: pass the agent's absolute scene x + net local→scene scale (labelScale, since
                   the char's 1.35 scale is undone above) so the bubble self-clamps horizontally and
                   far-left/right desks no longer clip the bubble at the office edge. */}
-              <BehaviorBubble x={0} y={0} below={below} message={bubbleMsg} absX={pos.x} scale={labelScale} sceneMinX={sceneMinX} sceneW={sceneW} />
+              <BehaviorBubble x={0} y={0} below={below} message={bubbleMsg} instant={historical} absX={pos.x} scale={labelScale} sceneMinX={sceneMinX} sceneW={sceneW} />
             </g>
           )
         })()}
@@ -1838,7 +1863,7 @@ function AgentCharacter({ agent }) {
             set-piece nearby shows a sub-dominant ⏳ — "knows it has work but the event is happening".
             Real-context bubbles PREEMPT it (only shown when no bubble); never moves the body / never
             touches status. Sits to the upper-right of the head so it doesn't fight the name tag. */}
-        {!state.bubble && reluctantUntil && reluctantUntil > Date.now() && (
+        {!historical && !state.bubble && reluctantUntil && reluctantUntil > Date.now() && (
           <g transform={`translate(10, -34) scale(${labelScale})`} data-reluctant="1" opacity="0.7" pointerEvents="none">
             <text x={0} y={0} textAnchor="middle" dominantBaseline="middle" fontSize="9">⏳</text>
           </g>

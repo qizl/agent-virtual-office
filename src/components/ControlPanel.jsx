@@ -253,6 +253,7 @@ export default function ControlPanel({ platform = 'browser', mode = 'full' }) {
         <div className="mb-1 flex flex-wrap items-center justify-center gap-2 text-[11px] text-gray-600 dark:text-gray-300" role="status" data-dashboard-history={dashboardHistory.state}>
           <span>{dashboardHistory.message}</span>
           {dashboardHistory.label && <strong>{dashboardHistory.label}</strong>}
+          <span>动作路径与播放时长仅为记录语义展示</span>
         </div>
       )}
       {isDashboard && !inHistory && dashboardSync && (

@@ -1,12 +1,13 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react'
 
-function BehaviorBubble({ x, y, message, below = false, absX = null, scale = 1, sceneMinX = 0, sceneW = 800, edgePad = 4 }) {
+function BehaviorBubble({ x, y, message, below = false, absX = null, scale = 1, sceneMinX = 0, sceneW = 800, edgePad = 4, instant = false }) {
   const [visible, setVisible] = useState(false)
   const [currentMsg, setCurrentMsg] = useState(message)
   const fadeTimerRef = useRef(null)
 
   useEffect(() => {
     if (fadeTimerRef.current) { clearTimeout(fadeTimerRef.current); fadeTimerRef.current = null }
+    if (instant) return // history cannot retain a later message or a wall-clock fade
     if (message) {
       setCurrentMsg(message)
       setVisible(true)
@@ -16,7 +17,7 @@ function BehaviorBubble({ x, y, message, below = false, absX = null, scale = 1, 
       fadeTimerRef.current = setTimeout(() => setCurrentMsg(null), 350)
     }
     return () => { if (fadeTimerRef.current) clearTimeout(fadeTimerRef.current) }
-  }, [message])
+  }, [message, instant])
 
   // Derive display text + box width ONCE per message. Without this memo the three
   // surrogate-cleaning regexes and the width fitting (a few canvas measureText calls)
@@ -24,9 +25,10 @@ function BehaviorBubble({ x, y, message, below = false, absX = null, scale = 1, 
   // its parent AgentCharacter walks (~30fps). The result depends only on currentMsg,
   // which changes a few times per minute, so x/y movement must not retrigger it.
   const derived = useMemo(() => {
-    if (!currentMsg) return null
-    return computeBubbleLayout(currentMsg)
-  }, [currentMsg])
+    const shownMessage = instant ? message : currentMsg
+    if (!shownMessage) return null
+    return computeBubbleLayout(shownMessage)
+  }, [currentMsg, instant, message])
 
   if (!derived) return null
 
@@ -56,11 +58,11 @@ function BehaviorBubble({ x, y, message, below = false, absX = null, scale = 1, 
   return (
     <g
       className="speech-bubble"
-      data-bubble-visible={visible ? '1' : '0'}
+      data-bubble-visible={(instant ? Boolean(message) : visible) ? '1' : '0'}
       style={{
-        opacity: visible ? 1 : 0,
-        transform: visible ? 'translateY(0)' : 'translateY(-5px)',
-        transition: 'opacity 0.3s, transform 0.3s',
+        opacity: (instant ? message : visible) ? 1 : 0,
+        transform: (instant ? message : visible) ? 'translateY(0)' : 'translateY(-5px)',
+        transition: instant ? 'none' : 'opacity 0.3s, transform 0.3s',
       }}
     >
       {/* Bubble body */}

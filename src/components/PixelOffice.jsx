@@ -723,10 +723,23 @@ const GRID_LINES = (() => {
 export const SCENE_W = 800
 export const SCENE_H = 560
 
-// Historical snapshots replace the complete presentation, including locally cached
-// fading bubbles. Live updates retain character identity for uninterrupted motion.
+// Timeline changes retain character identity; the separate controlled bubble clears
+// old messages immediately, while history presentation owns continuous positions.
 export function agentRenderKey(id, meta) {
-  return meta?.dashboard_history ? `${id}:history:${meta.seq}` : id
+  return id
+}
+
+function HistoryLinkOverlay() {
+  const links = useOfficeStore((s) => s.dashboardHistoryPresentation?.links)
+  if (!links?.length) return null
+  return <g data-history-links="1" pointerEvents="none" aria-label="记录中的任务关联">
+    {links.map((link, index) => <g key={index}>
+      <line x1={link.from.x} y1={link.from.y - 12} x2={link.to.x} y2={link.to.y - 12}
+        stroke="#8b5cf6" strokeWidth="2" strokeDasharray="4 4" opacity="0.65" />
+      <text x={(link.from.x + link.to.x) / 2} y={(link.from.y + link.to.y) / 2 - 18}
+        textAnchor="middle" fontSize="10" fill="#7c3aed">任务关联</text>
+    </g>)}
+  </g>
 }
 
 // POINT 2: the office renders with preserveAspectRatio="xMidYMid meet", so its on-screen scale
@@ -1469,6 +1482,7 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
       <PairLinkOverlay />
 
       {/* ═══ AGENTS ═══ */}
+      <HistoryLinkOverlay />
       {agentList.map((agent) => (
         <AgentCharacter key={agentRenderKey(agent.id, mawMeta)} agent={agent} />
       ))}

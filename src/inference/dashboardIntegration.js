@@ -3,6 +3,7 @@
 import { detectIntegrationConfig } from '../systems/platformDetect.js'
 import { startMawChoreography } from '../systems/mawChoreography.js'
 import { createDashboardHistoryController } from './dashboardHistory.js'
+import { buildHistoryPresentation, sampleHistoryPresentation } from './dashboardHistoryChoreography.js'
 import { validateDashboardEnvelope } from './dashboardSnapshot.js'
 
 export { validateDashboardEnvelope } from './dashboardSnapshot.js'
@@ -32,6 +33,7 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
   const originalPause = store.getState().isPaused
   let historyOwnsScene = false
   let historySeq = 0
+  let historyPlan = null
   const history = createDashboardHistoryController({
     config,
     onStart() {
@@ -43,12 +45,18 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
       clearTimeout(staleTimer)
       choreographyCleanup?.()
       choreographyCleanup = null
-      // Historical frames are stationary facts. Organic scheduling stays stopped
-      // while the independent history clock advances or waits for the user.
+      // Only the history clock may animate the illustrative presentation.
       store.setState({ isPaused: true, handoffs: [], activeEvent: null })
     },
-    onFrame(snapshot) {
+    onFrame(snapshot, context) {
+      const before = store.getState()
+      const positions = Object.fromEntries(Object.entries(before.agents).map(([id, agent]) =>
+        [id, before.dashboardHistoryPresentation?.agents[id]?.position || agent.position]))
       store.getState().applyMawSnapshot({ server_epoch: 0, seq: ++historySeq, snapshot, dashboard_history: true })
+      historyPlan = buildHistoryPresentation(context.step, store.getState().agents, positions, context)
+    },
+    onProgress(progress) {
+      if (historyPlan) store.setState({ dashboardHistoryPresentation: sampleHistoryPresentation(historyPlan, progress) })
     },
     onState(value) { store.getState().setDashboardHistory(value) },
     onPause() {},
@@ -174,6 +182,7 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     unsubscribe()
     history.destroy()
     choreographyCleanup?.()
-    if (historyOwnsScene) store.setState({ isPaused: originalPause, dashboardHistory: null })
+    historyPlan = null
+    if (historyOwnsScene) store.setState({ isPaused: originalPause, dashboardHistory: null, dashboardHistoryPresentation: null })
   }
 }

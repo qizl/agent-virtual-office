@@ -717,6 +717,7 @@ export const useOfficeStore = create((set) => ({
   dashboardSync: null,
   dashboardRetry: 0,
   dashboardHistory: null,
+  dashboardHistoryPresentation: null,
   dashboardHistoryToggle: 0,
   setDashboardHistory: (history) => set({ dashboardHistory: history }),
   setDashboardSync: (sync) => set({ dashboardSync: sync }),

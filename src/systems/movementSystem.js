@@ -317,7 +317,7 @@ function lineHitsAnyRect(ax, ay, bx, by, rects) {
   return rects.some(r => lineHitsRect(ax, ay, bx, by, r))
 }
 
-function findBestCorridor(from, to) {
+function findBestCorridor(from, to, random) {
   let best = null, bestDist = Infinity
   for (const c of CORRIDORS) {
     if (lineHitsAnyDesk(from.x, from.y, c.x, c.y)) continue
@@ -333,7 +333,7 @@ function findBestCorridor(from, to) {
   // candidate only when it keeps the floor, avoids furniture, and BOTH segments stay
   // clear; otherwise fall back to the exact validated point (never worse than validated).
   for (let attempt = 0; attempt < 4; attempt++) {
-    const cand = { x: best.x + (Math.random() - 0.5) * CORRIDOR_JITTER, y: best.y + (Math.random() - 0.5) * 12 }
+    const cand = { x: best.x + (random() - 0.5) * CORRIDOR_JITTER, y: best.y + (random() - 0.5) * 12 }
     if (!isOnFloor(cand.x, cand.y) || isOnObstacle(cand.x, cand.y)) continue
     if (lineHitsAnyDesk(from.x, from.y, cand.x, cand.y)) continue
     if (lineHitsAnyDesk(cand.x, cand.y, to.x, to.y)) continue
@@ -371,7 +371,7 @@ function wedgeEscapeNodes(p, obstacles) {
   return out
 }
 
-function findSafePolyline(from, to, nodes, obstacles) {
+function findSafePolyline(from, to, nodes, obstacles, random) {
   const pts = [from, to, ...nodes, ...wedgeEscapeNodes(from, obstacles), ...wedgeEscapeNodes(to, obstacles)]
   const n = pts.length
   const dist = Array(n).fill(Infinity)
@@ -422,8 +422,8 @@ function findSafePolyline(from, to, nodes, obstacles) {
     let placed = null
     for (let attempt = 0; attempt < 4 && !placed; attempt++) {
       const cand = {
-        x: node.x + (Math.random() - 0.5) * CORRIDOR_JITTER,
-        y: node.y + (Math.random() - 0.5) * 12,
+        x: node.x + (random() - 0.5) * CORRIDOR_JITTER,
+        y: node.y + (random() - 0.5) * 12,
       }
       if (!isOnFloor(cand.x, cand.y) || isOnObstacle(cand.x, cand.y)) continue
       if (lineHitsAnyRect(prevPt.x, prevPt.y, cand.x, cand.y, obstacles)) continue
@@ -477,10 +477,10 @@ function pushPoint(path, pt) {
 // prevented TEMPORALLY instead: AVO-187 (ADR-010) grants each physical door to one journey at a
 // time (src/systems/doorClaims.js), and a denied agent waits where it stands rather than meeting
 // the first one at the door.
-function jitterDoorCrossing(fromSide, toSide) {
+function jitterDoorCrossing(fromSide, toSide, random) {
   const travelX = Math.abs(toSide.x - fromSide.x) >= Math.abs(toSide.y - fromSide.y)
   for (let attempt = 0; attempt < 4; attempt++) {
-    const off = (Math.random() - 0.5) * DOOR_JITTER // ±10px along the opening
+    const off = (random() - 0.5) * DOOR_JITTER // ±10px along the opening
     const a = travelX ? { x: fromSide.x, y: fromSide.y + off } : { x: fromSide.x + off, y: fromSide.y }
     const b = travelX ? { x: toSide.x, y: toSide.y + off } : { x: toSide.x + off, y: toSide.y }
     if (isOnFloor(a.x, a.y) && !isOnObstacle(a.x, a.y) && isOnFloor(b.x, b.y) && !isOnObstacle(b.x, b.y)) {
@@ -525,7 +525,7 @@ const LOUNGE_ROUTE_NODES = [
   { x: 90, y: 430 }, { x: 200, y: 430 }, { x: 240, y: 430 }, { x: 300, y: 430 }, { x: 430, y: 430 },
 ]
 
-function routeWithinLounge(from, to) {
+function routeWithinLounge(from, to, random) {
   if (!lineHitsAnyRect(from.x, from.y, to.x, to.y, LOUNGE_OBSTACLES)) return [to]
   // Graph routing ONLY when both endpoints sit inside the lounge's convex floor rect:
   // findSafePolyline validates furniture rects, never floor membership of segment
@@ -536,7 +536,7 @@ function routeWithinLounge(from, to) {
   // lane path verbatim, so no input routes worse than before this change.
   const inLoungeRect = (p) => p.x >= 15 && p.x <= 451 && p.y >= 424 && p.y <= 545
   if (inLoungeRect(from) && inLoungeRect(to)) {
-    const graphPath = findSafePolyline(from, to, LOUNGE_ROUTE_NODES, LOUNGE_OBSTACLES)
+    const graphPath = findSafePolyline(from, to, LOUNGE_ROUTE_NODES, LOUNGE_OBSTACLES, random)
     if (graphPath) return graphPath
   }
   const y = 520
@@ -579,11 +579,11 @@ function routeWithinResearch(from, to) {
   return pts
 }
 
-function routeWithinMainOffice(from, to) {
+function routeWithinMainOffice(from, to, random) {
   if (!lineHitsAnyDesk(from.x, from.y, to.x, to.y)) return [to]
-  const graphPath = findSafePolyline(from, to, MAIN_ROUTE_NODES, MAIN_OFFICE_OBSTACLES)
+  const graphPath = findSafePolyline(from, to, MAIN_ROUTE_NODES, MAIN_OFFICE_OBSTACLES, random)
   if (graphPath) return graphPath
-  const corridor = findBestCorridor(from, to)
+  const corridor = findBestCorridor(from, to, random)
   if (corridor) return [corridor, to]
   // Last resort — findSafePolyline AND every single-corridor relay failed, meaning the
   // target is wedged against furniture with no clean route by construction (see the fuzz
@@ -623,11 +623,11 @@ function zoneMouth(p, zone) {
   }
 }
 
-function routeWithinZone(from, to, zone) {
+function routeWithinZone(from, to, zone, random) {
   const inner = (a, b) => {
-    if (zone === 'mainOffice') return routeWithinMainOffice(a, b)
+    if (zone === 'mainOffice') return routeWithinMainOffice(a, b, random)
     if (zone === 'meetingRoom') return routeWithinMeetingRoom(a, b)
-    if (zone === 'lounge') return routeWithinLounge(a, b)
+    if (zone === 'lounge') return routeWithinLounge(a, b, random)
     if (zone === 'research') return routeWithinResearch(a, b)
     return [b]
   }
@@ -641,8 +641,8 @@ function routeWithinZone(from, to, zone) {
   return pts
 }
 
-function appendZoneRoute(path, from, to, zone) {
-  for (const pt of routeWithinZone(from, to, zone)) pushPoint(path, pt)
+function appendZoneRoute(path, from, to, zone, random) {
+  for (const pt of routeWithinZone(from, to, zone, random)) pushPoint(path, pt)
 }
 
 // Claim-door id (calculateJourney's ROUTE names) → the physical door-passage
@@ -662,12 +662,13 @@ export function doorPassageRect(doorId) {
   return zone ? { x1: zone.x1, y1: zone.y1, x2: zone.x2, y2: zone.y2 } : null
 }
 
-export function calculateJourney(from, to) {
+// History may supply a stable source; live callers retain the same random jitter.
+export function calculateJourney(from, to, { random = Math.random } = {}) {
   const fromZone = getZone(from.x, from.y)
   const toZone = getZone(to.x, to.y)
 
   if (fromZone === toZone) {
-    return { waypoints: routeWithinZone(from, to, fromZone), doorIds: [] }
+    return { waypoints: routeWithinZone(from, to, fromZone, random), doorIds: [] }
   }
 
   const path = []
@@ -684,8 +685,8 @@ export function calculateJourney(from, to) {
     const rawFromSide = sides?.[fromZone] || DOORS[exitDoor]
     const exitToZone = toZone === 'mainOffice' || fromZone === 'mainOffice' ? toZone : 'mainOffice'
     const rawToSide = sides?.[exitToZone] || DOORS[exitDoor]
-    const [fromSide, toSide] = jitterDoorCrossing(rawFromSide, rawToSide)
-    appendZoneRoute(path, from, fromSide, fromZone)
+    const [fromSide, toSide] = jitterDoorCrossing(rawFromSide, rawToSide, random)
+    appendZoneRoute(path, from, fromSide, fromZone, random)
     pushPoint(path, toSide)
     doorClear.push({ doorId: exitDoor, at: path.length - 1 })
   }
@@ -698,16 +699,16 @@ export function calculateJourney(from, to) {
       const sides = DOOR_SIDES[entryDoor]
       const rawMainSide = sides?.mainOffice || DOORS[entryDoor]
       const rawToSide = sides?.[toZone] || DOORS[entryDoor]
-      const [mainSide, toSide] = jitterDoorCrossing(rawMainSide, rawToSide)
+      const [mainSide, toSide] = jitterDoorCrossing(rawMainSide, rawToSide, random)
       const prevPt = path[path.length - 1] || from
-      appendZoneRoute(path, prevPt, mainSide, 'mainOffice')
+      appendZoneRoute(path, prevPt, mainSide, 'mainOffice', random)
       pushPoint(path, toSide)
       doorClear.push({ doorId: entryDoor, at: path.length - 1 })
     }
   }
 
   const last = path[path.length - 1] || from
-  appendZoneRoute(path, last, to, toZone)
+  appendZoneRoute(path, last, to, toZone, random)
   return { waypoints: path, doorIds, doorClear }
 }
 
