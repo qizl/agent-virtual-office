@@ -1,32 +1,38 @@
 # MAW History Choreography
 
-Status: Approved for implementation by the user on 2026-10-24.
+Status: Approved for implementation by the user on 2026-10-25.
 
 ## 1. Intent
 
 Replay the recorded task process as visible role actions, rather than changing milestone labels over stationary characters. Add continuous transitions and draggable playback progress.
 
-The canonical external delivery plan is the Kit maintenance document `docs/development/multi-agent-workflow/agent-virtual-office/multi-agent-workflow-dashboard-history-choreography-2026-10-24/multi-agent-workflow-dashboard-history-choreography-2026-10-24.md`; its paired records own rolling delivery evidence. This specification owns AVO behavior. Previous acceptance blockers remain open.
+The current canonical external delivery plan is the Kit maintenance document `docs/development/multi-agent-workflow/agent-virtual-office/multi-agent-workflow-dashboard-handoff-entry-2026-10-25/multi-agent-workflow-dashboard-handoff-entry-2026-10-25.md`; its paired records own rolling delivery evidence. This specification owns AVO behavior. Previous acceptance blockers remain open.
 
 ## 2. Evidence Boundary
 
 - Read only validated task and committed transaction records. Never read prompt or log bodies or write observed runtime.
 - Use explicit member identities, task sequence, type, round and valid ref_task links. Never infer actors from node names or fabricate starts, handoffs, tool actions, durations or later conclusions.
 - Keep transaction revision order and deterministic causal ordering for undated task supplements. Mark missing or damaged evidence incomplete.
-- Preserve the existing 2 MB file, 200 input/milestone, 1 MiB response and 16 KiB snapshot limits.
+- Preserve the existing 2 MB file, 200 input/milestone/relationship, 1 MiB response, 50-member and 16 KiB snapshot limits. An interaction group that cannot fit is unavailable as a whole; never guess from a partial group.
+- A development submission targets the exact reviewer whose review task references it. A review result returns to the exact referenced task author. A development rework reference is not a next recipient. Missing, conflicting or unavailable relationships remain pending.
+- Historical handoffs require both task identities to have appeared in causal order. Final roster readiness or termination must not invent a historical availability fact.
 
 ## 3. Presentation Contract
 
 Each step may carry a bounded cue with an actor in its snapshot, one whitelisted activity, optional task identity and at most one explicitly related member. Activities are ready, publication, work, delivery, result, rework, coordination and terminal. A missing or invalid cue produces a neutral presentation, never guessed activity.
 
-The independent history clock provides four seconds per step. Motion represents the recorded milestone for presentation; it does not reproduce actual physical positions or elapsed work. Actor positions transition continuously across steps and seeks. Neutral roles must not inherit prior work or future results. Live choreography and ambient timers cannot take ownership.
+The independent history clock samples a deterministic route plan compiled from default positions. Ordinary steps last at least four seconds. A handoff includes travel at the existing 60 px/s speed, three seconds of mutual conversation at the recipient workstation and travel back to the current-state post. Steps are bounded to 60 seconds and the full timeline to 12,000,000 ms. Exceeding a bound explicitly degrades the interaction rather than truncating or accelerating a route. Motion illustrates a recorded milestone; it does not reproduce actual work duration. Neutral roles must not inherit prior work or future results. Live choreography and ambient timers cannot take ownership.
+
+Live handoffs reserve both concrete participants. Shared participants queue; disjoint pairs may proceed concurrently. Normal walks, desk correction and roaming yield to the interaction. Stable event identities prevent repeated polling from replaying a handoff. Task or round replacement, disappearance, disconnection, termination and unmount cancel ownership and callbacks. Failed verdicts retain their real status.
+
+Entering or refreshing a running Dashboard view places all members at their current-state posts and baselines prior handoffs. Empty, damaged or failed responses do not consume initialization. Only a mounted observer that has read a complete unassigned state may animate the first subsequent assignment from default seats. Unknown state and missed observations cannot imply a startup. Standalone opening behavior remains compatible.
 
 ## 4. Controls And Lifecycle
 
 - Pause freezes playback and presentation motion. Resume preserves the remaining step time.
 - Restart cancels previous work and starts the recorded timeline from its beginning. End holds the final frame without looping.
 - An accessible draggable progress bar seeks within presentation time and preserves the prior playing or paused state. Seeking backward restores only facts known at that target frame. Rapid seeks cancel obsolete transitions. An explicit seek while paused may perform one short positioning transition and then freeze; an ordinary pause never moves characters.
-- Parent commands and status retain same-origin, exact iframe identity and fixed project/task checks. Seek positions and durations are finite bounded integers: position_ms is within 0..duration_ms, duration_ms equals total steps times 4000 and never exceeds 800000. The seek command carries position_ms; state carries position_ms and duration_ms.
+- Parent commands and status retain same-origin, exact iframe identity and fixed project/task checks. Seek positions and durations are finite bounded integers: position_ms is within 0..duration_ms; duration_ms is the cumulative bounded step time, between total steps times 4000 and total steps times 60000, never exceeding 12,000,000. The seek command carries position_ms; state carries position_ms and duration_ms.
 - Fullscreen retains the same iframe, playback and task binding. Task changes and page exit cancel old timers and responses.
 
 ## 5. Acceptance
@@ -36,6 +42,8 @@ The independent history clock provides four seconds per step. Motion represents 
 - Mouse/touch and keyboard progress changes select the expected timeline position without changing the bound task or mode.
 - Malformed cues, foreign messages, excessive input, damaged records and missing references fail safely without observed-runtime writes.
 - Focused and full AVO/Python/Dashboard tests, browser playback/geometry and guarded committed-source packaging provide real evidence. Formal quality and review blockers remain explicit.
+- Cover exact-member handoffs with multiple executors/reviewers, delayed review assignment, rework/failure, missing/conflicting references, unavailable recipients and repeated polling. Verify conversation facing and continuous approach/return.
+- Verify running entry, refresh and reconnect hydrate directly; only observed unassigned-to-assigned starts an opening. Pause and seek during travel, conversation and return must sample the same timeline without revealing later facts.
 
 ## 6. Rollback
 

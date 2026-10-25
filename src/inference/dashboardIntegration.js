@@ -13,6 +13,9 @@ const REQUEST_TIMEOUT_MS = 10_000
 const STALE_MS = 120_000
 
 export function startDashboardIntegration(store, config = detectIntegrationConfig()) {
+  // Every mounted binding starts with its own observation baseline, including
+  // rapid task replacements that reuse this store.
+  store.setState({ agents: {}, mawMeta: null, dashboardHistoryPresentation: null })
   let torn = false
   let generation = 0
   let controller = null
@@ -28,6 +31,9 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
   let retryVersion = store.getState().dashboardRetry
   let reportedFailure = null
   let recovery = 0
+  let initialized = false
+  let observedUnassigned = false
+  let opening = 0
   let choreographyCleanup = startMawChoreography(store, { resumeCurrent: true })
   let historyToggleVersion = store.getState().dashboardHistoryToggle
   const originalPause = store.getState().isPaused
@@ -64,7 +70,10 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
 
   function sync(state, code = null) {
     if (torn) return
-    if (['error', 'missing', 'stale'].includes(state)) needsRecovery = true
+    if (['error', 'missing', 'stale'].includes(state)) {
+      needsRecovery = true
+      observedUnassigned = false
+    }
     if (['error', 'missing', 'configuration-error', 'stale'].includes(state) && code && code !== reportedFailure) {
       console.warn('[Dashboard] synchronization:', code)
       reportedFailure = code
@@ -93,9 +102,19 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     lastContent = content
     lastValidAt = Date.now()
     // Recovery is a baseline of the currently observed facts, never replay of unobserved work.
-    if (needsRecovery || isStale) recovery += 1
+    const recovering = needsRecovery || isStale
+    if (recovering) recovery += 1
     needsRecovery = false
-    store.getState().applyMawSnapshot({ ...envelope, dashboard_recovery: recovery })
+    const snapshot = envelope.snapshot
+    const hasMembers = snapshot?.members?.length > 0
+    const complete = hasMembers && snapshot.quality === 'ok'
+    const firstAssignment = initialized && !recovering && complete
+      && observedUnassigned && snapshot.assignment_state === 'assigned'
+    if (firstAssignment) opening += 1
+    if (hasMembers) initialized = true
+    observedUnassigned = complete && snapshot.assignment_state === 'unassigned'
+    store.getState().applyMawSnapshot({ ...envelope, dashboard_recovery: recovery,
+      dashboard_hydration: initialized ? 1 : 0, dashboard_opening: opening })
     isStale = envelope.snapshot?.quality === 'stale'
     if (isStale) store.getState().freezeMawSnapshot(envelope.snapshot.quality_detail || 'source-stale')
     armStaleTimer()

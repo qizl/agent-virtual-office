@@ -620,6 +620,8 @@ function buildMawMember(member, seat, stale = false) {
       verdict: member.verdict ?? null,
       terminate: member.terminate ?? null,
       stalled: member.stalled === true,
+      current_task: member.current_task ?? null,
+      handoff_pending: member.handoff_pending ?? null,
     },
   }
 }
@@ -631,6 +633,10 @@ function applyMawSnapshotImpl(s, envelope) {
   const historical = envelope.dashboard_history === true && s.integration === 'dashboard'
   const recovering = s.integration === 'dashboard'
     && (envelope.dashboard_recovery ?? 0) !== (s.mawMeta?.dashboard_recovery ?? 0)
+  const hydrating = s.integration === 'dashboard'
+    && (envelope.dashboard_hydration ?? 0) !== (s.mawMeta?.dashboard_hydration ?? 0)
+  const starting = s.integration === 'dashboard'
+    && (envelope.dashboard_opening ?? 0) !== (s.mawMeta?.dashboard_opening ?? 0)
   const meta = {
     server_epoch: envelope.server_epoch ?? null,
     seq: envelope.seq ?? null,
@@ -641,33 +647,48 @@ function applyMawSnapshotImpl(s, envelope) {
     terminal: snapshot ? snapshot.terminal : null,
     dashboard_recovery: envelope.dashboard_recovery ?? 0,
     dashboard_history: historical,
+    dashboard_hydration: envelope.dashboard_hydration ?? 0,
+    dashboard_opening: envelope.dashboard_opening ?? 0,
+    assignment_state: snapshot?.assignment_state ?? 'unknown',
+    handoff_state: snapshot?.handoff_state ?? null,
+    handoffs: snapshot?.handoffs ?? [],
   }
   const agents = historical ? {} : { ...s.agents }
   const desired = new Map()
-  // CR-1 opening action: the FIRST snapshot after load spawns EVERYONE at the
-  // default meeting-room seats, so the choreography's staggered walk-in plays
-  // on every page load. Later newcomers spawn by phase (rest → meeting room,
-  // task → desk). The probing set matches the choreography's own binding order,
-  // so opening spawn seats equal its stable rest-seat bindings exactly.
-  const opening = !historical && !Object.values(agents).some((a) => a?.mawMember)
+  // Dashboard entry observes current facts. Only an explicitly observed first
+  // assignment starts an opening; standalone snapshots retain their entrance.
+  const opening = starting || (!historical && s.integration !== 'dashboard'
+    && !Object.values(agents).some((a) => a?.mawMember))
   const openingTaken = new Set()
+  const incomingIds = new Set((snapshot?.members || []).map((member) => `${member.id}~${member.role}`))
+  const occupied = new Set(Object.values(agents).filter((a) => a?.mawMember && a.maw?.workSeat && incomingIds.has(a.id))
+    .map((a) => `${a.maw.workSeat.x},${a.maw.workSeat.y}`))
   if (snapshot && Array.isArray(snapshot.members)) {
-    const perRoleCount = {}
     for (const member of snapshot.members) {
       if (!member || typeof member.id !== 'string' || !MAW_ROSTER_BY_ID.get(member.role)) continue
       const agentId = `${member.id}~${member.role}`
-      const roleCount = perRoleCount[member.role] || 0
-      perRoleCount[member.role] = roleCount + 1
       // CR-10: the WORK seat is stamped separately from the spawn seat — the
       // opening spawns everyone at the meeting room, but the seat nameplate
       // must show at the member's ASSIGNED desk.
-      const workSeat = workSeatFor(member.role, roleCount)
+      let workSeat = agents[agentId]?.maw?.workSeat
+      if (!workSeat) {
+        for (let index = 0; index < 50; index += 1) {
+          const candidate = workSeatFor(member.role, index)
+          if (member.role === 'manager' || !occupied.has(`${candidate.x},${candidate.y}`)) {
+            workSeat = candidate
+            break
+          }
+        }
+        workSeat ??= workSeatFor(member.role, 49)
+        occupied.add(`${workSeat.x},${workSeat.y}`)
+      }
       let spawnSeat
       if (opening) {
         const assigned = restSeatFor(agentId, openingTaken)
         openingTaken.add(assigned.index)
         spawnSeat = assigned.seat
-      } else if (phaseOf(member.status) === 'rest') {
+      } else if (phaseOf(member.status) === 'rest'
+        && !(s.integration === 'dashboard' && !historical && snapshot.workflow && !snapshot.terminal)) {
         spawnSeat = restSeatFor(agentId).seat
       } else {
         spawnSeat = workSeat
@@ -685,7 +706,7 @@ function applyMawSnapshotImpl(s, envelope) {
     // CR-10: the assigned work seat is stamped ONCE and stays stable across
     // snapshots — PixelOffice renders the seat nameplate from it.
     built.maw.workSeat = existing?.maw?.workSeat ?? { ...workSeat }
-    if (existing && !historical) {
+    if (existing && !historical && !hydrating && !starting && !recovering) {
       // Preserve live motion state; refresh only the projected facts. While the
       // choreography owns a walk (inGroupEvent) its behavior/expression/bubble are
       // authoritative — a snapshot refresh must not reset the transit animation
@@ -708,7 +729,7 @@ function applyMawSnapshotImpl(s, envelope) {
       agents[agentId] = built
     }
   }
-  return { agents, mawMeta: meta, ...(recovering || historical ? { doorTraffic: createDoorClaimState() } : {}) }
+  return { agents, mawMeta: meta, ...(recovering || historical || hydrating || starting ? { doorTraffic: createDoorClaimState() } : {}) }
 }
 
 export const useOfficeStore = create((set) => ({

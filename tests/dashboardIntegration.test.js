@@ -78,6 +78,56 @@ describe('Dashboard envelope validation', () => {
 })
 
 describe('Dashboard fixed binding and lifecycle', () => {
+  it('hydrates a running task at its current workstations without entry or old handoffs', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply({ ok: true, data: envelope(1, {
+      assignment_state: 'assigned',
+    }) })))
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(8000)
+    const agent = useOfficeStore.getState().agents['member1~executor']
+    expect(agent.position).toEqual(agent.maw.workSeat)
+    expect(agent).toMatchObject({ inGroupEvent: false, isMoving: false, groupTarget: null })
+    expect(useOfficeStore.getState().mawMeta.dashboard_hydration).toBe(1)
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(0)
+  })
+
+  it('only opens after observing a complete unassigned state followed by assignment', async () => {
+    const idle = { ...envelope().snapshot.members[0], status: 'idle', task_kind: null, round: null }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(reply({ ok: true, data: envelope(1, { assignment_state: 'unassigned', members: [idle] }) }))
+      .mockResolvedValue(reply({ ok: true, data: envelope(2, { assignment_state: 'assigned' }) }))
+    vi.stubGlobal('fetch', fetchMock)
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    const initial = useOfficeStore.getState().agents['member1~executor']
+    expect(initial.position).toEqual(initial.maw.workSeat)
+    expect(initial.inGroupEvent).toBe(false)
+    await vi.advanceTimersByTimeAsync(2001)
+    const entering = useOfficeStore.getState().agents['member1~executor']
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(1)
+    expect(entering.position).not.toEqual(entering.maw.workSeat)
+    expect(entering.inGroupEvent).toBe(true)
+    expect(entering.groupTarget).toEqual(entering.maw.workSeat)
+  })
+
+  it('does not consume hydration on empty data or infer a start from unknown or failed observations', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(reply({ ok: true, data: { ...envelope(), snapshot: null } }))
+      .mockResolvedValueOnce(reply({ ok: true, data: envelope(2, { assignment_state: 'unknown' }) }))
+      .mockResolvedValueOnce(reply({ ok: true, data: envelope(3, { assignment_state: 'unassigned' }) }))
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValue(reply({ ok: true, data: envelope(4, { assignment_state: 'assigned' }) }))
+    vi.stubGlobal('fetch', fetchMock)
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().mawMeta.dashboard_hydration).toBe(0)
+    await vi.advanceTimersByTimeAsync(8000)
+    const agent = useOfficeStore.getState().agents['member1~executor']
+    expect(agent.position).toEqual(agent.maw.workSeat)
+    expect(agent.inGroupEvent).toBe(false)
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(0)
+  })
+
   it('fetches immediately with encoded fixed selection, single-flights retries, then polls every two seconds', async () => {
     const first = deferred()
     const fetchMock = vi.fn().mockReturnValueOnce(first.promise).mockResolvedValue(reply({ ok: true, data: envelope(2) }))

@@ -385,6 +385,8 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
   let lastSeenQuality = null
   let lastSeenTerminal = false
   let lastRecovery = 0 // Dashboard-only observation baseline; standalone replay remains unchanged
+  let lastHydration = 0
+  let lastOpening = 0
   let prevPostDesk = null // null = not yet observed; true = the team stands by at desks (CR-11)
   let standbySweepSeq = 0 // latest standby sweep — older sweeps' callbacks void themselves
   const pendingRelocation = new Map() // agentId -> { workflowActive } — deferred relocations for mid-walk members
@@ -518,8 +520,10 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
     for (const [id, boundSeat] of workSeatsByMember) {
       if (store.getState().agents[id]) claimed.add(seatKey(boundSeat))
     }
-    let seat = null
+    const existingSeat = member.maw?.workSeat
+    let seat = existingSeat && !claimed.has(seatKey(existingSeat)) ? { ...existingSeat } : null
     for (const candidate of [...(ROLE_WORK_CLUSTERS[role] ?? []), ...MAW_EXTRA_WORK_SEATS]) {
+      if (seat) break
       if (claimed.has(seatKey(candidate))) continue
       seat = { ...candidate }
       break
@@ -727,8 +731,12 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
     if (s.mode !== 'maw') return
     const members = Object.values(s.agents).filter((a) => a?.mawMember)
     const recovery = s.mawMeta?.dashboard_recovery ?? 0
-    if (resumeCurrent && recovery !== lastRecovery) {
+    const hydration = s.mawMeta?.dashboard_hydration ?? 0
+    const opening = s.mawMeta?.dashboard_opening ?? 0
+    if (resumeCurrent && (recovery !== lastRecovery || hydration !== lastHydration)) {
       lastRecovery = recovery
+      lastHydration = hydration
+      lastOpening = opening
       // A disconnected Dashboard did not observe intermediate work. Cancel every
       // old callback and baseline the CURRENT facts, without rest/task or handover replay.
       choreoEpoch += 1
@@ -747,6 +755,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
         prevHandover.set(member.id, member.status === 'awaiting-approval')
         stableWorkSeat(member)
         stableRestSeat(member)
+        seatTargets.set(member.id, { ...member.position })
         if (phaseOf(member.status) === 'task') workingSince.set(member.id, now)
         else restingSince.set(member.id, now)
       }
@@ -754,6 +763,11 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       lastSeenQuality = s.mawMeta?.quality ?? null
       lastSeenTerminal = s.mawMeta?.terminal != null
       return
+    }
+    if (resumeCurrent && opening !== lastOpening) {
+      lastOpening = opening
+      for (const id of Object.keys(prevPhase)) delete prevPhase[id]
+      prevHandover.clear()
     }
     const quality = s.mawMeta?.quality ?? null
     const terminal = s.mawMeta?.terminal != null
