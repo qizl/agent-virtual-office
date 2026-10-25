@@ -96,6 +96,12 @@ describe('Dashboard envelope validation', () => {
     expect(validateDashboardSnapshot({ ...base, handoffs: [{ ...base.handoffs[0], recipient_member_id: 'foreign' }] })).toBe(false)
     expect(validateDashboardSnapshot({ ...base, handoffs: [{ ...base.handoffs[0], target_task: 'reviewer-1/task-099.json' }] })).toBe(false)
     expect(validateDashboardSnapshot({ ...base, assignment_state: 'maybe' })).toBe(false)
+    for (const execution_state of ['not-started', 'started', 'unknown']) {
+      expect(validateDashboardSnapshot({ ...base, execution_state })).toBe(true)
+    }
+    for (const execution_state of ['assigned', '', null, true, 0, [], {}]) {
+      expect(validateDashboardSnapshot({ ...base, execution_state })).toBe(false)
+    }
     expect(validateDashboardSnapshot({ ...base, handoffs: [base.handoffs[0], base.handoffs[0]] })).toBe(false)
     expect(validateDashboardSnapshot({ schema: 'avo.maw-snapshot/1', sampled_at: 1000, quality: 'ok',
       quality_detail: null, workflow: null, terminal: null, members: [] })).toBe(true)
@@ -105,7 +111,7 @@ describe('Dashboard envelope validation', () => {
 describe('Dashboard fixed binding and lifecycle', () => {
   it('hydrates a running task at its current workstations without entry or old handoffs', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply({ ok: true, data: envelope(1, {
-      assignment_state: 'assigned',
+      assignment_state: 'assigned', execution_state: 'started',
     }) })))
     cleanup = startDashboardIntegration(useOfficeStore, config)
     await vi.advanceTimersByTimeAsync(8000)
@@ -116,41 +122,129 @@ describe('Dashboard fixed binding and lifecycle', () => {
     expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(0)
   })
 
-  it('only opens after observing a complete unassigned state followed by assignment', async () => {
+  it('opens every pre-start role to its work post once, preserving the route when startup arrives', async () => {
     const idle = { ...envelope().snapshot.members[0], status: 'idle', task_kind: null, round: null }
+    const members = [{ ...idle, id: 'manager1', role: 'manager' }, idle,
+      { ...idle, id: 'reviewer1', role: 'reviewer' }]
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce(reply({ ok: true, data: envelope(1, { assignment_state: 'unassigned', members: [idle] }) }))
-      .mockResolvedValue(reply({ ok: true, data: envelope(2, { assignment_state: 'assigned' }) }))
+      .mockResolvedValueOnce(reply({ ok: true, data: envelope(1, {
+        execution_state: 'not-started', assignment_state: 'unassigned', members,
+      }) }))
+      .mockResolvedValue(reply({ ok: true, data: envelope(2, {
+        execution_state: 'started', assignment_state: 'assigned', members: members.map((m) => ({ ...m, status: 'working' })),
+      }) }))
     vi.stubGlobal('fetch', fetchMock)
     cleanup = startDashboardIntegration(useOfficeStore, config)
     await vi.advanceTimersByTimeAsync(0)
-    const initial = useOfficeStore.getState().agents['member1~executor']
-    expect(initial.position).toEqual(initial.maw.workSeat)
-    expect(initial.inGroupEvent).toBe(false)
-    await vi.advanceTimersByTimeAsync(2001)
-    const entering = useOfficeStore.getState().agents['member1~executor']
+    const first = useOfficeStore.getState().agents
     expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(1)
-    expect(entering.position).not.toEqual(entering.maw.workSeat)
-    expect(entering.inGroupEvent).toBe(true)
-    expect(entering.groupTarget).toEqual(entering.maw.workSeat)
+    expect(useOfficeStore.getState().mawMeta.dashboard_hydration).toBe(0)
+    expect(first['manager1~manager'].groupTarget).toEqual({ x: 100, y: 80 })
+    expect(first['member1~executor'].inGroupEvent).toBe(false) // its 600ms slot has not fired
+    for (const agent of Object.values(first)) expect(agent.position).not.toEqual(agent.maw.workSeat)
+    useOfficeStore.getState().requestDashboardSync()
+    await vi.advanceTimersByTimeAsync(0)
+    const updated = useOfficeStore.getState().agents
+    expect(updated['manager1~manager'].position).toEqual(first['manager1~manager'].position)
+    expect(updated['manager1~manager'].groupTarget).toEqual(first['manager1~manager'].groupTarget)
+    expect(updated['member1~executor'].position).toEqual(first['member1~executor'].position)
+    await vi.advanceTimersByTimeAsync(599)
+    expect(useOfficeStore.getState().agents['member1~executor'].inGroupEvent).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(useOfficeStore.getState().agents['member1~executor'].groupTarget).toEqual(first['member1~executor'].maw.workSeat)
+    expect(useOfficeStore.getState().agents['reviewer1~reviewer'].inGroupEvent).toBe(false)
+    await vi.advanceTimersByTimeAsync(600)
+    expect(useOfficeStore.getState().agents['reviewer1~reviewer'].groupTarget).toEqual(first['reviewer1~reviewer'].maw.workSeat)
+    await vi.advanceTimersByTimeAsync(4000)
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(1)
+    expect(useOfficeStore.getState().mawMeta.dashboard_hydration).toBe(0)
   })
 
-  it('does not consume hydration on empty data or infer a start from unknown or failed observations', async () => {
+  it('empty, unknown and failed observations do not consume the first determinate entry decision', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(reply({ ok: true, data: { ...envelope(), snapshot: null } }))
-      .mockResolvedValueOnce(reply({ ok: true, data: envelope(2, { assignment_state: 'unknown' }) }))
-      .mockResolvedValueOnce(reply({ ok: true, data: envelope(3, { assignment_state: 'unassigned' }) }))
+      .mockResolvedValueOnce(reply({ ok: true, data: envelope(2, { execution_state: 'unknown' }) }))
       .mockRejectedValueOnce(new Error('offline'))
-      .mockResolvedValue(reply({ ok: true, data: envelope(4, { assignment_state: 'assigned' }) }))
+      .mockResolvedValue(reply({ ok: true, data: envelope(4, { execution_state: 'not-started' }) }))
     vi.stubGlobal('fetch', fetchMock)
     cleanup = startDashboardIntegration(useOfficeStore, config)
     await vi.advanceTimersByTimeAsync(0)
     expect(useOfficeStore.getState().mawMeta.dashboard_hydration).toBe(0)
-    await vi.advanceTimersByTimeAsync(8000)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(0)
+    expect(useOfficeStore.getState().mawMeta.dashboard_hydration).toBe(1)
+    await vi.advanceTimersByTimeAsync(4001)
     const agent = useOfficeStore.getState().agents['member1~executor']
+    expect(agent.position).not.toEqual(agent.maw.workSeat)
+    expect(agent.inGroupEvent).toBe(true)
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(1)
+    expect(useOfficeStore.getState().mawMeta.dashboard_recovery).toBe(1)
+  })
+
+  it('moves idle pre-start members to work posts and cancels pending entry on remount', async () => {
+    const idle = { ...envelope().snapshot.members[0], status: 'idle', task_kind: null, round: null }
+    const members = [{ ...idle, id: 'manager1', role: 'manager' }, idle]
+    const fetchMock = vi.fn().mockResolvedValue(reply({ ok: true, data: envelope(1, { execution_state: 'not-started', members }) }))
+    vi.stubGlobal('fetch', fetchMock)
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(600)
+    const entering = useOfficeStore.getState().agents['member1~executor']
+    expect(entering.status).toBe('idle')
+    expect(entering.groupTarget).toEqual(entering.maw.workSeat)
+    cleanup()
+    fetchMock.mockResolvedValue(reply({ ok: true, data: envelope(2, { execution_state: 'started', members }) }))
+    cleanup = startDashboardIntegration(useOfficeStore, { ...config, task: 'different-task' })
+    await vi.advanceTimersByTimeAsync(5000)
+    for (const agent of Object.values(useOfficeStore.getState().agents)) {
+      expect(agent.position).toEqual(agent.maw.workSeat)
+      expect(agent.inGroupEvent).toBe(false)
+    }
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(0)
+  })
+
+  it('does not reopen from assignment changes, later pre-start claims, terminal or legacy data', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(reply({ ok: true, data: envelope(1, { execution_state: 'started', assignment_state: 'unassigned' }) }))
+      .mockResolvedValue(reply({ ok: true, data: envelope(2, { execution_state: 'not-started', assignment_state: 'assigned' }) }))
+    vi.stubGlobal('fetch', fetchMock)
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(4000)
+    let agent = useOfficeStore.getState().agents['member1~executor']
     expect(agent.position).toEqual(agent.maw.workSeat)
     expect(agent.inGroupEvent).toBe(false)
     expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(0)
+    cleanup()
+    fetchMock.mockResolvedValue(reply({ ok: true, data: envelope(3, { execution_state: 'not-started', terminal: 'cancelled' }) }))
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(0)
+    cleanup()
+    fetchMock.mockResolvedValue(reply({ ok: true, data: envelope(4) }))
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    agent = useOfficeStore.getState().agents['member1~executor']
+    expect(agent.position).toEqual(agent.maw.workSeat)
+    expect(useOfficeStore.getState().mawMeta.execution_state).toBe('unknown')
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(0)
+  })
+
+  it('preserves a degraded positive start fact while requiring complete negative evidence for opening', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(reply({ ok: true, data: envelope(1, { quality: 'degraded', execution_state: 'started' }) }))
+      .mockResolvedValue(reply({ ok: true, data: envelope(2, { execution_state: 'not-started' }) }))
+    vi.stubGlobal('fetch', fetchMock)
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(4000)
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(0)
+    cleanup()
+    fetchMock
+      .mockResolvedValueOnce(reply({ ok: true, data: envelope(1, { quality: 'degraded', execution_state: 'not-started' }) }))
+      .mockResolvedValue(reply({ ok: true, data: envelope(2, { execution_state: 'not-started' }) }))
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(0)
+    await vi.advanceTimersByTimeAsync(2001)
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(1)
   })
 
   it('fetches immediately with encoded fixed selection, single-flights retries, then polls every two seconds', async () => {

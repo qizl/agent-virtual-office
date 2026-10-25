@@ -54,6 +54,7 @@ export function validateMawHandoff(handoff, members) {
 
 export function validateMawInteractionFields(snapshot) {
   if (snapshot.assignment_state !== undefined && !['unassigned', 'assigned', 'unknown'].includes(snapshot.assignment_state)) return false
+  if (snapshot.execution_state !== undefined && !['not-started', 'started', 'unknown'].includes(snapshot.execution_state)) return false
   if (snapshot.handoff_state !== undefined && !['complete', 'unavailable'].includes(snapshot.handoff_state)) return false
   for (const member of snapshot.members) {
     if (member.current_task !== undefined && member.current_task !== null && !validateMawTaskIdentity(member.current_task, member.role)) return false

@@ -25,7 +25,10 @@ The independent history clock samples a deterministic route plan compiled from d
 
 Live handoffs reserve both concrete participants. Shared participants queue; disjoint pairs may proceed concurrently. Normal walks, desk correction and roaming yield to the interaction. Stable event identities prevent repeated polling from replaying a handoff. Task or round replacement, disappearance, disconnection, termination and unmount cancel ownership and callbacks. Failed verdicts retain their real status.
 
-Entering or refreshing a running Dashboard view places all members at their current-state posts and baselines prior handoffs. Empty, damaged or failed responses do not consume initialization. Only a mounted observer that has read a complete unassigned state may animate the first subsequent assignment from default seats. Unknown state and missed observations cannot imply a startup. Standalone opening behavior remains compatible.
+Live snapshots may include `execution_state=not-started|started|unknown`, independently of handoff availability. A complete read with no concrete tasks, or only `initialized` tasks, is not-started. Any legal concrete task in `in-progress`, `dev-complete`, `reviewing`, `review-passed` or `review-failed` establishes started; inspect all tasks, including earlier rounds. Incomplete observations and legacy snapshots without the field are unknown. Manager activity, assignment existence, clocks and sequence numbers are not execution evidence.
+
+On the first determinate nonterminal Dashboard observation, not-started opens every member from their default meeting-room seat to their stable work post, including the manager at the gate, with 600 ms launch spacing. A first started observation hydrates current-state posts and baselines prior handoffs. Unknown, empty, damaged or failed observations never trigger an opening or consume its determinate decision. An opening already in progress finishes its continuous routes when execution starts; it is not restarted or replaced by instant positioning. Each mounted task decides once; re-entry before execution opens again, while re-entry after execution hydrates. No task state, member position or entry-completion marker is persisted in browser storage. Historical playback and standalone opening remain compatible.
+
 
 ## 4. Controls And Lifecycle
 
@@ -43,7 +46,7 @@ Entering or refreshing a running Dashboard view places all members at their curr
 - Malformed cues, foreign messages, excessive input, damaged records and missing references fail safely without observed-runtime writes.
 - Focused and full AVO/Python/Dashboard tests, browser playback/geometry and guarded committed-source packaging provide real evidence. Formal quality and review blockers remain explicit.
 - Cover exact-member handoffs with multiple executors/reviewers, delayed review assignment, rework/failure, missing/conflicting references, unavailable recipients and repeated polling. Verify conversation facing and continuous approach/return.
-- Verify running entry, refresh and reconnect hydrate directly; only observed unassigned-to-assigned starts an opening. Pause and seek during travel, conversation and return must sample the same timeline without revealing later facts.
+- Verify no-task and initialized-only entry launches every member with stable posts and staggered continuous routes; execution already started, refresh and reconnect hydrate directly. Starting execution during entry must preserve the current routes. Unknown observations cannot launch or consume the determinate entry decision; task changes cancel prior work. MAW task/member state must be absent from browser persistence.
 
 ## 6. Rollback
 

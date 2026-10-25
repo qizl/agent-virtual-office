@@ -394,6 +394,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
   const pendingRelocation = new Map() // agentId -> { workflowActive } — deferred relocations for mid-walk members
   let pendingSeq = 0
   const pendingEnter = new Map() // agentId -> { seq, from } — rolled back if the generation dies pre-fire
+  const openingMembers = new Set() // first pre-start roster; live facts cannot restart its entrance
   const seenHandoffs = new Set()
   const queuedHandoffs = new Map()
   const activeHandoffs = new Map()
@@ -714,7 +715,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       const waiting = new Set()
       for (const [id, item] of queuedHandoffs) {
         const pair = [item.senderId, item.recipientId]
-        if (pair.some((memberId) => handoffParticipants.has(memberId) || waiting.has(memberId))) {
+        if (pair.some((memberId) => handoffParticipants.has(memberId) || openingMembers.has(memberId) || waiting.has(memberId))) {
           pair.forEach((memberId) => waiting.add(memberId))
           continue
         }
@@ -742,6 +743,9 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
 
   /** Drop every per-member trace of members that left the snapshot. */
   function pruneGoneMembers(memberIds) {
+    for (const id of openingMembers) {
+      if (!memberIds.has(id)) openingMembers.delete(id)
+    }
     for (const id of [...workSeatsByMember.keys()]) {
       if (!memberIds.has(id)) {
         occupiedWorkSeats.delete(seatKey(workSeatsByMember.get(id)))
@@ -865,7 +869,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       }
       if (!freeRoam && Date.now() - lastWanderAt < WANDER_INTERVAL_MS) return
       const candidates = wanderCandidates({
-        members: Object.values(s.agents).filter((a) => a?.mawMember && !handoffParticipants.has(a.id)),
+        members: Object.values(s.agents).filter((a) => a?.mawMember && !handoffParticipants.has(a.id) && !openingMembers.has(a.id)),
         workingSince,
         restingSince,
         freeRoam,
@@ -935,7 +939,8 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
     const recovery = s.mawMeta?.dashboard_recovery ?? 0
     const hydration = s.mawMeta?.dashboard_hydration ?? 0
     const opening = s.mawMeta?.dashboard_opening ?? 0
-    if (resumeCurrent && (recovery !== lastRecovery || hydration !== lastHydration)) {
+    const openingBatch = resumeCurrent && opening !== lastOpening
+    if (resumeCurrent && !openingBatch && (recovery !== lastRecovery || hydration !== lastHydration)) {
       lastRecovery = recovery
       lastHydration = hydration
       lastOpening = opening
@@ -948,6 +953,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       seenHandoffs.clear()
       for (const id of factualHandoffs(s).keys()) seenHandoffs.add(id)
       pendingEnter.clear()
+      openingMembers.clear()
       pendingRelocation.clear()
       handoverQueue.length = 0
       managerBusy = false
@@ -969,8 +975,22 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       lastSeenTerminal = s.mawMeta?.terminal != null
       return
     }
-    if (resumeCurrent && opening !== lastOpening) {
+    if (openingBatch) {
       lastOpening = opening
+      lastHydration = hydration
+      lastRecovery = recovery
+      // Entry wins over a coincident recovery baseline: an earlier failed or
+      // unknown observation did not consume the first determinate start fact.
+      choreoEpoch += 1
+      for (const timer of pendingTimers) clearTimeout(timer)
+      pendingTimers.clear()
+      clearFactualHandoffs({ restore: false })
+      pendingEnter.clear()
+      pendingRelocation.clear()
+      handoverQueue.length = 0
+      managerBusy = false
+      openingMembers.clear()
+      for (const member of members) openingMembers.add(member.id)
       for (const id of Object.keys(prevPhase)) delete prevPhase[id]
       prevHandover.clear()
     }
@@ -990,6 +1010,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
     if (quality !== lastSeenQuality) lastSeenQuality = quality
     lastSeenTerminal = terminal
     if (enteringStale || enteringTerminal) {
+      openingMembers.clear()
       // A generation boundary reaps EVERYTHING the old generation still owned:
       // walk locks, the queue's busy flag and pending items, the handover
       // latches, and the not-yet-fired staggered walks. Presentation differs:
@@ -1024,6 +1045,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       // (review P1/P2). Mid-walk members defer the same way.
       let sweep = 0
       for (const member of members) {
+        if (openingMembers.has(member.id)) continue
         if (member.maw?.role === 'manager') continue
         if (phaseOf(member.status) !== 'rest') continue
         const agentId = member.id
@@ -1048,6 +1070,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
     for (const [agentId, rel] of pendingRelocation) {
       const live = store.getState().agents[agentId]
       if (!live) { pendingRelocation.delete(agentId); continue }
+      if (openingMembers.has(agentId)) continue
       if (handoffParticipants.has(agentId)) continue
       if (Date.now() < (rel.readyAt ?? 0)) continue // stagger slot not due yet
       if (live.isMoving || live.journeyTarget || live.inGroupEvent) continue
@@ -1076,6 +1099,12 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       }
       const phase = phaseOf(member.status)
       const previous = prevPhase[member.id]
+      if (openingMembers.has(member.id) && !openingBatch) {
+        // Startup may become visible before this figure's stagger slot or
+        // arrival. Keep that same route, dressing it from CURRENT facts later.
+        prevPhase[member.id] = phase
+        continue
+      }
       if (handoffParticipants.has(member.id)) continue
       if (phase === previous) continue
       prevPhase[member.id] = phase
@@ -1091,11 +1120,12 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       // Stable seat binding: the seat was assigned when the member FIRST entered
       // this phase; recomputing from live counts would stack same-role members
       // and send the manager to someone else's desk.
-      const seat = isManager
+      const forceWorkPost = openingBatch && openingMembers.has(member.id)
+      const seat = forceWorkPost ? stableWorkSeat(member) : isManager
         ? (phase === 'task' ? MANAGER_GATE : stableRestSeat(member))
         : phase === 'task' || workflowActive ? stableWorkSeat(member) : stableRestSeat(member)
       // Delivering members hurry back to the work seat and wait for the manager.
-      const delay = member.status === 'awaiting-approval' ? 0 : batchStagger * STAGGER_MS
+      const delay = !forceWorkPost && member.status === 'awaiting-approval' ? 0 : batchStagger * STAGGER_MS
       batchStagger += 1
       // The pending record is owned by ITS callback only: rapid rest/task toggles
       // stack several scheduled walks, and an older callback firing late must
@@ -1109,10 +1139,16 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
         if (!mine || mine.seq !== seq) return // ownership lost (a newer pending walk or a prune) — terminate; the owner walks
         pendingEnter.delete(agentId)
         const live = store.getState().agents[agentId]
-        if (!live || phaseOf(live.status) !== phase) return // the phase moved on — its own transition owns the walk
+        if (!live || (!forceWorkPost && phaseOf(live.status) !== phase)) return // the phase moved on — its own transition owns the walk
+        if (forceWorkPost && !openingMembers.has(agentId)) return
         if (handoffParticipants.has(agentId)) return
-        walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null, zoneBound: isManager ? undefined : phase === 'rest' && !workflowActive ? 'meeting' : 'member' })
-        arriveThen(agentId, 0, () => restorePresentation(agentId))
+        walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null, zoneBound: isManager ? undefined : !forceWorkPost && phase === 'rest' && !workflowActive ? 'meeting' : 'member' })
+        const finish = () => {
+          openingMembers.delete(agentId)
+          restorePresentation(agentId)
+          processFactualHandoffs()
+        }
+        arriveThen(agentId, 0, finish, () => openingMembers.delete(agentId))
       }, delay)
     }
 
@@ -1142,6 +1178,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
   return function cleanup() {
     torn = true
     unsubscribe()
+    openingMembers.clear()
     clearFactualHandoffs({ stop: true })
     if (wanderTimer) clearInterval(wanderTimer)
     for (const t of pendingTimers) clearTimeout(t)

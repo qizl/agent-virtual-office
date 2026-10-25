@@ -3,6 +3,7 @@ import copy
 import json
 import stat
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import fixtures
@@ -82,6 +83,14 @@ class SnapshotValidationTest(unittest.TestCase):
                              "task_kind": "aggregate-review", "verdict": "fail",
                              "terminate": "initialized", "stalled": True}]
         projection.validate_snapshot(value)
+
+    def test_execution_state_is_optional_and_strictly_validated(self):
+        projection.validate_snapshot(sample())
+        for state in ("not-started", "started", "unknown"):
+            projection.validate_snapshot({**sample(), "execution_state": state})
+        for state in (None, "assigned", True, 1, [], {}):
+            with self.subTest(state=state):
+                self.assert_invalid({**sample(), "execution_state": state})
 
 
 class DashboardReadTest(unittest.TestCase):
@@ -230,6 +239,129 @@ class InteractionProjectionTest(unittest.TestCase):
                 mutate(invalid)
                 with self.assertRaises(projection.BridgeError):
                     projection.validate_snapshot(invalid)
+
+
+class ExecutionProjectionTest(unittest.TestCase):
+    def snapshot(self, **kwargs):
+        root = fixtures.build_runtime(fixtures.uuid_tmp(), **kwargs)
+        return root, projection.read_snapshot(root, "maw-synth-001", now=1000)
+
+    def test_no_tasks_or_only_initialized_tasks_do_not_prove_execution(self):
+        for status in ("active", "completed", "cancelled"):
+            for tasks in ([], [fixtures.task(1, status="initialized")]):
+                with self.subTest(status=status, tasks=bool(tasks)):
+                    _root, value = self.snapshot(manifest_status=status, executor_tasks=tasks)
+                    self.assertEqual(value["execution_state"], "not-started")
+
+    def test_every_supported_post_assignment_status_proves_execution(self):
+        for status in ("in-progress", "dev-complete", "reviewing", "review-passed", "review-failed"):
+            for kind in ("dev", "review", "plan-review", "aggregate-review"):
+                with self.subTest(status=status, kind=kind):
+                    field = "executor_tasks" if kind == "dev" else "reviewer_tasks"
+                    _root, value = self.snapshot(**{field: [fixtures.task(1, type_=kind, status=status)]})
+                    self.assertEqual(value["execution_state"], "started")
+
+    def test_earlier_execution_is_not_hidden_by_an_initialized_rework(self):
+        _root, value = self.snapshot(executor_tasks=[
+            fixtures.task(1, status="review-failed"),
+            fixtures.task(3, status="initialized", round_=2, ref_task="executor-1/task-001"),
+        ])
+        self.assertEqual(fixtures.member_by_role(value["members"], "executor")["status"], "planning")
+        self.assertEqual(value["execution_state"], "started")
+
+    def test_only_manifest_bound_concrete_member_tasks_count(self):
+        root, _value = self.snapshot(decision_tasks=[fixtures.task(1)])
+        directory = root / RUNTIME_REL / "maw-synth-001"
+        fixtures.write(directory / "manager-1" / "task-002.json", fixtures.task(2))
+        self.assertEqual(projection.read_snapshot(root, "maw-synth-001", now=1000)["execution_state"], "not-started")
+        manifest = json.loads((directory / "task.json").read_text())
+        manifest["roles"].append("decision-maker-1")
+        fixtures.write(directory / "task.json", manifest)
+        self.assertEqual(projection.read_snapshot(root, "maw-synth-001", now=1000)["execution_state"], "started")
+
+    def test_execution_is_independent_of_recipient_readiness_and_pending_links(self):
+        _root, value = self.snapshot(executor_tasks=[fixtures.task(1, status="dev-complete")],
+                                    reviewer_tasks=[fixtures.task(2, type_="review", status="initialized",
+                                                                  ref_task="executor-1/task-001")],
+                                    executor_ready=None, reviewer_ready=None)
+        self.assertEqual(value["handoffs"], [])
+        self.assertEqual(fixtures.member_by_role(value["members"], "executor")["handoff_pending"], "not-ready")
+        self.assertEqual(value["execution_state"], "started")
+
+    def test_incomplete_or_invalid_task_observation_is_unknown(self):
+        root, _value = self.snapshot(executor_tasks=[fixtures.task(1)])
+        original = projection.read_runtime_state(root, "maw-synth-001")
+        variants = []
+        state = copy.deepcopy(original)
+        state["degraded"].append("executor-1/tasks:limit")
+        variants.append(state)
+        state = copy.deepcopy(original)
+        state["_inconsistent"] = True
+        variants.append(state)
+        state = copy.deepcopy(original)
+        del state["roles"]["reviewer-1"]
+        variants.append(state)
+        state = copy.deepcopy(original)
+        state["manifest"]["roles"].append("executor-1")
+        variants.append(state)
+        for state in variants:
+            self.assertEqual(projection.build_snapshot(state, "producer-test", 1, 1000)["execution_state"], "unknown")
+        directory = root / RUNTIME_REL / "maw-synth-001" / "executor-1"
+        (directory / "task-001.json").rename(directory / "task-002.json")
+        self.assertEqual(projection.read_snapshot(root, "maw-synth-001", now=1000)["execution_state"], "unknown")
+        fixtures.write(directory / "task-002.json", fixtures.task(2, status="unsupported"))
+        self.assertEqual(projection.read_snapshot(root, "maw-synth-001", now=1000)["execution_state"], "unknown")
+
+    def test_a_task_disappearing_during_read_does_not_prove_absence(self):
+        root, _value = self.snapshot(executor_tasks=[fixtures.task(1)])
+        real_read = projection.read_json_schema
+
+        def missing_task(path, allowed):
+            return (None, "missing") if path.name == "task-001.json" else real_read(path, allowed)
+
+        with mock.patch.object(projection, "read_json_schema", side_effect=missing_task):
+            state = projection.read_runtime_state(root, "maw-synth-001")
+        self.assertEqual(projection.build_snapshot(state, "producer-test", 1, 1000)["execution_state"], "unknown")
+
+    def test_a_failed_task_listing_does_not_prove_absence(self):
+        root, _value = self.snapshot(executor_tasks=[fixtures.task(1)])
+        real_glob = Path.glob
+
+        def failed_listing(path, pattern):
+            if path.name == "executor-1":
+                raise OSError("task listing unavailable")
+            return real_glob(path, pattern)
+
+        with mock.patch.object(Path, "glob", autospec=True, side_effect=failed_listing):
+            state = projection.read_runtime_state(root, "maw-synth-001")
+        self.assertEqual(projection.build_snapshot(state, "producer-test", 1, 1000)["execution_state"], "unknown")
+
+    def test_total_task_limit_prevents_inference_from_an_incomplete_group(self):
+        for count, expected in ((200, "started"), (201, "unknown")):
+            with self.subTest(count=count):
+                _root, value = self.snapshot(executor_tasks=[fixtures.task(index) for index in range(1, count)],
+                                            reviewer_tasks=[fixtures.task(count, type_="review", status="initialized")])
+                self.assertEqual(value["execution_state"], expected)
+
+    def test_interaction_size_fallback_keeps_the_execution_fact(self):
+        root, _value = self.snapshot()
+        directory = root / RUNTIME_REL / "maw-synth-001"
+        manifest = json.loads((directory / "task.json").read_text())
+        for index in range(1, 25):
+            executor, reviewer = f"executor-{index}", f"reviewer-{index}"
+            for folder in (executor, reviewer):
+                if folder not in manifest["roles"]:
+                    manifest["roles"].append(folder)
+                fixtures.write(directory / folder / "ready.json", {"schema": "maw.ready/1", "status": "confirmed"})
+            fixtures.write(directory / executor / f"task-{index:03d}.json", fixtures.task(index, status="dev-complete"))
+            seq = index + 24
+            fixtures.write(directory / reviewer / f"task-{seq:03d}.json",
+                           fixtures.task(seq, type_="review", status="initialized", ref_task=f"{executor}/task-{index:03d}"))
+        fixtures.write(directory / "task.json", manifest)
+        value = projection.read_snapshot(root, "maw-synth-001", now=1000)
+        self.assertEqual(value["handoff_state"], "unavailable")
+        self.assertEqual(value["execution_state"], "started")
+        self.assertLessEqual(len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()), 16384)
 
 
 if __name__ == "__main__":

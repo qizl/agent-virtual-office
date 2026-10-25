@@ -279,6 +279,7 @@ export function createMawStatus({
       seen.add(body.members[i].id)
     }
     if (body.assignment_state !== undefined && !['unassigned', 'assigned', 'unknown'].includes(body.assignment_state)) return 'assignment_state is invalid'
+    if (body.execution_state !== undefined && !['not-started', 'started', 'unknown'].includes(body.execution_state)) return 'execution_state is invalid'
     if (body.handoff_state !== undefined && !['complete', 'unavailable'].includes(body.handoff_state)) return 'handoff_state is invalid'
     if (body.handoffs !== undefined && (!Array.isArray(body.handoffs) || body.handoffs.length > 200
       || body.handoffs.some((edge) => !validHandoff(edge, body.members))
@@ -387,6 +388,7 @@ export function createMawStatus({
         body.sampled_at,
         body.seq,
         body.assignment_state ?? null,
+        body.execution_state ?? null,
         body.handoff_state ?? null,
         body.handoffs ?? [],
         body.members,
@@ -425,6 +427,7 @@ export function createMawStatus({
         producer_seq: body.seq,
         accepted_at: now(),
         ...(body.assignment_state !== undefined ? { assignment_state: body.assignment_state } : {}),
+        ...(body.execution_state !== undefined ? { execution_state: body.execution_state } : {}),
         ...(body.handoff_state !== undefined ? { handoff_state: body.handoff_state } : {}),
         ...(body.handoffs !== undefined ? { handoffs: body.handoffs.map((edge) => ({ ...edge })) } : {}),
         members: body.members.map((m) => ({

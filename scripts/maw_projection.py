@@ -34,6 +34,7 @@ ROLE_TYPES = ("decision-maker", "executor", "manager", "reviewer")
 ROLE_FOLDER_RE = re.compile(r"(?:manager|decision-maker|executor|reviewer)-[0-9]+")
 MEMBER_ROLES = ("decision-maker", "executor", "reviewer")  # manager has no task files
 TASK_STATUSES = {"initialized", "in-progress", "dev-complete", "reviewing", "review-passed", "review-failed"}
+STARTED_TASK_STATUSES = {"in-progress", "dev-complete", "reviewing", "review-passed", "review-failed"}
 TERMINAL_MANIFEST = ("cancelled", "completed", "completed-with-findings")
 MAX_FILE_BYTES = 2_000_000
 MAX_TASK_FILES = 200
@@ -399,11 +400,13 @@ def read_runtime_state(project_root: Path, task_id: str, *, task_validator=None)
         terminate, why = read_json_schema(checked_path(entry, "terminate.json"), {TERMINATE_SCHEMA})
         if terminate is None and why != "missing":
             degraded.append(f"{folder}/terminate.json:{why}")
-        tasks = []
+        task_records = []
+        task_files_complete = True
         try:
             children = sorted(entry.glob("task-*.json"))
         except OSError:
             children = []
+            task_files_complete = False
         if len(children) > MAX_TASK_FILES:
             degraded.append(f"{folder}/tasks:limit")
             children = children[:MAX_TASK_FILES]
@@ -415,14 +418,19 @@ def read_runtime_state(project_root: Path, task_id: str, *, task_validator=None)
                 if why is None and not task_validator(task):
                     task, why = None, "invalid-task"
             if task is None:
+                task_files_complete = False
                 if why != "missing":
                     degraded.append(f"{folder}/{child.name}:{why}")
                 continue
-            tasks.append(task)
+            task_records.append((task, child.name))
+        task_records.sort(key=lambda item: item[0].get("seq") or 0)
         roles[folder] = {
             "ready": ready,
             "terminate": terminate,
-            "tasks": sorted(tasks, key=lambda t: t.get("seq") or 0),
+            "tasks": [task for task, _name in task_records],
+            # Private read provenance: a missing read cannot prove no execution,
+            # and task contents alone cannot prove the filename/sequence binding.
+            "_task_file_names": [name for _task, name in task_records] if task_files_complete else None,
         }
 
     listener_fresh = None
@@ -705,6 +713,36 @@ def task_identity(folder, task):
             "source_ref": source, "ref_task": parent}
 
 
+def _execution_state(state):
+    """Project startup from complete, bound task evidence, independently of handoffs."""
+    declared = (state.get("manifest") or {}).get("roles")
+    if (state.get("degraded") or state.get("_inconsistent")
+            or not isinstance(declared, list) or not declared
+            or any(not isinstance(folder, str) or not ROLE_FOLDER_RE.fullmatch(folder) for folder in declared)
+            or len(set(declared)) != len(declared)
+            or not set(declared).issubset(state["roles"])):
+        return "unknown"
+    started = False
+    total = 0
+    for folder in declared:
+        if folder.rsplit("-", 1)[0] not in MEMBER_ROLES:
+            continue  # Manager/workflow activity is not concrete task execution.
+        role = state["roles"][folder]
+        tasks, filenames = role["tasks"], role.get("_task_file_names")
+        if not isinstance(filenames, list) or len(filenames) != len(tasks):
+            return "unknown"
+        total += len(tasks)
+        if total > MAX_TASK_FILES:
+            return "unknown"
+        for task, filename in zip(tasks, filenames):
+            identity = task_identity(folder, task)
+            if identity is None or filename != identity["source_ref"].split("/", 1)[1]:
+                return "unknown"
+            if task["status"] in STARTED_TASK_STATUSES:
+                started = True
+    return "started" if started else "not-started"
+
+
 def handoff_fact(kind, sender, recipient, source, target):
     signature = f"{kind}|{sender}|{recipient}|{source}|{target}"
     identity = f"{_fnv64(signature)}{_fnv64(f'handoff:{signature}')}"
@@ -882,6 +920,7 @@ def build_snapshot(state: dict, producer_id: str, seq: int, sampled_at: int) -> 
         "quality": quality,
         "quality_detail": quality_detail,
         "terminal": terminal,
+        "execution_state": _execution_state(state),
         "members": members,
     }
     snapshot.update(_interaction_fields(state, members))
@@ -1034,6 +1073,8 @@ def validate_snapshot(snapshot: dict) -> dict:
             invalid("snapshot member current_task is invalid")
         if "handoff_pending" in member and member["handoff_pending"] not in (None, "missing", "conflict", "not-ready", "incomplete"):
             invalid("snapshot member handoff_pending is invalid")
+    if "execution_state" in snapshot and snapshot["execution_state"] not in ("not-started", "started", "unknown"):
+        invalid("snapshot execution_state is invalid")
     if "assignment_state" in snapshot and snapshot["assignment_state"] not in ("unassigned", "assigned", "unknown"):
         invalid("snapshot assignment_state is invalid")
     if "handoff_state" in snapshot and snapshot["handoff_state"] not in ("complete", "unavailable"):
@@ -1088,6 +1129,7 @@ def read_snapshot(project_root: Path, task_id: str, *, now=None) -> dict:
         "terminal": raw.get("terminal"), "sampled_at": raw["sampled_at"],
         "producer_id": raw["producer"], "producer_seq": raw["seq"],
         "accepted_at": sampled_at, "members": raw["members"],
+        "execution_state": raw["execution_state"],
         "assignment_state": raw["assignment_state"], "handoff_state": raw["handoff_state"], "handoffs": raw["handoffs"],
     }
     if len(json.dumps(snapshot, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")) > MAX_SNAPSHOT_BYTES:

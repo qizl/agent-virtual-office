@@ -79,6 +79,20 @@ describe('createPersistedState', () => {
 
     expect({ ...persistedA, _savedAt: 0 }).toEqual({ ...persistedB, _savedAt: 0 })
   })
+
+  it('excludes MAW runtime members and their moving positions while retaining static office state', () => {
+    const staticAgent = { behavior: 'idle', expression: 'normal', position: { x: 30, y: 40 }, facing: 'down' }
+    const state = { agents: {
+      qa: staticAgent,
+      'member1~executor': { ...staticAgent, mawMember: true, position: { x: 600, y: 200 } },
+    } }
+    const before = createPersistedState(state)
+    const after = createPersistedState({ ...state, agents: { ...state.agents,
+      'member1~executor': { ...state.agents['member1~executor'], position: { x: 200, y: 300 }, inGroupEvent: true },
+    } })
+    expect(before.agents).toEqual({ qa: staticAgent })
+    expect(persistedSnapshotKey(after)).toEqual(persistedSnapshotKey(before))
+  })
 })
 
 describe('validatePersistedAgent — deskItemCount sanitization (R63)', () => {

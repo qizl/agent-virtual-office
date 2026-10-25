@@ -90,6 +90,24 @@ describe('MAW snapshot transport', () => {
     expect(body.server_epoch).toBe(ack.server_epoch)
   })
 
+  it('retains execution facts, validates their enum and binds them to producer idempotency', async () => {
+    const { base } = await makeChannel()
+    const first = snapshot({ execution_state: 'not-started' })
+    const post = (data) => fetch(`${base}/api/maw/status`, { method: 'POST', body: JSON.stringify(data) })
+    expect((await post(first)).status).toBe(200)
+    expect((await (await fetch(`${base}/api/maw/status`)).json()).snapshot.execution_state).toBe('not-started')
+    const conflict = await post({ ...first, execution_state: 'started' })
+    expect(conflict.status).toBe(409)
+    expect((await conflict.json()).error.code).toBe('sequence-content-conflict')
+    for (const execution_state of ['assigned', null, true, 1, {}, []]) {
+      expect((await post({ ...first, seq: 2, execution_state })).status).toBe(400)
+    }
+    for (const [seq, execution_state] of [[2, 'started'], [3, 'unknown']]) {
+      expect((await post({ ...first, seq, execution_state })).status).toBe(200)
+      expect((await (await fetch(`${base}/api/maw/status`)).json()).snapshot.execution_state).toBe(execution_state)
+    }
+  })
+
   it('validates and retains exact task identities and handoff edges', async () => {
     const { base } = await makeChannel()
     const executorTask = { seq: 1, round: 1, type: 'dev', source_ref: 'executor-1/task-001.json', ref_task: null }

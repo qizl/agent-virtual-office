@@ -60,7 +60,8 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
   let reportedFailure = null
   let recovery = 0
   let initialized = false
-  let observedUnassigned = false
+  let hydration = 0
+  let entryDecided = false
   let opening = 0
   let choreographyCleanup = startMawChoreography(store, { resumeCurrent: true })
   let historyToggleVersion = store.getState().dashboardHistoryToggle
@@ -109,7 +110,6 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     if (torn) return
     if (['error', 'missing', 'stale'].includes(state)) {
       needsRecovery = true
-      observedUnassigned = false
     }
     if (['error', 'missing', 'configuration-error', 'stale'].includes(state) && code && code !== reportedFailure) {
       console.warn('[Dashboard] synchronization:', code)
@@ -145,13 +145,22 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     const snapshot = envelope.snapshot
     const hasMembers = snapshot?.members?.length > 0
     const complete = hasMembers && snapshot.quality === 'ok'
-    const firstAssignment = initialized && !recovering && complete
-      && observedUnassigned && snapshot.assignment_state === 'assigned'
-    if (firstAssignment) opening += 1
+    // The first determinate runtime observation owns this mount's entry choice.
+    // Unknown/legacy observations may establish a current-state baseline, but
+    // assignment transitions and later start facts never replay an opening.
+    let startsOpening = false
+    if (!entryDecided && hasMembers) {
+      if (snapshot.terminal != null || snapshot.execution_state === 'started') entryDecided = true
+      else if (complete && snapshot.execution_state === 'not-started') {
+        entryDecided = true
+        startsOpening = true
+        opening += 1
+      }
+    }
+    if (hasMembers && !initialized && !startsOpening) hydration += 1
     if (hasMembers) initialized = true
-    observedUnassigned = complete && snapshot.assignment_state === 'unassigned'
     store.getState().applyMawSnapshot({ ...envelope, dashboard_recovery: recovery,
-      dashboard_hydration: initialized ? 1 : 0, dashboard_opening: opening })
+      dashboard_hydration: hydration, dashboard_opening: opening })
     isStale = envelope.snapshot?.quality === 'stale'
     if (isStale) store.getState().freezeMawSnapshot(envelope.snapshot.quality_detail || 'source-stale')
     armStaleTimer()

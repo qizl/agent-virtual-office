@@ -154,13 +154,13 @@ export function createPersistedState(state) {
     dailyBlockedLedger: ensureCurrentDailyBlockedLedger(state.dailyBlockedLedger),
   }
   for (const [id, a] of Object.entries(state.agents)) {
-    // Skip session-carrying dynamic worktree agents ('slug~role'). They are
+    // Skip observed MAW members and session-carrying worktree agents. They are
     // ephemeral — created per-session by applyExternalStatus, not present in
     // the static roster, and never restored by initAgents. Persisting them
     // bloats the localStorage snapshot and leaves orphaned entries after short
     // sessions end. The discriminator mirrors applyExternalStatus: a non-null
     // `session` field is ONLY ever set by the dynamic-creation branch.
-    if (a.session) continue
+    if (a.session || a.mawMember) continue
     data.agents[id] = {
       // Don't persist status — it's transient, driven only by external hooks
       behavior: a.behavior,
@@ -650,13 +650,14 @@ function applyMawSnapshotImpl(s, envelope) {
     dashboard_hydration: envelope.dashboard_hydration ?? 0,
     dashboard_opening: envelope.dashboard_opening ?? 0,
     assignment_state: snapshot?.assignment_state ?? 'unknown',
+    execution_state: snapshot?.execution_state ?? 'unknown',
     handoff_state: snapshot?.handoff_state ?? null,
     handoffs: snapshot?.handoffs ?? [],
   }
   const agents = historical ? {} : { ...s.agents }
   const desired = new Map()
-  // Dashboard entry observes current facts. Only an explicitly observed first
-  // assignment starts an opening; standalone snapshots retain their entrance.
+  // Dashboard entry needs a determinate pre-start observation. Standalone
+  // snapshots retain their existing default-seat entrance.
   const opening = starting || (!historical && s.integration !== 'dashboard'
     && !Object.values(agents).some((a) => a?.mawMember))
   const openingTaken = new Set()
