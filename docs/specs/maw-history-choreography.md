@@ -29,6 +29,7 @@ Live snapshots may include `execution_state=not-started|started|unknown`, indepe
 
 On the first determinate nonterminal Dashboard observation, not-started opens every member from their default meeting-room seat to their stable work post, including the manager at the gate, with 600 ms launch spacing. A first started observation hydrates current-state posts and baselines prior handoffs. Unknown, empty, damaged or failed observations never trigger an opening or consume its determinate decision. An opening already in progress finishes its continuous routes when execution starts; it is not restarted or replaced by instant positioning. Each mounted task decides once; re-entry before execution opens again, while re-entry after execution hydrates. No task state, member position or entry-completion marker is persisted in browser storage. Historical playback and standalone opening remain compatible.
 
+During a live nonterminal workflow, CR-6 keeps the existing 90-second eligibility threshold and checks one global activity decision every 15 seconds. A random draw strictly below 0.10 permits choosing at most one eligible member; all other draws launch nobody. Failed draws and empty candidate sets consume the opportunity, so the five-second audit tick cannot retry early. Team size does not multiply the probability. Preserve existing eligibility exclusions, dwell, return paths and counter-reset timing. CR-8 terminal roaming bypasses this probability gate; historical routes never use the live random scheduler.
 
 ## 4. Controls And Lifecycle
 
@@ -47,6 +48,7 @@ On the first determinate nonterminal Dashboard observation, not-started opens ev
 - Focused and full AVO/Python/Dashboard tests, browser playback/geometry and guarded committed-source packaging provide real evidence. Formal quality and review blockers remain explicit.
 - Cover exact-member handoffs with multiple executors/reviewers, delayed review assignment, rework/failure, missing/conflicting references, unavailable recipients and repeated polling. Verify conversation facing and continuous approach/return.
 - Verify no-task and initialized-only entry launches every member with stable posts and staggered continuous routes; execution already started, refresh and reconnect hydrate directly. Starting execution during entry must preserve the current routes. Unknown observations cannot launch or consume the determinate entry decision; task changes cancel prior work. MAW task/member state must be absent from browser persistence.
+- Cover probability boundaries below and at 0.10, consumed failed/empty rounds, no retry at five/ten seconds, and the next opportunity at 15 seconds. Multiple eligible members still yield one global draw and at most one departure. Manager/interaction exclusions, return paths and CR-8 remain intact. Pause and seek during historical travel, conversation and return must sample the same timeline without revealing later facts.
 
 ## 6. Rollback
 

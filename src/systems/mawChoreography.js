@@ -37,6 +37,7 @@ const HANDOVER_DWELL_MS = 3000
 // keeps the queue moving, so launches overlap instead of serializing.
 export const STAGGER_MS = 600
 const WANDER_INTERVAL_MS = 15_000
+const WANDER_CHANCE = 0.10
 const LONG_WORK_MS = 90_000 // a member on the same work/rest stretch this long may take a walk
 const ARRIVAL_POLL_MS = 400
 const ARRIVE_TIMEOUT_MS = 20_000
@@ -376,7 +377,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
   let managerBusy = false
   const workingSince = new Map() // memberId -> start of the current working stretch
   const restingSince = new Map() // memberId -> start of the current resting stretch
-  let lastWanderAt = 0
+  let lastWanderDecisionAt = 0
   const walkTokens = new Map() // agentId -> latest walk token — a superseding walk invalidates the old chain
   const walkBounds = new Map() // agentId -> the zone bound of its CURRENT walk — timeout re-issues must keep it
   const seatTargets = new Map() // agentId -> published target of its last SEAT walk (desk/gate) — the CR-3 audit's compliance spot
@@ -867,7 +868,14 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
           arriveThen(agent.id, 0, () => restorePresentation(agent.id))
         }
       }
-      if (!freeRoam && Date.now() - lastWanderAt < WANDER_INTERVAL_MS) return
+      if (!freeRoam) {
+        const now = Date.now()
+        if (now - lastWanderDecisionAt < WANDER_INTERVAL_MS) return
+        // One team-wide chance per decision, including misses and empty rounds.
+        // Only the selected member/point is random after the 10% gate succeeds.
+        lastWanderDecisionAt = now
+        if (Math.random() >= WANDER_CHANCE) return
+      }
       const candidates = wanderCandidates({
         members: Object.values(s.agents).filter((a) => a?.mawMember && !handoffParticipants.has(a.id) && !openingMembers.has(a.id)),
         workingSince,
@@ -875,7 +883,6 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
         freeRoam,
       })
       if (candidates.length === 0) return
-      lastWanderAt = Date.now()
       const agent = candidates[Math.floor(Math.random() * candidates.length)]
       const point = wanderPoint()
       if (!point) return

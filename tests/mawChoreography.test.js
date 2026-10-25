@@ -277,7 +277,9 @@ describe('startMawChoreography (controller)', () => {
     const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.1) // deterministic pick + 8.8s dwell
     try {
       store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'working')]))
-      vi.advanceTimersByTime(95_000) // past LONG_WORK_MS, through 5s wander ticks
+      vi.advanceTimersByTime(94_999)
+      randomSpy.mockReturnValueOnce(0.01) // the next team-wide 10% decision succeeds
+      vi.advanceTimersByTime(1)
       const walking = store.getState().agents['exe01~executor']
       expect(walking.inGroupEvent).toBe(true) // wander walk started (no ReferenceError)
       expect(violatesMemberZone(walking.groupTarget)).toBe(false)
@@ -294,6 +296,75 @@ describe('startMawChoreography (controller)', () => {
       // not in the meeting room (review P2: zoneBound 'meeting' regression)
       const desk = workSeatFor('executor', 0)
       expect(Math.hypot(back.position.x - desk.x, back.position.y - desk.y)).toBeLessThan(60)
+    } finally {
+      randomSpy.mockRestore()
+      cleanup()
+    }
+  })
+
+  it('CR-6 misses consume the whole 15-second decision and the 10% boundary is exclusive', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.10)
+    try {
+      store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor')]))
+      vi.advanceTimersByTime(94_999)
+      randomSpy.mockClear()
+      vi.advanceTimersByTime(1)
+      expect(randomSpy).toHaveBeenCalledTimes(1)
+      expect(store.getState().agents['exe01~executor'].inGroupEvent).toBe(false)
+      vi.advanceTimersByTime(10_000)
+      expect(randomSpy).toHaveBeenCalledTimes(1) // no 5s/10s retry after a miss
+      vi.advanceTimersByTime(5_000)
+      expect(randomSpy).toHaveBeenCalledTimes(2)
+      expect(store.getState().agents['exe01~executor'].inGroupEvent).toBe(false)
+      randomSpy.mockReturnValue(0.099)
+      vi.advanceTimersByTime(15_000)
+      expect(store.getState().agents['exe01~executor'].inGroupEvent).toBe(true)
+    } finally {
+      randomSpy.mockRestore()
+      cleanup()
+    }
+  })
+
+  it('CR-6 preserves the 90-second threshold and chooses at most one member per successful team decision', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    installWalker(store)
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.099)
+    try {
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('exe01', 'executor'), mawMember('exe02', 'executor'),
+        mawMember('rev01', 'reviewer'), mawMember('mgr01', 'manager'),
+      ]))
+      vi.advanceTimersByTime(89_999)
+      expect(Object.values(store.getState().agents).filter((a) => a.inGroupEvent)).toHaveLength(0)
+      vi.advanceTimersByTime(5_001)
+      const walking = Object.values(store.getState().agents).filter((a) => a.inGroupEvent)
+      expect(walking).toHaveLength(1)
+      expect(walking[0].maw.role).not.toBe('manager')
+      vi.advanceTimersByTime(10_000)
+      expect(Object.values(store.getState().agents).filter((a) => a.inGroupEvent).length).toBeLessThanOrEqual(1)
+    } finally {
+      randomSpy.mockRestore()
+      cleanup()
+    }
+  })
+
+  it('CR-6 empty candidate rounds consume their decision slot too', () => {
+    const store = useOfficeStore
+    const cleanup = startMawChoreography(store)
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0)
+    try {
+      store.getState().applyMawSnapshot(envelope([]))
+      vi.advanceTimersByTime(5_000)
+      expect(randomSpy).toHaveBeenCalledTimes(1)
+      vi.advanceTimersByTime(10_000)
+      expect(randomSpy).toHaveBeenCalledTimes(1)
+      vi.advanceTimersByTime(5_000)
+      expect(randomSpy).toHaveBeenCalledTimes(2)
+      expect(store.getState().agents).toEqual({})
     } finally {
       randomSpy.mockRestore()
       cleanup()
@@ -614,7 +685,7 @@ describe('startMawChoreography (controller)', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
     installWalker(store)
-    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0) // deterministic pick + dwell
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.99) // CR-8 bypasses the 10% gate
     try {
       store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'done')]))
       useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, terminal: { status: 'completed' } } })
@@ -879,7 +950,9 @@ describe('startMawChoreography (controller)', () => {
     const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.99) // pick last rect, late dwell
     try {
       store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'working')]))
-      vi.advanceTimersByTime(95_000) // wander break starts
+      vi.advanceTimersByTime(94_999)
+      randomSpy.mockReturnValueOnce(0.01) // allow a break, retaining the research target and long dwell
+      vi.advanceTimersByTime(1)
       const walking = store.getState().agents['exe01~executor']
       expect(walking.inGroupEvent).toBe(true)
       vi.advanceTimersByTime(8_000) // mid-break: the whole break is choreography-owned (locked)
@@ -972,7 +1045,9 @@ describe('startMawChoreography (controller)', () => {
     const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.99) // wander into the last rest rect (research)
     try {
       store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'working')]))
-      vi.advanceTimersByTime(95_000) // wander break starts
+      vi.advanceTimersByTime(94_999)
+      randomSpy.mockReturnValueOnce(0.01) // allow a break, retaining the research target
+      vi.advanceTimersByTime(1)
       vi.advanceTimersByTime(8_000) // mid-dwell, standing in a rest area
       const research = ZONE_FLOOR_RECTS.research
       const stranded = store.getState().agents['exe01~executor']
