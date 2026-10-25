@@ -13,6 +13,42 @@ from fixtures import maw_office, member_by_role
 
 
 class ProjectionTest(unittest.TestCase):
+    def test_valid_long_workflow_display_is_bounded_without_changing_identities(self):
+        for title in ("Detailed delivery workflow " + "x" * 93, "😀" * 120):
+            with self.subTest(title_units=len(title.encode("utf-16-le")) // 2):
+                root = fixtures.build_runtime(fixtures.uuid_tmp(), executor_tasks=[fixtures.task(1)])
+                path = root / fixtures.RUNTIME_REL / "maw-synth-001" / "workflow.json"
+                workflow = json.loads(path.read_text())
+                long_node = "review-" + ("current-delivery-" * 5).rstrip("-")
+                workflow["selection"]["title"] = title
+                workflow["definition"]["nodes"] = [{"id": long_node, "type": "development-group", "depends_on": []}]
+                workflow["nodes"] = {long_node: {"status": "pending"}}
+                fixtures.write(path, workflow)
+                original = json.loads(path.read_text())
+                snapshot = maw_office.projection.read_snapshot(root, "maw-synth-001", now=1000)
+                self.assertLessEqual(len(snapshot["workflow"].encode("utf-16-le")) // 2, 200)
+                self.assertTrue(snapshot["workflow"].startswith("MAW "))
+                self.assertFalse(any(0xD800 <= ord(char) <= 0xDFFF for char in snapshot["workflow"]))
+                self.assertEqual(json.loads(path.read_text()), original)
+                self.assertEqual(member_by_role(snapshot["members"], "executor")["current_task"]["source_ref"],
+                                 "executor-1/task-001.json")
+                self.assertRegex(member_by_role(snapshot["members"], "executor")["id"], r"^[A-Za-z0-9_-]{12}$")
+
+    def test_producer_workflow_budget_does_not_weaken_snapshot_validator(self):
+        root = fixtures.build_runtime(fixtures.uuid_tmp())
+        snapshot = maw_office.projection.read_snapshot(root, "maw-synth-001", now=1000)
+        snapshot["workflow"] = "😀" * 101
+        with self.assertRaises(maw_office.BridgeError) as error:
+            maw_office.projection.validate_snapshot(snapshot)
+        self.assertEqual(error.exception.code, "invalid-snapshot")
+
+    def test_display_budget_preserves_exact_boundary_and_unicode_characters(self):
+        display = maw_office.projection._display_text
+        for original in ("Short workflow", "x" * 200, "x" * 198 + "😀"):
+            self.assertEqual(display(original), original)
+        self.assertEqual(display("x" * 199 + "😀"), "x" * 199)
+        self.assertEqual(display("😀" * 101), "😀" * 100)
+
     def test_cancelled_overrides_running_finish_required_and_pass(self):
         """F8 combination: manifest cancelled while evaluate is running with
         finish-required and the review already passed — the office must show the

@@ -389,7 +389,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
   let lastSeenTerminal = false
   let lastRecovery = 0 // Dashboard-only observation baseline; standalone replay remains unchanged
   let lastHydration = 0
-  let lastOpening = 0
+  let lastOpening = resumeCurrent ? store.getState().mawMeta?.dashboard_opening ?? 0 : 0
   let prevPostDesk = null // null = not yet observed; true = the team stands by at desks (CR-11)
   let standbySweepSeq = 0 // latest standby sweep — older sweeps' callbacks void themselves
   const pendingRelocation = new Map() // agentId -> { workflowActive } — deferred relocations for mid-walk members
@@ -402,6 +402,19 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
   const handoffParticipants = new Map() // agentId -> event id; ordinary movement must yield
   let processingHandoffs = false
   let mutatingHandoff = false
+  let movementElapsed = 0
+  let movementStamp = Date.now()
+  let movementPaused = store.getState().isPaused
+
+  // Observe pause transitions synchronously, so even a partial arrival-poll
+  // interval is charged only for the time the office could actually move.
+  function movementTime() {
+    const now = Date.now()
+    if (!movementPaused) movementElapsed += now - movementStamp
+    movementStamp = now
+    movementPaused = store.getState().isPaused
+    return movementElapsed
+  }
 
   function later(fn, ms) {
     if (torn) return
@@ -484,11 +497,14 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
     let reissues = 0
     const awaitWalk = () => {
       const token = walkTokens.get(agentId)
-      const startedAt = Date.now()
+      const startedAt = movementTime()
       const poll = () => {
         if (torn || choreoEpoch !== epoch || walkTokens.get(agentId) !== token) return // superseded — the new walk owns the chain
-        const current = store.getState().agents[agentId]
+        const state = store.getState()
+        const current = state.agents[agentId]
         if (!current || !current.inGroupEvent || !current.groupTarget) return // released elsewhere
+        // A paused journey keeps both its route and retry budget until movement resumes.
+        if (state.isPaused) return later(poll, ARRIVAL_POLL_MS)
         if (arrivedAt(current)) {
           const settledToken = token
           return later(() => {
@@ -496,7 +512,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
             fn()
           }, afterMs)
         }
-        if (Date.now() - startedAt >= ARRIVE_TIMEOUT_MS) {
+        if (movementTime() - startedAt >= ARRIVE_TIMEOUT_MS) {
           if (reissues >= ARRIVE_MAX_REISSUES) {
             restorePresentation(agentId)
             onCancel?.()
@@ -927,6 +943,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
     try { dispatch() } finally { dispatching = false }
   }
   const unsubscribe = store.subscribe(() => {
+    movementTime()
     if (torn || dispatching || mutatingHandoff) return
     dispatching = true
     try {

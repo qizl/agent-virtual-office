@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import characters from '../config/characters.json'
 import officeExperience from '../config/officeExperience.json'
 import { sanitizeObservedActivity } from '../utils/statusContract.mjs'
-import { HOME_POSITIONS, OVERFLOW_POSITIONS, OVERFLOW_SLOT_BY_XY, clampToFloor, avoidOverlap, visuallyOverlapping } from './movementSystem.js'
+import { HOME_POSITIONS, OVERFLOW_POSITIONS, OVERFLOW_SLOT_BY_XY, ZONE_FLOOR_RECTS, clampToFloor, isOnFloor, isOnObstacle, avoidOverlap, visuallyOverlapping } from './movementSystem.js'
 import { randomBubble, setNameResolver, behaviorLabel, t as i18nT } from '../i18n'
 import { generateContextBubble } from './contextBubble'
 import { rng } from './rng.js'
@@ -588,6 +588,37 @@ function mawExpression(member) {
   return 'normal'
 }
 
+// Direct hydration bypasses the movement system, so its nominal seat pool must
+// satisfy the same furniture and visual-clearance rules as a walk destination.
+function mawSeatIsClear(seat, occupied, rect) {
+  return seat && seat.x >= Math.max(24, rect.x1) && seat.x <= Math.min(778, rect.x2)
+    && seat.y >= Math.max(64, rect.y1) && seat.y <= Math.min(500, rect.y2)
+    && isOnFloor(seat.x, seat.y) && !isOnObstacle(seat.x, seat.y)
+    && !occupied.some((other) => visuallyOverlapping(seat, other))
+}
+
+function freeMawSeat(preferred, occupied, rect) {
+  const clamped = clampToVisible(clampToFloor(preferred))
+  if (mawSeatIsClear(clamped, occupied, rect)) return clamped
+  // Deterministic nearest free floor point; unlike avoidOverlap's random escape,
+  // this assignment remains reproducible and is stamped for later choreography.
+  let nearest = null
+  let distance = Infinity
+  for (let y = Math.max(64, rect.y1 + 2); y <= rect.y2 - 2; y += 8) {
+    for (let x = rect.x1 + 2; x <= rect.x2 - 2; x += 8) {
+      const point = { x, y }
+      const squared = (x - preferred.x) ** 2 + (y - preferred.y) ** 2
+      if (squared < distance && mawSeatIsClear(point, occupied, rect)) {
+        nearest = point
+        distance = squared
+      }
+    }
+  }
+  // The meeting room can exhaust visual-clearance space before the member cap.
+  // Preserve every recorded member on safe floor rather than emit a null seat.
+  return nearest ?? clamped
+}
+
 function buildMawMember(member, seat, stale = false) {
   const style = MAW_ROSTER_BY_ID.get(member.role) || {}
   const agentId = `${member.id}~${member.role}`
@@ -662,8 +693,16 @@ function applyMawSnapshotImpl(s, envelope) {
     && !Object.values(agents).some((a) => a?.mawMember))
   const openingTaken = new Set()
   const incomingIds = new Set((snapshot?.members || []).map((member) => `${member.id}~${member.role}`))
-  const occupied = new Set(Object.values(agents).filter((a) => a?.mawMember && a.maw?.workSeat && incomingIds.has(a.id))
-    .map((a) => `${a.maw.workSeat.x},${a.maw.workSeat.y}`))
+  const occupied = []
+  const workBindings = new Map()
+  for (const agent of Object.values(agents)) {
+    if (!agent?.mawMember || !incomingIds.has(agent.id)) continue
+    const rect = agent.maw?.role === 'manager' ? ZONE_FLOOR_RECTS.entrance : ZONE_FLOOR_RECTS.mainOffice
+    if (!mawSeatIsClear(agent.maw?.workSeat, occupied, rect)) continue
+    workBindings.set(agent.id, agent.maw.workSeat)
+    occupied.push(agent.maw.workSeat)
+  }
+  const restingOccupied = []
   if (snapshot && Array.isArray(snapshot.members)) {
     for (const member of snapshot.members) {
       if (!member || typeof member.id !== 'string' || !MAW_ROSTER_BY_ID.get(member.role)) continue
@@ -671,17 +710,18 @@ function applyMawSnapshotImpl(s, envelope) {
       // CR-10: the WORK seat is stamped separately from the spawn seat — the
       // opening spawns everyone at the meeting room, but the seat nameplate
       // must show at the member's ASSIGNED desk.
-      let workSeat = agents[agentId]?.maw?.workSeat
+      let workSeat = workBindings.get(agentId)
       if (!workSeat) {
+        const rect = member.role === 'manager' ? ZONE_FLOOR_RECTS.entrance : ZONE_FLOOR_RECTS.mainOffice
         for (let index = 0; index < 50; index += 1) {
-          const candidate = workSeatFor(member.role, index)
-          if (member.role === 'manager' || !occupied.has(`${candidate.x},${candidate.y}`)) {
+          const candidate = clampToVisible(clampToFloor(workSeatFor(member.role, index)))
+          if (mawSeatIsClear(candidate, occupied, rect)) {
             workSeat = candidate
             break
           }
         }
-        workSeat ??= workSeatFor(member.role, 49)
-        occupied.add(`${workSeat.x},${workSeat.y}`)
+        workSeat ??= freeMawSeat(workSeatFor(member.role, 0), occupied, rect)
+        occupied.push(workSeat)
       }
       let spawnSeat
       if (opening) {
@@ -690,7 +730,10 @@ function applyMawSnapshotImpl(s, envelope) {
         spawnSeat = assigned.seat
       } else if (phaseOf(member.status) === 'rest'
         && !(s.integration === 'dashboard' && !historical && snapshot.workflow && !snapshot.terminal)) {
-        spawnSeat = restSeatFor(agentId).seat
+        const assigned = restSeatFor(agentId, openingTaken)
+        openingTaken.add(assigned.index)
+        spawnSeat = freeMawSeat(assigned.seat, restingOccupied, ZONE_FLOOR_RECTS.meetingRoom)
+        restingOccupied.push(spawnSeat)
       } else {
         spawnSeat = workSeat
       }
@@ -706,7 +749,7 @@ function applyMawSnapshotImpl(s, envelope) {
     const built = buildMawMember(member, seat, stale)
     // CR-10: the assigned work seat is stamped ONCE and stays stable across
     // snapshots — PixelOffice renders the seat nameplate from it.
-    built.maw.workSeat = existing?.maw?.workSeat ?? { ...workSeat }
+    built.maw.workSeat = { ...workSeat }
     if (existing && !historical && !hydrating && !starting && !recovering) {
       // Preserve live motion state; refresh only the projected facts. While the
       // choreography owns a walk (inGroupEvent) its behavior/expression/bubble are

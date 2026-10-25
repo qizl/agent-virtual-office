@@ -446,6 +446,81 @@ describe('Dashboard fixed binding and lifecycle', () => {
   })
 
 
+  it.each(['approach', 'conversation'])('AVO-205 cancels a factual %s on transport rejection without erasing or replaying facts', async (stage) => {
+    const dev = { seq: 1, round: 1, type: 'dev', source_ref: 'executor-1/task-001.json', ref_task: null }
+    const review = { seq: 2, round: 1, type: 'review', source_ref: 'reviewer-1/task-002.json', ref_task: dev.source_ref }
+    const members = [
+      { id: 'disconnect-executor', role: 'executor', status: 'working', current_task: dev },
+      { id: 'disconnect-reviewer', role: 'reviewer', status: 'planning', current_task: review },
+    ]
+    const edge = { id: mawHandoffId('submission', members[0].id, members[1].id, dev.source_ref, review.source_ref),
+      kind: 'submission', sender_member_id: members[0].id, recipient_member_id: members[1].id,
+      source_task: dev.source_ref, target_task: review.source_ref }
+    const facts = { execution_state: 'started', handoff_state: 'complete', members, handoffs: [edge] }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(reply({ ok: true, data: envelope(1, { ...facts, handoffs: [] }) }))
+      .mockResolvedValueOnce(reply({ ok: true, data: envelope(2, facts) }))
+      .mockRejectedValue(new Error('offline'))
+    vi.stubGlobal('fetch', fetchMock)
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(Object.values(useOfficeStore.getState().agents).every((a) => a.inGroupEvent)).toBe(true)
+    if (stage === 'conversation') {
+      useOfficeStore.setState({ agents: Object.fromEntries(Object.entries(useOfficeStore.getState().agents)
+        .map(([id, agent]) => [id, { ...agent, position: { ...agent.groupTarget },
+          isMoving: false, journeyTarget: null }])) })
+      await vi.advanceTimersByTimeAsync(100)
+      expect(Object.values(useOfficeStore.getState().agents).every((a) => a.behavior === 'chat')).toBe(true)
+    }
+    const taskFacts = () => Object.values(useOfficeStore.getState().agents)
+      .map((a) => ({ id: a.id, status: a.status, current_task: a.maw.current_task }))
+    const originalFacts = taskFacts()
+    const releasedClaims = vi.spyOn(useOfficeStore.getState(), 'releaseAgentDoorClaims')
+    try {
+      await vi.advanceTimersByTimeAsync(stage === 'conversation' ? 1900 : 2000)
+      expect(useOfficeStore.getState().dashboardSync.state).toBe('error')
+      for (const agent of Object.values(useOfficeStore.getState().agents)) {
+        expect(agent).toMatchObject({ inGroupEvent: false, isMoving: false, groupTarget: null, journeyTarget: null })
+        expect(agent.behavior).not.toBe('chat')
+        expect(releasedClaims).toHaveBeenCalledWith(agent.id)
+      }
+      expect(taskFacts()).toEqual(originalFacts)
+      expect(useOfficeStore.getState().mawMeta).toMatchObject({ quality: 'ok', handoffs: [edge] })
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(taskFacts()).toEqual(originalFacts)
+      expect(Object.values(useOfficeStore.getState().agents).every((a) => !a.inGroupEvent && a.behavior !== 'chat')).toBe(true)
+
+      fetchMock.mockResolvedValue(reply({ ok: true, data: envelope(3, facts) }))
+      useOfficeStore.getState().requestDashboardSync()
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(useOfficeStore.getState().dashboardSync.state).toBe('synced')
+      expect(taskFacts()).toEqual(originalFacts)
+      expect(Object.values(useOfficeStore.getState().agents).every((a) => !a.inGroupEvent && a.behavior !== 'chat')).toBe(true)
+    } finally { releasedClaims.mockRestore() }
+  })
+
+  it('AVO-205 never replays an interrupted opening marker when the transport reconnects', async () => {
+    const members = [{ ...envelope().snapshot.members[0], status: 'idle', task_kind: null, round: null }]
+    const facts = { execution_state: 'not-started', members }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(reply({ ok: true, data: envelope(1, facts) }))
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValue(reply({ ok: true, data: envelope(2, facts) }))
+    vi.stubGlobal('fetch', fetchMock)
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(1)
+    expect(useOfficeStore.getState().agents['member1~executor'].inGroupEvent).toBe(true)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(useOfficeStore.getState().dashboardSync.state).toBe('error')
+    await vi.advanceTimersByTimeAsync(7000)
+    const current = useOfficeStore.getState()
+    expect(current.dashboardSync.state).toBe('synced')
+    expect(current.mawMeta.dashboard_opening).toBe(1)
+    expect(current.agents['member1~executor']).toMatchObject({ status: 'idle',
+      position: current.agents['member1~executor'].maw.workSeat, inGroupEvent: false, groupTarget: null })
+  })
+
   it.each([404, 410])('clears removed projects with the backend project-not-registered code (HTTP %s)', async (status) => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply({ ok: false, error: { code: 'project-not-registered' } }, status)))
     useOfficeStore.getState().applyMawSnapshot(envelope())

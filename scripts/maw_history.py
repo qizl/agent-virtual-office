@@ -425,8 +425,13 @@ def _task_ref(value):
     return normalized if len(normalized) <= MAX_TASK_REF_LENGTH else None
 
 
-def _neutral_frame(template):
+def _neutral_frame(template, *, registrations=None, revision=None):
     frame = copy.deepcopy(template)
+    if registrations is not None and revision is not None:
+        # A verified add-role transaction proves a membership boundary. Roles
+        # without such a record retain the legacy roster; never guess a date.
+        frame["members"] = [member for member in frame["members"]
+                            if registrations.get(member["id"], revision) <= revision]
     frame.update(terminal=None, workflow="MAW · 任务记录回顾", quality="ok", quality_detail=None,
                  assignment_state="unknown", handoff_state="complete", handoffs=[])
     for member in frame["members"]:
@@ -651,6 +656,11 @@ def read_history(project_root: Path, task_id: str, *, project: str, now=None) ->
         task_dir = projection.safe_resolve(Path(project_root), f"{projection.RUNTIME_REL}/{task_id}")
         operations, operation_fingerprint = _operation_records(state, task_dir, warnings)
         tasks = _task_records(state, task_dir, warnings)
+        registrations = {}
+        for revision, _identity, _op, action in operations:
+            if action["action"] == "add-role":
+                member_id = projection.member_identity(state, action["role"])
+                registrations.setdefault(member_id, revision)
         for _revision, _identity, _op, action in operations:
             if action["action"] in CLOSE and action["manifest"]["status"] != terminal:
                 conflict = True
@@ -673,18 +683,18 @@ def read_history(project_root: Path, task_id: str, *, project: str, now=None) ->
                           "source_refs": refs, "snapshot": current, "cue": cue})
 
         if not conflict:
-            for _revision, identity, op, action in operations:
+            for revision, identity, op, action in operations:
                 recorded_at = _recorded_time(op.get("created_at"))
                 refs = [f"context/operations/{identity}.json"]
                 predecessor = _delivery_predecessor(op, action, state, warnings)
                 if predecessor:
                     folder, task = predecessor
                     known_tasks[f"{folder}/task-{task['seq']:03d}"] = task
-                    frame = _neutral_frame(final_snapshot)
+                    frame = _neutral_frame(final_snapshot, registrations=registrations, revision=revision)
                     _task_fact(frame, state, folder, task)
                     append(identity + ":source-state", "task-transition", "评审派发事务中记录的交付状态",
                            recorded_at, refs, frame, _task_cue(frame, state, folder, task, known_tasks))
-                frame = _neutral_frame(final_snapshot)
+                frame = _neutral_frame(final_snapshot, registrations=registrations, revision=revision)
                 if action["action"] in PUBLICATIONS:
                     owner = action["role"] if action["action"] == "assign-dev" else action["owner"]
                     known_tasks[f"{owner}/task-{action['task']['seq']:03d}"] = action["task"]

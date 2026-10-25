@@ -110,6 +110,11 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     if (torn) return
     if (['error', 'missing', 'stale'].includes(state)) {
       needsRecovery = true
+      // A failed observation cannot keep an old factual interaction alive.
+      // Cleanup releases its participants and callbacks without changing task facts.
+      const stopChoreography = choreographyCleanup
+      choreographyCleanup = null
+      stopChoreography?.()
     }
     if (['error', 'missing', 'configuration-error', 'stale'].includes(state) && code && code !== reportedFailure) {
       console.warn('[Dashboard] synchronization:', code)
@@ -165,6 +170,9 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     }
     if (hasMembers && !startsOpening && (!initialized || baselinesStarted)) hydration += 1
     if (hasMembers) initialized = true
+    // Reconnect before applying the fresh baseline, so only a genuinely new
+    // first-entry marker may open; an interrupted old opening cannot replay.
+    choreographyCleanup ??= startMawChoreography(store, { resumeCurrent: true })
     store.getState().applyMawSnapshot({ ...envelope, dashboard_recovery: recovery,
       dashboard_hydration: hydration, dashboard_opening: opening })
     isStale = envelope.snapshot?.quality === 'stale'

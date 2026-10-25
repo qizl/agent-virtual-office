@@ -91,7 +91,98 @@ def review_publication(directory, *, before=None, after=None):
     return op
 
 
+def member_registration(directory, role="reviewer-2", revision=2):
+    manifest = json.loads((directory / "task.json").read_text())
+    manifest["roles"].append(role)
+    fixtures.write(directory / "task.json", manifest)
+    fixtures.write(directory / role / "ready.json", {"schema": "maw.ready/1", "status": "confirmed"})
+    workflow = json.loads((directory / "workflow.json").read_text())
+    workflow["revision"] = revision + 1
+    fixtures.write(directory / "workflow.json", workflow)
+    action = {"action": "add-role", "role": role, "manifest": manifest,
+              "workflow": workflow, "prompt": "synthetic member registration"}
+    suffix = "add" + history._canonical_digest({key: value for key, value in action.items() if key != "workflow"})[:10]
+    op = operation(directory, action, revision=revision, suffix=suffix)
+    op["writes"]["task.json"]["after"] = history._written_digest(manifest)
+    op["writes"]["workflow.json"]["after"] = history._written_digest(workflow)
+    op["writes"][f"{role}/prompt.md"] = {
+        "before": None, "after": "sha256:" + hashlib.sha256(action["prompt"].encode()).hexdigest()}
+    fixtures.write(directory / "context" / "operations" / f"{op['op_id']}.json", op)
+    return op
+
+
 class HistoryTest(unittest.TestCase):
+    def test_registered_member_is_absent_before_the_verified_add_role(self):
+        root, directory = runtime()
+        first = operation(directory, {"action": "complete-node", "node": "develop"}, revision=1)
+        added = member_registration(directory)
+        result = read(root)
+        early, joined, final = result["steps"]
+        late_id = history.projection.member_identity({"project_root": root, "task_id": TASK}, "reviewer-2")
+        self.assertEqual(early["id"], first["op_id"])
+        self.assertNotIn(late_id, {member["id"] for member in early["snapshot"]["members"]})
+        self.assertEqual(joined["id"], added["op_id"])
+        self.assertIn(late_id, {member["id"] for member in joined["snapshot"]["members"]})
+        self.assertEqual(joined["cue"]["actor_member_id"], late_id)
+        self.assertIn(late_id, {member["id"] for member in final["snapshot"]["members"]})
+        self.assertTrue(result["complete"])
+
+    def test_multiple_registered_members_obey_their_own_revision_boundaries(self):
+        root, directory = runtime()
+        operation(directory, {"action": "complete-node", "node": "develop"}, revision=1)
+        member_registration(directory, "reviewer-2", revision=2)
+        member_registration(directory, "executor-2", revision=3)
+        result = read(root)
+        ids = {role: history.projection.member_identity({"project_root": root, "task_id": TASK}, role)
+               for role in ("reviewer-2", "executor-2")}
+        rosters = [{member["id"] for member in step["snapshot"]["members"]} for step in result["steps"]]
+        self.assertFalse(set(ids.values()) & rosters[0])
+        self.assertIn(ids["reviewer-2"], rosters[1])
+        self.assertNotIn(ids["executor-2"], rosters[1])
+        self.assertTrue(set(ids.values()).issubset(rosters[2]))
+        for step in result["steps"]:
+            history._validate_frame(step["snapshot"])
+            history._validate_cue(step["cue"], step["snapshot"])
+
+    def test_legacy_roster_without_registration_records_keeps_compatibility(self):
+        root, directory = runtime()
+        workflow = json.loads((directory / "workflow.json").read_text())
+        workflow["revision"] = 2
+        fixtures.write(directory / "workflow.json", workflow)
+        operation(directory, {"action": "complete-node", "node": "develop"})
+        result = read(root)
+        self.assertEqual({member["id"] for member in result["steps"][0]["snapshot"]["members"]},
+                         {member["id"] for member in result["final_snapshot"]["members"]})
+        self.assertTrue(result["complete"])
+
+    def test_verified_registration_uses_revision_when_recorded_time_is_missing(self):
+        root, directory = runtime()
+        operation(directory, {"action": "complete-node", "node": "develop"}, revision=1)
+        added = member_registration(directory)
+        added["created_at"] = None
+        fixtures.write(directory / "context" / "operations" / f"{added['op_id']}.json", added)
+        result = read(root)
+        late_id = history.projection.member_identity({"project_root": root, "task_id": TASK}, "reviewer-2")
+        self.assertNotIn(late_id, {member["id"] for member in result["steps"][0]["snapshot"]["members"]})
+        self.assertIn(late_id, {member["id"] for member in result["steps"][1]["snapshot"]["members"]})
+        self.assertIsNone(result["steps"][1]["recorded_at"])
+        self.assertIn("recorded-time-unavailable", result["warnings"])
+
+    def test_invalid_registration_cannot_supply_a_boundary_or_claim_complete_history(self):
+        root, directory = runtime()
+        operation(directory, {"action": "complete-node", "node": "develop"}, revision=1)
+        added = member_registration(directory)
+        added["writes"]["reviewer-2/prompt.md"]["after"] = AFTER
+        fixtures.write(directory / "context" / "operations" / f"{added['op_id']}.json", added)
+        result = read(root)
+        self.assertFalse(result["complete"])
+        self.assertIn("operation-record-invalid", result["warnings"])
+        self.assertFalse(any(step["kind"] == "role-added" for step in result["steps"]))
+        # Without a valid registration boundary, keep the old neutral-roster
+        # compatibility instead of assigning a guessed join date.
+        self.assertEqual({member["id"] for member in result["steps"][0]["snapshot"]["members"]},
+                         {member["id"] for member in result["final_snapshot"]["members"]})
+
     def test_steps_have_safe_cues_and_reset_non_actor_facts(self):
         root, directory = runtime(executor_tasks=[fixtures.task(1, status="in-progress")])
         operation(directory, {"action": "complete-node", "node": "develop"})

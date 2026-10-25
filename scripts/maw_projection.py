@@ -857,6 +857,11 @@ def disable_interactions(snapshot):
         member["handoff_pending"] = "incomplete"
 
 
+def _display_text(value: str, maximum: int = 200) -> str:
+    """Budget composed display text in JS units without splitting a surrogate pair."""
+    return value.encode("utf-16-le")[:maximum * 2].decode("utf-16-le", errors="ignore")
+
+
 def build_snapshot(state: dict, producer_id: str, seq: int, sampled_at: int) -> dict | None:
     manifest = state.get("manifest")
     if manifest is None:
@@ -871,7 +876,7 @@ def build_snapshot(state: dict, producer_id: str, seq: int, sampled_at: int) -> 
         # Old schemas without a frozen definition: state it, never invent a graph.
         workflow_text = "MAW（未提供工作流定义）"
     else:
-        workflow_text = f"MAW {title} · {active[0] if active else '已收尾'}"
+        workflow_text = _display_text(f"MAW {title} · {active[0] if active else '已收尾'}")
     stall_cutoff = state.get("_stall_minutes", 30)
 
     members = []

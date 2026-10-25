@@ -1268,6 +1268,65 @@ describe('startMawChoreography (controller)', () => {
     }
   })
 
+  it('AVO-202 keeps a paused idle opening on its original route and resumes physical arrival', () => {
+    const store = useOfficeStore
+    store.setState({ integration: 'dashboard', isPaused: false })
+    const cleanup = startMawChoreography(store, { resumeCurrent: true })
+    try {
+      const first = envelope([mawMember('opening-idle', 'executor', 'idle')])
+      store.getState().applyMawSnapshot({ ...first, dashboard_opening: 1,
+        snapshot: { ...first.snapshot, execution_state: 'not-started' } })
+      vi.advanceTimersByTime(0)
+      const id = 'opening-idle~executor'
+      const entered = store.getState().agents[id]
+      const route = entered.groupTarget
+      expect(entered.inGroupEvent).toBe(true)
+      expect(route).toEqual(entered.maw.workSeat)
+      vi.advanceTimersByTime(10_000)
+      store.setState({ isPaused: true })
+      vi.advanceTimersByTime(85_000)
+      const paused = store.getState().agents[id]
+      expect(paused.inGroupEvent).toBe(true)
+      expect(paused.groupTarget).toBe(route)
+      expect(paused.position).toEqual(entered.position)
+
+      store.setState({ isPaused: false })
+      vi.advanceTimersByTime(5_000)
+      const resumed = store.getState().agents[id]
+      expect(resumed.inGroupEvent).toBe(true)
+      expect(resumed.groupTarget).toBe(route)
+      store.setState({ agents: { ...store.getState().agents,
+        [id]: { ...resumed, position: { ...route }, isMoving: false, journeyTarget: null } } })
+      vi.advanceTimersByTime(500) // 400ms physical-arrival poll plus its zero-delay completion
+      expect(store.getState().agents[id]).toMatchObject({ position: route,
+        status: 'idle', inGroupEvent: false, groupTarget: null })
+    } finally { cleanup() }
+  })
+
+  it('AVO-202 charges arrival retries only for active movement time', () => {
+    const store = useOfficeStore
+    store.setState({ integration: 'dashboard', isPaused: false })
+    const cleanup = startMawChoreography(store, { resumeCurrent: true })
+    try {
+      const first = envelope([mawMember('opening-budget', 'executor', 'idle')])
+      store.getState().applyMawSnapshot({ ...first, dashboard_opening: 1,
+        snapshot: { ...first.snapshot, execution_state: 'not-started' } })
+      vi.advanceTimersByTime(0)
+      const id = 'opening-budget~executor'
+      const route = store.getState().agents[id].groupTarget
+      vi.advanceTimersByTime(19_000)
+      store.setState({ isPaused: true })
+      vi.advanceTimersByTime(85_000)
+      store.setState({ isPaused: false })
+      vi.advanceTimersByTime(900)
+      expect(store.getState().agents[id].groupTarget).toBe(route)
+      vi.advanceTimersByTime(500) // the next 400ms poll observes the exhausted active budget
+      expect(store.getState().agents[id].groupTarget).toEqual(route)
+      expect(store.getState().agents[id].groupTarget).not.toBe(route)
+      expect(store.getState().agents[id].inGroupEvent).toBe(true)
+    } finally { cleanup() }
+  })
+
   it('the settle check follows the PUBLISHED walk target when avoidOverlap moves it', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
