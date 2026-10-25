@@ -11,11 +11,11 @@ const edge = {
   source_task: devTask.source_ref, target_task: reviewTask.source_ref,
 }
 
-function snapshot({ seq, sourceStatus = 'working', handoffs = [], handoffState = 'complete', reviewerStatus = 'planning' }) {
+function snapshot({ seq, sourceStatus = 'working', handoffs = [], handoffState = 'complete', reviewerStatus = 'planning', members }) {
   return {
     schema: 'avo.maw-snapshot/1', sampled_at: seq * 1000, workflow: 'develop', quality: 'ok', quality_detail: null,
     terminal: null, assignment_state: 'assigned', handoff_state: handoffState, handoffs,
-    members: [
+    members: members ?? [
       { id: 'executor-one', role: 'executor', status: sourceStatus, label: 'Executor One', detail: null, round: 1,
         task_kind: 'dev', verdict: null, terminate: null, stalled: false, current_task: devTask, handoff_pending: null },
       { id: 'reviewer-one', role: 'reviewer', status: reviewerStatus, label: 'Reviewer One', detail: null, round: 1,
@@ -24,6 +24,17 @@ function snapshot({ seq, sourceStatus = 'working', handoffs = [], handoffState =
         task_kind: null, verdict: null, terminate: null, stalled: false, current_task: null, handoff_pending: null },
     ],
   }
+}
+
+function extraMember(id, role, task, status = 'planning') {
+  return { id, role, status, label: id, detail: null, round: task.round,
+    task_kind: task.type, verdict: null, terminate: null, stalled: false, current_task: task, handoff_pending: null }
+}
+
+function submission(sender, recipient, source, target) {
+  return { id: mawHandoffId('submission', sender, recipient, source.source_ref, target.source_ref),
+    kind: 'submission', sender_member_id: sender, recipient_member_id: recipient,
+    source_task: source.source_ref, target_task: target.source_ref }
 }
 
 function apply(seq, options = {}) {
@@ -179,6 +190,82 @@ describe('live factual handoff choreography', () => {
     apply(2, { sourceStatus: 'awaiting-approval', handoffs: [edge] })
     expect(useOfficeStore.getState().agents['executor-one~executor'].inGroupEvent).toBe(false)
     expect(useOfficeStore.getState().agents['reviewer-one~reviewer'].inGroupEvent).toBe(false)
+    cleanup()
+  })
+
+  it('queues two handoffs sharing a sender until the first pair has returned', async () => {
+    const laterReview = { ...reviewTask, seq: 3, source_ref: 'reviewer-2/task-003.json' }
+    const nextEdge = submission('executor-one', 'reviewer-two', devTask, laterReview)
+    const members = [...snapshot({ seq: 1 }).members, extraMember('reviewer-two', 'reviewer', laterReview)]
+    apply(1, { members })
+    installWalker()
+    const cleanup = startMawChoreography(useOfficeStore, { resumeCurrent: true })
+    apply(2, { members })
+    apply(3, { members, handoffs: [edge, nextEdge] })
+
+    let agents = useOfficeStore.getState().agents
+    expect(agents['executor-one~executor'].inGroupEvent).toBe(true)
+    expect(agents['reviewer-one~reviewer'].inGroupEvent).toBe(true)
+    expect(agents['reviewer-two~reviewer'].inGroupEvent).toBe(false)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(useOfficeStore.getState().agents['reviewer-one~reviewer'].behavior).toBe('chat')
+    await vi.advanceTimersByTimeAsync(2200)
+    expect(useOfficeStore.getState().agents['reviewer-one~reviewer'].behavior).toBe('chat')
+    expect(useOfficeStore.getState().agents['reviewer-two~reviewer'].inGroupEvent).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(1600)
+    agents = useOfficeStore.getState().agents
+    expect(agents['reviewer-one~reviewer'].inGroupEvent).toBe(false)
+    expect(agents['executor-one~executor'].inGroupEvent).toBe(true)
+    expect(agents['reviewer-two~reviewer'].inGroupEvent).toBe(true)
+    expect(agents['executor-one~executor'].behavior).toBe('chat')
+    expect(agents['reviewer-two~reviewer'].behavior).toBe('chat')
+
+    await vi.advanceTimersByTimeAsync(5000)
+    apply(4, { members, handoffs: [edge, nextEdge] })
+    expect(Object.values(useOfficeStore.getState().agents).every((agent) => !agent.inGroupEvent)).toBe(true)
+    cleanup()
+  })
+
+  it('runs disjoint sender-recipient pairs in parallel instead of globally serializing them', async () => {
+    const secondDev = { ...devTask, seq: 3, source_ref: 'executor-2/task-003.json' }
+    const secondReview = { ...reviewTask, seq: 4, source_ref: 'reviewer-2/task-004.json', ref_task: secondDev.source_ref }
+    const secondEdge = submission('executor-two', 'reviewer-two', secondDev, secondReview)
+    const members = [...snapshot({ seq: 1 }).members,
+      extraMember('executor-two', 'executor', secondDev, 'working'), extraMember('reviewer-two', 'reviewer', secondReview)]
+    apply(1, { members })
+    installWalker()
+    const cleanup = startMawChoreography(useOfficeStore, { resumeCurrent: true })
+    apply(2, { members })
+    apply(3, { members, handoffs: [edge, secondEdge] })
+    const pairIds = ['executor-one~executor', 'reviewer-one~reviewer', 'executor-two~executor', 'reviewer-two~reviewer']
+    for (const id of pairIds) expect(useOfficeStore.getState().agents[id].inGroupEvent).toBe(true)
+    expect(useOfficeStore.getState().agents['manager-one~manager'].inGroupEvent).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(1000)
+    for (const id of pairIds) expect(useOfficeStore.getState().agents[id].behavior).toBe('chat')
+    await vi.advanceTimersByTimeAsync(4000)
+    for (const id of pairIds) expect(useOfficeStore.getState().agents[id].inGroupEvent).toBe(false)
+    cleanup()
+  })
+
+  it('waits for a late recipient and does not consume the event while that member is unavailable', async () => {
+    const base = snapshot({ seq: 1, sourceStatus: 'awaiting-approval' }).members
+    apply(1, { members: base.filter((member) => member.id !== 'reviewer-one') })
+    installWalker()
+    const cleanup = startMawChoreography(useOfficeStore, { resumeCurrent: true })
+    apply(2, { members: base.filter((member) => member.id !== 'reviewer-one') })
+    const unavailable = base.map((member) => member.id === 'reviewer-one' ? { ...member, terminate: 'initialized' } : member)
+    apply(3, { members: unavailable, handoffs: [edge] })
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(useOfficeStore.getState().agents['executor-one~executor'].inGroupEvent).toBe(false)
+    expect(useOfficeStore.getState().agents['reviewer-one~reviewer'].inGroupEvent).toBe(false)
+
+    apply(4, { members: base, handoffs: [edge] })
+    expect(useOfficeStore.getState().agents['executor-one~executor'].inGroupEvent).toBe(true)
+    expect(useOfficeStore.getState().agents['reviewer-one~reviewer'].inGroupEvent).toBe(true)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(useOfficeStore.getState().agents['reviewer-one~reviewer'].behavior).toBe('chat')
     cleanup()
   })
 })
