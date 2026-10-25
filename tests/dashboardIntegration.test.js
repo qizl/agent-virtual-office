@@ -122,6 +122,44 @@ describe('Dashboard fixed binding and lifecycle', () => {
     expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(0)
   })
 
+  it('baselines old handoffs on the first determinate started fact after an unknown observation', async () => {
+    const dev = { seq: 1, round: 1, type: 'dev', source_ref: 'executor-1/task-001.json', ref_task: null }
+    const review = { seq: 2, round: 1, type: 'review', source_ref: 'reviewer-1/task-002.json', ref_task: dev.source_ref }
+    const members = [
+      { id: 'executor-one', role: 'executor', status: 'awaiting-approval', current_task: dev },
+      { id: 'reviewer-one', role: 'reviewer', status: 'planning', current_task: review },
+    ]
+    const oldSubmission = { id: mawHandoffId('submission', members[0].id, members[1].id, dev.source_ref, review.source_ref),
+      kind: 'submission', sender_member_id: members[0].id, recipient_member_id: members[1].id,
+      source_task: dev.source_ref, target_task: review.source_ref }
+    const newResult = { id: mawHandoffId('review-result', members[1].id, members[0].id, review.source_ref, dev.source_ref),
+      kind: 'review-result', sender_member_id: members[1].id, recipient_member_id: members[0].id,
+      source_task: review.source_ref, target_task: dev.source_ref }
+    const started = { execution_state: 'started', handoff_state: 'complete', members, handoffs: [oldSubmission] }
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(reply({ ok: true, data: envelope(1, {
+        execution_state: 'unknown', handoff_state: 'unavailable', members, handoffs: [],
+      }) }))
+      .mockResolvedValueOnce(reply({ ok: true, data: envelope(2, started) }))
+      .mockResolvedValueOnce(reply({ ok: true, data: envelope(3, started) }))
+      .mockResolvedValue(reply({ ok: true, data: envelope(4, { ...started, handoffs: [oldSubmission, newResult] }) })))
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().mawMeta.dashboard_hydration).toBe(1)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(useOfficeStore.getState().mawMeta.dashboard_hydration).toBe(2)
+    for (const agent of Object.values(useOfficeStore.getState().agents)) {
+      expect(agent.position).toEqual(agent.maw.workSeat)
+      expect(agent.inGroupEvent).toBe(false)
+    }
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(useOfficeStore.getState().mawMeta.dashboard_hydration).toBe(2)
+    expect(Object.values(useOfficeStore.getState().agents).some((a) => a.inGroupEvent)).toBe(false)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(useOfficeStore.getState().mawMeta.dashboard_hydration).toBe(2)
+    expect(Object.values(useOfficeStore.getState().agents).every((a) => a.inGroupEvent)).toBe(true)
+  })
+
   it('opens every pre-start role to its work post once, preserving the route when startup arrives', async () => {
     const idle = { ...envelope().snapshot.members[0], status: 'idle', task_kind: null, round: null }
     const members = [{ ...idle, id: 'manager1', role: 'manager' }, idle,

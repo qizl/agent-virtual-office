@@ -149,15 +149,21 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     // Unknown/legacy observations may establish a current-state baseline, but
     // assignment transitions and later start facts never replay an opening.
     let startsOpening = false
+    let baselinesStarted = false
     if (!entryDecided && hasMembers) {
-      if (snapshot.terminal != null || snapshot.execution_state === 'started') entryDecided = true
+      if (snapshot.terminal != null || snapshot.execution_state === 'started') {
+        entryDecided = true
+        // An earlier unknown observation cannot baseline relationships that
+        // only become readable with this first determinate running state.
+        baselinesStarted = true
+      }
       else if (complete && snapshot.execution_state === 'not-started') {
         entryDecided = true
         startsOpening = true
         opening += 1
       }
     }
-    if (hasMembers && !initialized && !startsOpening) hydration += 1
+    if (hasMembers && !startsOpening && (!initialized || baselinesStarted)) hydration += 1
     if (hasMembers) initialized = true
     store.getState().applyMawSnapshot({ ...envelope, dashboard_recovery: recovery,
       dashboard_hydration: hydration, dashboard_opening: opening })
