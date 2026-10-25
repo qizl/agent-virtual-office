@@ -373,8 +373,8 @@ def _operation_records(state, task_dir, warnings):
         if (len(revisions) != current_revision - 1 or revisions[0] != 2 or revisions[-1] != current_revision
                 or any(right != left + 1 for left, right in zip(revisions, revisions[1:]))):
             _warning(warnings, "operation-history-incomplete")
-    token = (directory_before, tuple(names), limited, tuple(identities))
-    return sorted(records, key=lambda record: (record[0], record[1])), token
+    fingerprint = (directory_before, tuple(names), limited, tuple(identities))
+    return sorted(records, key=lambda record: (record[0], record[1])), fingerprint
 
 
 def _path_identity(path, *, directory):
@@ -390,7 +390,7 @@ def _path_identity(path, *, directory):
             info.st_mtime_ns, info.st_ctime_ns)
 
 
-def _operation_input_token(task_dir):
+def _operation_input_fingerprint(task_dir):
     """Re-read the same bounded operation set to detect replacement or mutation."""
     directory = projection.checked_path(task_dir, "context", "operations")
     directory_before = _path_identity(directory, directory=True)
@@ -649,7 +649,7 @@ def read_history(project_root: Path, task_id: str, *, project: str, now=None) ->
             _warning(warnings, "current-input-incomplete")
         terminal, conflict = _terminal(state)
         task_dir = projection.safe_resolve(Path(project_root), f"{projection.RUNTIME_REL}/{task_id}")
-        operations, operation_token = _operation_records(state, task_dir, warnings)
+        operations, operation_fingerprint = _operation_records(state, task_dir, warnings)
         tasks = _task_records(state, task_dir, warnings)
         for _revision, _identity, _op, action in operations:
             if action["action"] in CLOSE and action["manifest"]["status"] != terminal:
@@ -723,7 +723,7 @@ def read_history(project_root: Path, task_id: str, *, project: str, now=None) ->
         after = projection.read_with_consistency(Path(project_root), task_id, 30, task_validator=_task_shape)
         if after.get("_inconsistent") or _current_signature(after) != baseline:
             raise BridgeError("input-inconsistent", "task inputs changed during history observation", projection.EXIT_NO_DATA)
-        if _operation_input_token(task_dir) != operation_token:
+        if _operation_input_fingerprint(task_dir) != operation_fingerprint:
             raise BridgeError("input-inconsistent", "operation history changed during observation", projection.EXIT_NO_DATA)
         return result
     except BridgeError:
