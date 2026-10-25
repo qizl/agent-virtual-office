@@ -26,7 +26,9 @@
 //     and the store re-clamps final walk targets so avoidOverlap can never
 //     push a member back in.
 
-import { MEETING_CHAIRS, HOME_POSITIONS, ZONE_FLOOR_RECTS, clampToFloor } from './movementSystem.js'
+import { MEETING_CHAIRS, HOME_POSITIONS, ZONE_FLOOR_RECTS, clampToFloor, calcFacing } from './movementSystem.js'
+import { validateMawHandoff } from '../inference/dashboardSnapshot.js'
+import { handoffApproachPoint } from './mawHandoff.js'
 
 export const MANAGER_GATE = { x: 100, y: 80 }
 const HANDOVER_DWELL_MS = 3000
@@ -392,6 +394,12 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
   const pendingRelocation = new Map() // agentId -> { workflowActive } — deferred relocations for mid-walk members
   let pendingSeq = 0
   const pendingEnter = new Map() // agentId -> { seq, from } — rolled back if the generation dies pre-fire
+  const seenHandoffs = new Set()
+  const queuedHandoffs = new Map()
+  const activeHandoffs = new Map()
+  const handoffParticipants = new Map() // agentId -> event id; ordinary movement must yield
+  let processingHandoffs = false
+  let mutatingHandoff = false
 
   function later(fn, ms) {
     if (torn) return
@@ -431,7 +439,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
   }
 
   /** Release the walk lock and dress the member in their CURRENT status animation. */
-  function restorePresentation(agentId) {
+  function restorePresentation(agentId, bubble = undefined) {
     const s = store.getState()
     const a = s.agents[agentId]
     if (!a) return
@@ -439,7 +447,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
     s.clearAgentGroupEvent(agentId, {
       behavior: behaviorFor(pseudo),
       expression: a.status === 'done' ? 'happy' : a.status === 'blocked' ? 'confused' : 'normal',
-      bubble: a.bubble ?? null,
+      bubble: bubble === undefined ? a.bubble ?? null : bubble,
     })
   }
 
@@ -496,9 +504,9 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
           walk(agentId, current.groupTarget, { behavior: current.behavior, expression: current.expression, bubble: current.bubble, zoneBound: walkBounds.get(agentId) })
           return awaitWalk()
         }
-        setTimeout(poll, ARRIVAL_POLL_MS)
+        later(poll, ARRIVAL_POLL_MS)
       }
-      setTimeout(poll, ARRIVAL_POLL_MS)
+      later(poll, ARRIVAL_POLL_MS)
     }
     awaitWalk()
   }
@@ -546,6 +554,190 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
     restSeatsTaken.add(assigned.index)
     restSeatsByMember.set(member.id, assigned)
     return assigned.seat
+  }
+
+  function mutateHandoff(fn) {
+    const previous = mutatingHandoff
+    mutatingHandoff = true
+    try { fn() } finally { mutatingHandoff = previous }
+  }
+
+  function factualHandoffs(state) {
+    if (state.mawMeta?.quality === 'stale' || state.mawMeta?.terminal != null
+      || state.mawMeta?.handoff_state !== 'complete') return new Map()
+    const agents = Object.values(state.agents).filter((a) => a?.mawMember)
+    const facts = agents.map((a) => ({ id: a.maw?.key, role: a.maw?.role, current_task: a.maw?.current_task }))
+    const resolved = new Map()
+    for (const edge of state.mawMeta?.handoffs ?? []) {
+      if (!validateMawHandoff(edge, facts)) continue
+      const sender = agents.find((a) => a.maw.key === edge.sender_member_id)
+      const recipient = agents.find((a) => a.maw.key === edge.recipient_member_id)
+      if (!sender || !recipient || sender.maw.terminate || recipient.maw.terminate) continue
+      const tasks = [sender.maw.current_task, recipient.maw.current_task]
+      const signature = JSON.stringify([edge, ...tasks.map((task) => [task.seq, task.round, task.type, task.source_ref, task.ref_task])])
+      resolved.set(edge.id, { edge, senderId: sender.id, recipientId: recipient.id, signature })
+    }
+    return resolved
+  }
+
+  function ownsHandoff(item) {
+    return !torn && activeHandoffs.get(item.edge.id) === item
+      && handoffParticipants.get(item.senderId) === item.edge.id
+      && handoffParticipants.get(item.recipientId) === item.edge.id
+  }
+
+  function releaseHandoff(item, { stop = false, rephase = false } = {}) {
+    if (activeHandoffs.get(item.edge.id) !== item) return
+    activeHandoffs.delete(item.edge.id)
+    const ids = [item.senderId, item.recipientId]
+    for (const id of ids) {
+      if (handoffParticipants.get(id) === item.edge.id) handoffParticipants.delete(id)
+      walkTokens.set(id, (walkTokens.get(id) || 0) + 1)
+      if (rephase) delete prevPhase[id]
+    }
+    mutateHandoff(() => {
+      for (const id of ids) {
+        const state = store.getState()
+        const member = state.agents[id]
+        if (!member) continue
+        if (stop) {
+          state.releaseAgentDoorClaims(id)
+          store.getState().abortAgentMovement(id, member.position)
+        }
+        restorePresentation(id, member.name ?? null)
+      }
+    })
+  }
+
+  function clearFactualHandoffs({ stop = false, restore = true } = {}) {
+    queuedHandoffs.clear()
+    if (restore) {
+      for (const item of [...activeHandoffs.values()]) releaseHandoff(item, { stop })
+    } else {
+      activeHandoffs.clear()
+      handoffParticipants.clear()
+    }
+  }
+
+  // Use active time for both physical-arrival budgets and the conversation.
+  // Pausing the office must not expire a door wait or consume the three seconds.
+  function waitForHandoff(item, ready, next, limit = ARRIVE_TIMEOUT_MS) {
+    let elapsed = 0
+    let stamp = Date.now()
+    let retries = 0
+    const poll = () => {
+      if (!ownsHandoff(item)) return
+      const state = store.getState()
+      const now = Date.now()
+      if (!state.isPaused) elapsed += now - stamp
+      stamp = now
+      const pair = [state.agents[item.senderId], state.agents[item.recipientId]]
+      if (pair.some((a) => !a?.inGroupEvent || !a.groupTarget)) {
+        releaseHandoff(item, { stop: true, rephase: true })
+        runDispatch()
+        return
+      }
+      if (!state.isPaused && ready(pair, elapsed)) return next()
+      if (!state.isPaused && elapsed >= limit) {
+        if (retries >= ARRIVE_MAX_REISSUES) {
+          releaseHandoff(item, { stop: true, rephase: true })
+          runDispatch()
+          return
+        }
+        retries += 1
+        elapsed = 0
+        mutateHandoff(() => {
+          for (const agent of pair) {
+            if (!arrivedAt(agent)) walk(agent.id, agent.groupTarget, { behavior: 'idle', zoneBound: walkBounds.get(agent.id) })
+          }
+        })
+      }
+      later(poll, 100)
+    }
+    later(poll, 100)
+  }
+
+  function beginFactualHandoff(item) {
+    const state = store.getState()
+    const recipient = state.agents[item.recipientId]
+    const seat = stableWorkSeat(recipient)
+    const approach = handoffApproachPoint(seat)
+    if (!approach) return
+    activeHandoffs.set(item.edge.id, item)
+    for (const id of [item.senderId, item.recipientId]) {
+      handoffParticipants.set(id, item.edge.id)
+      pendingEnter.delete(id)
+      pendingRelocation.delete(id)
+      breakUntil.delete(id)
+    }
+    mutateHandoff(() => {
+      walk(item.recipientId, seat, { behavior: 'idle', zoneBound: 'member' })
+      walk(item.senderId, approach, { behavior: 'idle', zoneBound: 'none' })
+    })
+    waitForHandoff(item, (pair) => pair.every(arrivedAt), () => {
+      if (!ownsHandoff(item)) return
+      // Both positions are proven arrivals. Publish facing in the same owned
+      // transaction: the generic idle-facing action deliberately rejects events.
+      mutateHandoff(() => store.setState((current) => {
+        const sender = current.agents[item.senderId]
+        const receiver = current.agents[item.recipientId]
+        const bubble = item.edge.kind === 'submission' ? '任务交接' : '评审回交'
+        return { agents: { ...current.agents,
+          [sender.id]: { ...sender, behavior: 'chat', expression: 'normal', bubble,
+            facing: calcFacing(sender.position.x, sender.position.y, receiver.position.x, receiver.position.y) },
+          [receiver.id]: { ...receiver, behavior: 'chat', expression: 'normal', bubble,
+            facing: calcFacing(receiver.position.x, receiver.position.y, sender.position.x, sender.position.y) },
+        } }
+      }))
+      waitForHandoff(item, (_pair, elapsed) => elapsed >= HANDOVER_DWELL_MS, () => {
+        if (!ownsHandoff(item)) return
+        mutateHandoff(() => {
+          for (const id of [item.senderId, item.recipientId]) {
+            const current = store.getState()
+            const member = current.agents[id]
+            const desk = phaseOf(member.status) === 'task' || (current.mawMeta?.workflow != null && current.mawMeta?.terminal == null)
+            walk(id, desk ? stableWorkSeat(member) : stableRestSeat(member), { behavior: 'idle', zoneBound: desk ? 'member' : 'meeting' })
+          }
+        })
+        waitForHandoff(item, (pair) => pair.every(arrivedAt), () => {
+          releaseHandoff(item)
+          processFactualHandoffs()
+        })
+      }, HANDOVER_DWELL_MS + 1000)
+    })
+  }
+
+  function processFactualHandoffs() {
+    if (processingHandoffs || torn) return
+    processingHandoffs = true
+    try {
+      const waiting = new Set()
+      for (const [id, item] of queuedHandoffs) {
+        const pair = [item.senderId, item.recipientId]
+        if (pair.some((memberId) => handoffParticipants.has(memberId) || waiting.has(memberId))) {
+          pair.forEach((memberId) => waiting.add(memberId))
+          continue
+        }
+        queuedHandoffs.delete(id)
+        beginFactualHandoff(item)
+      }
+    } finally { processingHandoffs = false }
+  }
+
+  function reconcileFactualHandoffs(state) {
+    const facts = factualHandoffs(state)
+    for (const [id, item] of queuedHandoffs) {
+      if (facts.get(id)?.signature !== item.signature) queuedHandoffs.delete(id)
+    }
+    for (const item of [...activeHandoffs.values()]) {
+      if (facts.get(item.edge.id)?.signature !== item.signature) releaseHandoff(item, { stop: true, rephase: true })
+    }
+    for (const [id, item] of facts) {
+      if (seenHandoffs.has(id)) continue
+      seenHandoffs.add(id)
+      queuedHandoffs.set(id, item)
+    }
+    processFactualHandoffs()
   }
 
   /** Drop every per-member trace of members that left the snapshot. */
@@ -653,6 +845,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       if (!freeRoam) {
         for (const agent of Object.values(s.agents)) {
           if (!agent?.mawMember) continue
+          if (handoffParticipants.has(agent.id)) continue
           if (agent.isMoving || agent.journeyTarget || agent.inGroupEvent) continue
           if (agent.maw?.role === 'manager' && managerBusy) continue
           if (phaseOf(agent.status) !== 'task') continue
@@ -672,7 +865,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       }
       if (!freeRoam && Date.now() - lastWanderAt < WANDER_INTERVAL_MS) return
       const candidates = wanderCandidates({
-        members: Object.values(s.agents).filter((a) => a?.mawMember),
+        members: Object.values(s.agents).filter((a) => a?.mawMember && !handoffParticipants.has(a.id)),
         workingSince,
         restingSince,
         freeRoam,
@@ -688,6 +881,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       arriveThen(agent.id, 8000 + Math.random() * 8000, () => {
         const current = store.getState().agents[agent.id]
         if (!current) return
+        if (handoffParticipants.has(agent.id)) return
         if (current.status !== statusAtDeparture) return restorePresentation(agent.id) // the transition owns the new walk
         // CR-3/CR-1/CR-8/CR-11: the home follows the member's POST — a working
         // member or a standby member returns to its DESK; only an off-duty
@@ -716,8 +910,13 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
   // earlier one) — one dispatch runs to completion; the walk sets change no member
   // facts, so nothing needs reprocessing.
   let dispatching = false
-  const unsubscribe = store.subscribe(() => {
+  function runDispatch() {
     if (torn || dispatching) return
+    dispatching = true
+    try { dispatch() } finally { dispatching = false }
+  }
+  const unsubscribe = store.subscribe(() => {
+    if (torn || dispatching || mutatingHandoff) return
     dispatching = true
     try {
       dispatch()
@@ -728,7 +927,10 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
 
   function dispatch() {
     const s = store.getState()
-    if (s.mode !== 'maw') return
+    if (s.mode !== 'maw') {
+      if (activeHandoffs.size || queuedHandoffs.size) clearFactualHandoffs({ stop: true })
+      return
+    }
     const members = Object.values(s.agents).filter((a) => a?.mawMember)
     const recovery = s.mawMeta?.dashboard_recovery ?? 0
     const hydration = s.mawMeta?.dashboard_hydration ?? 0
@@ -742,6 +944,9 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       choreoEpoch += 1
       for (const timer of pendingTimers) clearTimeout(timer)
       pendingTimers.clear()
+      clearFactualHandoffs({ restore: false })
+      seenHandoffs.clear()
+      for (const id of factualHandoffs(s).keys()) seenHandoffs.add(id)
       pendingEnter.clear()
       pendingRelocation.clear()
       handoverQueue.length = 0
@@ -790,6 +995,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       // latches, and the not-yet-fired staggered walks. Presentation differs:
       // stale rests everyone (plan: stop active work animation), a cancellation
       // dresses each figure in its CURRENT status (blocked → scratch-head …).
+      clearFactualHandoffs({ stop: true })
       choreoEpoch += 1
       for (const a of members) {
         if (!a.inGroupEvent) continue
@@ -833,6 +1039,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
     // accumulated status diffs replay exactly once.
     if (quality === 'stale') return
     pruneGoneMembers(new Set(members.map((m) => m.id)))
+    reconcileFactualHandoffs(s)
 
     // CR-11 deferred relocations: members queued by the standby sweep (staggered
     // readyAt) or caught MID-WALK at a flip are walked to their CURRENT post the
@@ -841,6 +1048,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
     for (const [agentId, rel] of pendingRelocation) {
       const live = store.getState().agents[agentId]
       if (!live) { pendingRelocation.delete(agentId); continue }
+      if (handoffParticipants.has(agentId)) continue
       if (Date.now() < (rel.readyAt ?? 0)) continue // stagger slot not due yet
       if (live.isMoving || live.journeyTarget || live.inGroupEvent) continue
       pendingRelocation.delete(agentId)
@@ -868,6 +1076,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       }
       const phase = phaseOf(member.status)
       const previous = prevPhase[member.id]
+      if (handoffParticipants.has(member.id)) continue
       if (phase === previous) continue
       prevPhase[member.id] = phase
       if (isManager && managerBusy) {
@@ -901,6 +1110,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
         pendingEnter.delete(agentId)
         const live = store.getState().agents[agentId]
         if (!live || phaseOf(live.status) !== phase) return // the phase moved on — its own transition owns the walk
+        if (handoffParticipants.has(agentId)) return
         walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null, zoneBound: isManager ? undefined : phase === 'rest' && !workflowActive ? 'meeting' : 'member' })
         arriveThen(agentId, 0, () => restorePresentation(agentId))
       }, delay)
@@ -910,7 +1120,9 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
     // the manager handover must fire even when the member never left the task phase).
     // Keyed by the plain agent id — pruneGoneMembers sweeps this map by id, so a
     // decorated key would be pruned every tick and re-enqueue the handover forever.
+    const structuredHandoffs = s.integration === 'dashboard' || s.mawMeta?.handoff_state != null
     for (const member of members) {
+      if (structuredHandoffs || handoffParticipants.has(member.id)) continue
       if (member.maw?.role === 'manager') continue
       if (member.status === 'awaiting-approval' && prevHandover.get(member.id) !== true) {
         prevHandover.set(member.id, true)
@@ -930,6 +1142,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
   return function cleanup() {
     torn = true
     unsubscribe()
+    clearFactualHandoffs({ stop: true })
     if (wanderTimer) clearInterval(wanderTimer)
     for (const t of pendingTimers) clearTimeout(t)
     pendingTimers.clear()

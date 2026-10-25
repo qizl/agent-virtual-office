@@ -679,6 +679,146 @@ def project_manager(workflow: dict | None, manifest: dict, role: dict, manifest_
     return make("working", "复核工作流")
 
 
+def member_identity(state, folder):
+    return hashlib.sha256(f"{state['project_root'].resolve()}|{state['task_id']}|{folder}".encode()).hexdigest()[:12]
+
+
+def normalize_task_ref(value):
+    if not isinstance(value, str) or len(value) > 128 or not TASK_REF_RE.fullmatch(value):
+        return None
+    normalized = value if value.endswith(".json") else value + ".json"
+    return normalized if len(normalized) <= 128 else None
+
+
+def task_identity(folder, task):
+    """Expose only validated task identity, never task content or inferred links."""
+    if (not isinstance(task, dict) or task.get("schema") not in tuple(TASK_SCHEMAS)
+            or not _safe_integer(task.get("seq")) or task["seq"] < 1
+            or not _safe_integer(task.get("round")) or task["round"] < 1
+            or task.get("type") not in tuple(TASK_KINDS) or task.get("status") not in tuple(TASK_STATUSES)):
+        return None
+    source = normalize_task_ref(f"{folder}/task-{int(task['seq']):03d}.json")
+    parent = normalize_task_ref(task.get("ref_task"))
+    if source is None or (task.get("ref_task") is not None and parent is None):
+        return None
+    return {"seq": task["seq"], "round": task["round"], "type": task["type"],
+            "source_ref": source, "ref_task": parent}
+
+
+def handoff_fact(kind, sender, recipient, source, target):
+    signature = f"{kind}|{sender}|{recipient}|{source}|{target}"
+    identity = f"{_fnv64(signature)}{_fnv64(f'handoff:{signature}')}"
+    return {"id": identity, "kind": kind, "sender_member_id": sender, "recipient_member_id": recipient,
+            "source_task": source, "target_task": target}
+
+
+def _fnv64(value):
+    hash_value = 0xCBF29CE484222325
+    for byte in value.encode("ascii"):
+        hash_value = ((hash_value ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"{hash_value:016x}"
+
+
+def _interaction_fields(state, members):
+    """Resolve exact current task relationships; no role-first recipient fallback."""
+    roles = state["roles"]
+    by_id = {member["id"]: member for member in members}
+    records, current = {}, {}
+    complete = not state["degraded"] and not state.get("_inconsistent")
+    declared = (state.get("manifest") or {}).get("roles")
+    declared_valid = (isinstance(declared, list) and bool(declared)
+                      and all(isinstance(folder, str) and ROLE_FOLDER_RE.fullmatch(folder) for folder in declared)
+                      and len(set(declared)) == len(declared))
+    declared_roles = set(declared) if declared_valid else set()
+    complete = complete and declared_valid and declared_roles.issubset(roles)
+    total = sum(len(role["tasks"]) for role in roles.values())
+    if total > MAX_TASK_FILES:
+        complete = False
+    for folder, role in roles.items():
+        if folder not in declared_roles:
+            current[folder] = None
+            member = by_id.get(member_identity(state, folder))
+            if member:
+                member.update(current_task=None, handoff_pending=None)
+            continue
+        identities = [(task_identity(folder, task), task) for task in role["tasks"]]
+        if any(identity is None for identity, _task in identities):
+            complete = False
+        for identity, task in identities:
+            if identity:
+                if identity["source_ref"] in records:
+                    complete = False
+                records[identity["source_ref"]] = (folder, identity, task)
+        identity = identities[-1][0] if identities else None
+        current[folder] = identity
+        member = by_id.get(member_identity(state, folder))
+        if member:
+            member.update(current_task=identity, handoff_pending=None)
+    if not complete:
+        for member in members:
+            if member.get("current_task"):
+                member["handoff_pending"] = "incomplete"
+        return {"assignment_state": "unknown", "handoff_state": "unavailable", "handoffs": []}
+    handoffs = []
+
+    def available(folder):
+        role = roles[folder]
+        return ((role.get("ready") or {}).get("status") == "confirmed"
+                and (role.get("terminate") or {}).get("status") not in ("initialized", "confirmed"))
+
+    for folder, identity in current.items():
+        if identity is None:
+            continue
+        member = by_id[member_identity(state, folder)]
+        task = records[identity["source_ref"]][2]
+        target = None
+        kind = None
+        if identity["type"] == "dev" and task["status"] in ("dev-complete", "reviewing"):
+            matches = [record for record in records.values() if record[1]["type"] == "review"
+                       and record[1]["round"] == identity["round"]
+                       and record[1]["ref_task"] == identity["source_ref"]]
+            if len(matches) != 1:
+                member["handoff_pending"] = "conflict" if matches else "missing"
+                continue
+            target = matches[0]
+            kind = "submission"
+            if target[2]["status"] in ("review-passed", "review-failed"):
+                continue
+        elif identity["type"] == "review" and task["status"] in ("review-passed", "review-failed"):
+            target = records.get(identity["ref_task"])
+            kind = "review-result"
+            if target is None:
+                member["handoff_pending"] = "missing"
+                continue
+            if target[1]["type"] != "dev" or target[1]["round"] != identity["round"]:
+                member["handoff_pending"] = "conflict"
+                continue
+        if target is None:
+            continue
+        recipient, target_identity, _target_task = target
+        if recipient == folder:
+            member["handoff_pending"] = "conflict"
+        elif current.get(recipient) != target_identity or not available(recipient) or not available(folder):
+            member["handoff_pending"] = "not-ready"
+        else:
+            handoffs.append(handoff_fact(kind, member["id"], member_identity(state, recipient),
+                                         identity["source_ref"], target_identity["source_ref"]))
+    if len(handoffs) > MAX_TASK_FILES:
+        for member in members:
+            if member.get("current_task"):
+                member["handoff_pending"] = "incomplete"
+        return {"assignment_state": "assigned" if records else "unassigned", "handoff_state": "unavailable", "handoffs": []}
+    return {"assignment_state": "assigned" if records else "unassigned", "handoff_state": "complete", "handoffs": handoffs}
+
+
+def disable_interactions(snapshot):
+    """Disable the entire optional interaction group, retaining observed status."""
+    snapshot.update(assignment_state="unknown", handoff_state="unavailable", handoffs=[])
+    for member in snapshot["members"]:
+        member["current_task"] = None
+        member["handoff_pending"] = "incomplete"
+
+
 def build_snapshot(state: dict, producer_id: str, seq: int, sampled_at: int) -> dict | None:
     manifest = state.get("manifest")
     if manifest is None:
@@ -710,7 +850,7 @@ def build_snapshot(state: dict, producer_id: str, seq: int, sampled_at: int) -> 
         role_map[folder] = role
     for folder in sorted(role_map):
         role_type = folder.rsplit("-", 1)[0]
-        member_key = hashlib.sha256(f"{state['project_root'].resolve()}|{state['task_id']}|{folder}".encode()).hexdigest()[:12]
+        member_key = member_identity(state, folder)
         if role_type == "manager":
             projected = project_manager(workflow, manifest, role_map[folder], terminal)
         else:
@@ -733,7 +873,7 @@ def build_snapshot(state: dict, producer_id: str, seq: int, sampled_at: int) -> 
     if state.get("_inconsistent"):
         quality = "degraded"
         quality_detail = "concurrent-update"
-    return {
+    snapshot = {
         "schema": SCHEMA,
         "producer": producer_id,
         "seq": seq,
@@ -744,6 +884,10 @@ def build_snapshot(state: dict, producer_id: str, seq: int, sampled_at: int) -> 
         "terminal": terminal,
         "members": members,
     }
+    snapshot.update(_interaction_fields(state, members))
+    if len(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")).encode()) > MAX_SNAPSHOT_BYTES:
+        disable_interactions(snapshot)
+    return snapshot
 
 
 def read_with_consistency(project_root: Path, task_id: str, stall_minutes: int, *, task_validator=None) -> dict:
@@ -778,6 +922,49 @@ PRODUCER_RE = re.compile(r"[A-Za-z0-9_-]{8,128}\Z")
 TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\Z")
 MEMBER_STATUSES = {"awaiting-approval", "blocked", "done", "idle", "planning", "working"}
 TASK_KINDS = {"aggregate-review", "dev", "plan-review", "review"}
+TASK_REF_RE = re.compile(r"(?:decision-maker|executor|reviewer)-[0-9]+/task-[0-9]{3,}(?:\.json)?\Z")
+CURRENT_TASK_KEYS = {"seq", "round", "type", "source_ref", "ref_task"}
+HANDOFF_KEYS = {"id", "kind", "sender_member_id", "recipient_member_id", "source_task", "target_task"}
+
+
+def valid_task_identity(task, role=None):
+    if (not isinstance(task, dict) or set(task) != CURRENT_TASK_KEYS
+            or not _safe_integer(task.get("seq")) or task["seq"] < 1
+            or not _safe_integer(task.get("round")) or task["round"] < 1
+            or task.get("type") not in tuple(TASK_KINDS)
+            or normalize_task_ref(task.get("source_ref")) != task.get("source_ref")
+            or not isinstance(task.get("source_ref"), str)
+            or (task.get("ref_task") is not None and normalize_task_ref(task["ref_task"]) != task["ref_task"])):
+        return False
+    folder, filename = task["source_ref"].split("/")
+    return filename == f"task-{int(task['seq']):03d}.json" and (role is None or folder.rsplit("-", 1)[0] == role)
+
+
+def valid_handoff(handoff, members):
+    if (not isinstance(handoff, dict) or set(handoff) != HANDOFF_KEYS
+            or not isinstance(handoff.get("id"), str) or not MEMBER_ID_RE.fullmatch(handoff["id"])
+            or handoff.get("kind") not in ("submission", "review-result")):
+        return False
+    source = next((member for member in members if member["id"] == handoff.get("sender_member_id")), None)
+    target = next((member for member in members if member["id"] == handoff.get("recipient_member_id")), None)
+    if source is None or target is None or source["id"] == target["id"]:
+        return False
+    source_task, target_task = source.get("current_task"), target.get("current_task")
+    if (not valid_task_identity(source_task, source["role"]) or not valid_task_identity(target_task, target["role"])
+            or handoff.get("source_task") != source_task["source_ref"]
+            or handoff.get("target_task") != target_task["source_ref"] or source_task["round"] != target_task["round"]):
+        return False
+    signature = f"{handoff['kind']}|{source['id']}|{target['id']}|{source_task['source_ref']}|{target_task['source_ref']}"
+    expected_id = f"{_fnv64(signature)}{_fnv64(f'handoff:{signature}')}"
+    if handoff["id"] != expected_id:
+        return False
+    if handoff["kind"] == "submission":
+        return (source["role"] in ("executor", "decision-maker") and target["role"] == "reviewer"
+                and source_task["type"] == "dev" and target_task["type"] == "review"
+                and target_task["ref_task"] == source_task["source_ref"])
+    return (source["role"] == "reviewer" and target["role"] in ("executor", "decision-maker")
+            and source_task["type"] == "review" and target_task["type"] == "dev"
+            and source_task["ref_task"] == target_task["source_ref"])
 
 
 def _safe_integer(value) -> bool:
@@ -843,6 +1030,23 @@ def validate_snapshot(snapshot: dict) -> dict:
                 invalid("snapshot member enum is invalid")
         if "stalled" in member and type(member["stalled"]) is not bool:
             invalid("snapshot member stalled must be boolean")
+        if "current_task" in member and member["current_task"] is not None and not valid_task_identity(member["current_task"], member["role"]):
+            invalid("snapshot member current_task is invalid")
+        if "handoff_pending" in member and member["handoff_pending"] not in (None, "missing", "conflict", "not-ready", "incomplete"):
+            invalid("snapshot member handoff_pending is invalid")
+    if "assignment_state" in snapshot and snapshot["assignment_state"] not in ("unassigned", "assigned", "unknown"):
+        invalid("snapshot assignment_state is invalid")
+    if "handoff_state" in snapshot and snapshot["handoff_state"] not in ("complete", "unavailable"):
+        invalid("snapshot handoff_state is invalid")
+    handoffs = snapshot.get("handoffs", [])
+    if not isinstance(handoffs, list) or len(handoffs) > MAX_TASK_FILES or any(not valid_handoff(edge, members) for edge in handoffs):
+        invalid("snapshot handoffs are invalid")
+    if len({edge["id"] for edge in handoffs}) != len(handoffs):
+        invalid("snapshot handoff identity is duplicated")
+    if handoffs and snapshot.get("handoff_state") != "complete":
+        invalid("snapshot handoffs require complete interaction data")
+    if len({(edge["kind"], edge["source_task"], edge["target_task"]) for edge in handoffs}) != len(handoffs):
+        invalid("snapshot handoff relationship is duplicated")
     try:
         raw = json.dumps(snapshot, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
     except (TypeError, ValueError, UnicodeEncodeError) as exc:
@@ -884,7 +1088,10 @@ def read_snapshot(project_root: Path, task_id: str, *, now=None) -> dict:
         "terminal": raw.get("terminal"), "sampled_at": raw["sampled_at"],
         "producer_id": raw["producer"], "producer_seq": raw["seq"],
         "accepted_at": sampled_at, "members": raw["members"],
+        "assignment_state": raw["assignment_state"], "handoff_state": raw["handoff_state"], "handoffs": raw["handoffs"],
     }
     if len(json.dumps(snapshot, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")) > MAX_SNAPSHOT_BYTES:
-        raise BridgeError("payload-too-large", "snapshot exceeds the 16384 byte limit", EXIT_PROTOCOL)
+        disable_interactions(snapshot)
+        if len(json.dumps(snapshot, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")) > MAX_SNAPSHOT_BYTES:
+            raise BridgeError("payload-too-large", "snapshot exceeds the 16384 byte limit", EXIT_PROTOCOL)
     return snapshot

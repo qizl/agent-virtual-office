@@ -26,6 +26,51 @@ const MAW_SSE_HEARTBEAT_MS = 15_000
 const MEMBER_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
 const PRODUCER_RE = /^[A-Za-z0-9_-]{8,128}$/
 const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
+const TASK_REF_RE = /^(decision-maker|executor|reviewer)-[0-9]+\/task-([0-9]{3,})\.json$/
+const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value)
+const exactKeys = (value, keys) => object(value) && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key))
+const taskRef = (value) => typeof value === 'string' && value.length <= 128 && TASK_REF_RE.test(value)
+
+function validTaskIdentity(task, role) {
+  if (!exactKeys(task, ['seq', 'round', 'type', 'source_ref', 'ref_task'])
+    || !isSafeInt(task.seq) || task.seq < 1 || !isSafeInt(task.round) || task.round < 1
+    || !MAW_TASK_KINDS.includes(task.type) || !taskRef(task.source_ref) || (task.ref_task !== null && !taskRef(task.ref_task))) return false
+  const source = task.source_ref.match(TASK_REF_RE)
+  return source[1] === role && source[2] === String(task.seq).padStart(3, '0')
+}
+
+function fnv64(value) {
+  let hash = 0xcbf29ce484222325n
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= BigInt(value.charCodeAt(index))
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n)
+  }
+  return hash.toString(16).padStart(16, '0')
+}
+
+function mawHandoffId(kind, sender, recipient, source, target) {
+  const signature = `${kind}|${sender}|${recipient}|${source}|${target}`
+  return `${fnv64(signature)}${fnv64(`handoff:${signature}`)}`
+}
+
+function validHandoff(handoff, members) {
+  if (!exactKeys(handoff, ['id', 'kind', 'sender_member_id', 'recipient_member_id', 'source_task', 'target_task'])
+    || typeof handoff.id !== 'string' || !MEMBER_ID_RE.test(handoff.id)
+    || !['submission', 'review-result'].includes(handoff.kind)) return false
+  const sender = members.find((member) => member.id === handoff.sender_member_id)
+  const recipient = members.find((member) => member.id === handoff.recipient_member_id)
+  if (!sender || !recipient || sender === recipient || !validTaskIdentity(sender.current_task, sender.role)
+    || !validTaskIdentity(recipient.current_task, recipient.role)) return false
+  const source = sender.current_task
+  const target = recipient.current_task
+  if (source.source_ref !== handoff.source_task || target.source_ref !== handoff.target_task || source.round !== target.round) return false
+  if (handoff.id !== mawHandoffId(handoff.kind, sender.id, recipient.id, source.source_ref, target.source_ref)) return false
+  return handoff.kind === 'submission'
+    ? ['executor', 'decision-maker'].includes(sender.role) && recipient.role === 'reviewer'
+      && source.type === 'dev' && target.type === 'review' && target.ref_task === source.source_ref
+    : sender.role === 'reviewer' && ['executor', 'decision-maker'].includes(recipient.role)
+      && source.type === 'review' && target.type === 'dev' && source.ref_task === target.source_ref
+}
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex')
@@ -199,6 +244,12 @@ export function createMawStatus({
     if (raw.stalled !== undefined && typeof raw.stalled !== 'boolean') {
       return `members[${index}].stalled must be boolean`
     }
+    if (raw.current_task !== undefined && raw.current_task !== null && !validTaskIdentity(raw.current_task, raw.role)) {
+      return `members[${index}].current_task is invalid`
+    }
+    if (raw.handoff_pending !== undefined && raw.handoff_pending !== null && !['missing', 'conflict', 'not-ready', 'incomplete'].includes(raw.handoff_pending)) {
+      return `members[${index}].handoff_pending is invalid`
+    }
     return null
   }
 
@@ -227,6 +278,13 @@ export function createMawStatus({
       if (seen.has(body.members[i].id)) return `members[${i}].id duplicates an earlier member id`
       seen.add(body.members[i].id)
     }
+    if (body.assignment_state !== undefined && !['unassigned', 'assigned', 'unknown'].includes(body.assignment_state)) return 'assignment_state is invalid'
+    if (body.handoff_state !== undefined && !['complete', 'unavailable'].includes(body.handoff_state)) return 'handoff_state is invalid'
+    if (body.handoffs !== undefined && (!Array.isArray(body.handoffs) || body.handoffs.length > 200
+      || body.handoffs.some((edge) => !validHandoff(edge, body.members))
+      || new Set(body.handoffs.map((edge) => edge.id)).size !== body.handoffs.length
+      || new Set(body.handoffs.map((edge) => `${edge.kind}|${edge.source_task}|${edge.target_task}`)).size !== body.handoffs.length
+      || (body.handoffs.length > 0 && body.handoff_state !== 'complete'))) return 'handoffs are invalid'
     return null
   }
 
@@ -328,6 +386,9 @@ export function createMawStatus({
         body.terminal ?? null,
         body.sampled_at,
         body.seq,
+        body.assignment_state ?? null,
+        body.handoff_state ?? null,
+        body.handoffs ?? [],
         body.members,
       ]))
       if (producer !== null && leaseActive() && producer.id !== body.producer) {
@@ -363,6 +424,9 @@ export function createMawStatus({
         producer_id: body.producer,
         producer_seq: body.seq,
         accepted_at: now(),
+        ...(body.assignment_state !== undefined ? { assignment_state: body.assignment_state } : {}),
+        ...(body.handoff_state !== undefined ? { handoff_state: body.handoff_state } : {}),
+        ...(body.handoffs !== undefined ? { handoffs: body.handoffs.map((edge) => ({ ...edge })) } : {}),
         members: body.members.map((m) => ({
           id: m.id,
           role: m.role,
@@ -374,6 +438,8 @@ export function createMawStatus({
           verdict: m.verdict ?? null,
           terminate: m.terminate ?? null,
           stalled: m.stalled === true,
+          ...(m.current_task !== undefined ? { current_task: m.current_task === null ? null : { ...m.current_task } } : {}),
+          ...(m.handoff_pending !== undefined ? { handoff_pending: m.handoff_pending } : {}),
         })),
       }
       broadcast()

@@ -1,9 +1,9 @@
 // Fixed-selection, same-origin Dashboard transport. Each mounted view owns its requests,
 // timers, ordering cursor and choreography; no shared "current task" is consulted.
 import { detectIntegrationConfig } from '../systems/platformDetect.js'
-import { startMawChoreography } from '../systems/mawChoreography.js'
+import { startMawChoreography, workSeatFor, restSeatFor } from '../systems/mawChoreography.js'
 import { createDashboardHistoryController } from './dashboardHistory.js'
-import { buildHistoryPresentation, sampleHistoryPresentation } from './dashboardHistoryChoreography.js'
+import { buildHistoryPresentation, sampleHistoryPresentation, prepareHistoryTimeline } from './dashboardHistoryChoreography.js'
 import { validateDashboardEnvelope } from './dashboardSnapshot.js'
 
 export { validateDashboardEnvelope } from './dashboardSnapshot.js'
@@ -11,6 +11,34 @@ export { validateDashboardEnvelope } from './dashboardSnapshot.js'
 const POLL_MS = 2000
 const REQUEST_TIMEOUT_MS = 10_000
 const STALE_MS = 120_000
+
+// Compile from defaults once, independently of the currently visible live scene.
+// The roster supplies coordinates only; each frame still exposes its own members.
+function historyRosterFor(steps) {
+  const roster = {}
+  const occupied = new Set(), resting = new Set()
+  for (const step of steps) {
+    for (const member of step.snapshot.members) {
+      const id = `${member.id}~${member.role}`
+      if (roster[id]) continue
+      let workSeat
+      for (let i = 0; i < 50; i += 1) {
+        const candidate = workSeatFor(member.role, i)
+        if (member.role === 'manager' || !occupied.has(`${candidate.x},${candidate.y}`)) {
+          workSeat = candidate
+          break
+        }
+      }
+      workSeat ??= workSeatFor(member.role, 49)
+      occupied.add(`${workSeat.x},${workSeat.y}`)
+      const rest = restSeatFor(id, resting)
+      resting.add(rest.index)
+      roster[id] = { id, mawMember: true, position: { ...rest.seat },
+        maw: { key: member.id, role: member.role, workSeat, restSeat: rest.seat } }
+    }
+  }
+  return roster
+}
 
 export function startDashboardIntegration(store, config = detectIntegrationConfig()) {
   // Every mounted binding starts with its own observation baseline, including
@@ -40,8 +68,13 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
   let historyOwnsScene = false
   let historySeq = 0
   let historyPlan = null
+  let historyRoster = {}
   const history = createDashboardHistoryController({
     config,
+    prepareTimeline(steps, history) {
+      historyRoster = historyRosterFor(steps)
+      return prepareHistoryTimeline(steps, historyRoster, history.final_snapshot)
+    },
     onStart() {
       historyOwnsScene = true
       generation += 1
@@ -59,6 +92,10 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
       const positions = Object.fromEntries(Object.entries(before.agents).map(([id, agent]) =>
         [id, before.dashboardHistoryPresentation?.agents[id]?.position || agent.position]))
       store.getState().applyMawSnapshot({ server_epoch: 0, seq: ++historySeq, snapshot, dashboard_history: true })
+      const agents = Object.fromEntries(Object.entries(store.getState().agents).map(([id, agent]) => [id,
+        historyRoster[id] ? { ...agent, maw: { ...agent.maw,
+          workSeat: historyRoster[id].maw.workSeat, restSeat: historyRoster[id].maw.restSeat } } : agent]))
+      store.setState({ agents })
       historyPlan = buildHistoryPresentation(context.step, store.getState().agents, positions, context)
     },
     onProgress(progress) {
@@ -202,6 +239,7 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     history.destroy()
     choreographyCleanup?.()
     historyPlan = null
+    historyRoster = {}
     if (historyOwnsScene) store.setState({ isPaused: originalPause, dashboardHistory: null, dashboardHistoryPresentation: null })
   }
 }

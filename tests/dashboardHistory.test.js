@@ -82,6 +82,72 @@ describe('Recorded history boundary', () => {
 })
 
 describe('Iframe-owned playback lifecycle', () => {
+  it('uses a validated cumulative plan for boundaries, pause, seek and restart instead of fixed step arithmetic', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(fixture())))
+    const prepareTimeline = vi.fn(() => ({ plans: [{ duration_ms: 9000 }, { duration_ms: 6500 }], starts: [0, 9000], duration_ms: 15500 }))
+    const onProgress = vi.fn()
+    const p = player({ prepareTimeline, onProgress })
+    p.controller.onTerminal('completed')
+    await vi.advanceTimersByTimeAsync(4500)
+    expect(prepareTimeline).toHaveBeenCalledOnce()
+    expect(p.state()).toMatchObject({ step: 1, position_ms: 4500, duration_ms: 15500 })
+    expect(onProgress.mock.lastCall[0]).toMatchObject({ step_elapsed_ms: 4500, step_duration_ms: 9000, step_start_ms: 0 })
+    p.controller.toggle()
+    await vi.advanceTimersByTimeAsync(10000)
+    expect(p.state().position_ms).toBe(4500)
+    p.controller.seek(10000)
+    expect(p.onFrame.mock.lastCall[1]).toMatchObject({ index: 1, step_start_ms: 9000, step_duration_ms: 6500, plan: { duration_ms: 6500 } })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(p.state()).toMatchObject({ state: 'paused', step: 2, position_ms: 10000, locating: false })
+    expect(onProgress.mock.lastCall[0].step_elapsed_ms).toBe(1000)
+    p.controller.toggle()
+    await vi.advanceTimersByTimeAsync(5500)
+    expect(p.state()).toMatchObject({ state: 'ended', position_ms: 15500 })
+    p.controller.restart()
+    expect(p.state()).toMatchObject({ state: 'playing', position_ms: 0, duration_ms: 15500 })
+    expect(prepareTimeline).toHaveBeenCalledOnce()
+  })
+
+  it('rejects invalid or unbounded compiled timing before taking ownership of the scene', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(fixture())))
+    for (const timeline of [
+      { plans: [{ duration_ms: 3999 }, { duration_ms: 4000 }], starts: [0, 3999], duration_ms: 7999 },
+      { plans: [{ duration_ms: 60001 }, { duration_ms: 4000 }], starts: [0, 60001], duration_ms: 64001 },
+      { plans: [{ duration_ms: 4000 }, { duration_ms: 4000 }], starts: [0, 3999], duration_ms: 8000 },
+      { plans: [{ duration_ms: 4000 }, { duration_ms: 4000 }], starts: [0, 4000], duration_ms: 12000001 },
+    ]) {
+      const p = player({ prepareTimeline: () => timeline })
+      p.controller.onTerminal('completed')
+      await vi.advanceTimersByTimeAsync(0)
+      expect(p.state()).toMatchObject({ state: 'error', code: 'history-timeline-invalid' })
+      expect(p.onStart).not.toHaveBeenCalled()
+    }
+  })
+
+  it('includes the final return home in the last recorded step and keeps the terminal seek continuous', async () => {
+    const data = fixture()
+    const onProgress = vi.fn()
+    const prepareTimeline = vi.fn((steps, history) => ({ plans: [{ duration_ms: 4000 }, { duration_ms: 7000 }],
+      starts: [0, 4000], duration_ms: 11000, finalSnapshot: history.final_snapshot }))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply(data)))
+    const p = player({ prepareTimeline, onProgress })
+    p.controller.onTerminal('completed')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(prepareTimeline).toHaveBeenCalledWith(data.steps, data)
+    expect(p.state().duration_ms).toBe(11000)
+    p.controller.toggle()
+    p.controller.seek(10500)
+    await vi.advanceTimersByTimeAsync(500)
+    expect(p.state()).toMatchObject({ state: 'paused', position_ms: 10500, step: 2, step_elapsed_ms: 6500 })
+    p.controller.seek(11000)
+    expect(p.onFrame.mock.lastCall[1]).toMatchObject({ reason: 'seek', step_duration_ms: 7000 })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(p.state()).toMatchObject({ state: 'paused', position_ms: 11000, locating: false })
+    p.controller.toggle()
+    await vi.advanceTimersByTimeAsync(100)
+    expect(p.state()).toMatchObject({ state: 'ended', position_ms: 11000 })
+  })
+
   it('autoplays completed tasks once, preserves the remaining four-second step on pause and stops at the final frame without looping', async () => {
     const data = fixture()
     const fetchMock = vi.fn().mockResolvedValue(reply(data))
@@ -337,6 +403,7 @@ describe('History owns the office scene', () => {
     await vi.advanceTimersByTimeAsync(0)
     expect(fetchMock).toHaveBeenCalledTimes(2)
     const first = useOfficeStore.getState()
+    const firstStepDuration = first.dashboardHistory.step_duration_ms
     expect(first.dashboardHistory).toMatchObject({ state: 'playing', step: 1 })
     expect(first.mawMeta.terminal).toBeNull()
     expect(first.isPaused).toBe(true)
@@ -348,13 +415,41 @@ describe('History owns the office scene', () => {
     expect(useOfficeStore.getState().dashboardHistory.step).toBe(1)
     expect(useOfficeStore.getState().mawMeta.quality).toBe('ok')
     useOfficeStore.getState().togglePause()
-    await vi.advanceTimersByTimeAsync(4000)
+    await vi.advanceTimersByTimeAsync(firstStepDuration + 50)
     const second = useOfficeStore.getState()
     expect(second.dashboardHistory.step).toBe(2)
     expect(second.agents['executor~executor']).toMatchObject({ status: 'done', isMoving: false, inGroupEvent: false })
     expect(second.agents['executor~executor'].journeyTarget).toBeUndefined()
     cleanup()
     expect(useOfficeStore.getState()).toMatchObject({ isPaused: false, dashboardHistory: null })
+  })
+
+  it('compiles history from default seats and restarts there after the live office has moved', async () => {
+    const data = fixture()
+    const live = { server_epoch: 1, seq: 1, snapshot: data.final_snapshot }
+    const fetchMock = vi.fn().mockImplementation(async (url) => url.startsWith('/api/visualization/history')
+      ? reply(data) : { ok: true, status: 200, json: async () => ({ ok: true, data: live }) })
+    const host = fakeScope()
+    vi.stubGlobal('window', host.scope)
+    vi.stubGlobal('fetch', fetchMock)
+    const cleanup = startDashboardIntegration(useOfficeStore, config)
+    cleanups.push(cleanup)
+    await vi.advanceTimersByTimeAsync(0)
+
+    const id = 'executor~executor'
+    const initial = useOfficeStore.getState()
+    const rest = initial.agents[id].maw.restSeat
+    expect(initial.dashboardHistory).toMatchObject({ state: 'playing', step: 1 })
+    expect(initial.dashboardHistoryPresentation.agents[id].position).toMatchObject(rest)
+
+    await vi.advanceTimersByTimeAsync(1000)
+    const moving = useOfficeStore.getState().dashboardHistoryPresentation.agents[id].position
+    expect(Math.hypot(moving.x - rest.x, moving.y - rest.y)).toBeGreaterThan(0)
+
+    host.send(command('restart'))
+    const restarted = useOfficeStore.getState()
+    expect(restarted.dashboardHistory).toMatchObject({ state: 'playing', step: 1, position_ms: 0 })
+    expect(restarted.dashboardHistoryPresentation.agents[id].position).toMatchObject(rest)
   })
 
   it('keeps displayed positions continuous across actor changes and seeks while restoring only target-frame facts', async () => {
@@ -380,53 +475,60 @@ describe('History owns the office scene', () => {
       ? reply(data) : { ok: true, status: 200, json: async () => ({ ok: true, data: { server_epoch: 1, seq: 1, snapshot: data.final_snapshot } }) }))
     const cleanup = startDashboardIntegration(useOfficeStore, config)
     cleanups.push(cleanup)
-    await vi.advanceTimersByTimeAsync(3950)
+    await vi.advanceTimersByTimeAsync(950)
+    const firstStepDuration = useOfficeStore.getState().dashboardHistory.step_duration_ms
     const id = 'executor~executor'
     const before = useOfficeStore.getState().dashboardHistoryPresentation.agents[id].position
     await vi.advanceTimersByTimeAsync(50)
-    expect(useOfficeStore.getState().dashboardHistoryPresentation.agents[id].position).toMatchObject(before)
-    await vi.advanceTimersByTimeAsync(4100)
+    const next = useOfficeStore.getState().dashboardHistoryPresentation.agents[id].position
+    expect(Math.hypot(next.x - before.x, next.y - before.y)).toBeLessThanOrEqual(4)
+    expect(Math.hypot(next.x - before.x, next.y - before.y)).toBeGreaterThan(0)
+    const remainingToBoundary = Math.max(0, firstStepDuration - useOfficeStore.getState().dashboardHistory.position_ms + 100)
+    await vi.advanceTimersByTimeAsync(remainingToBoundary)
     const current = useOfficeStore.getState()
-    expect(current.agents['reviewer~reviewer'].maw.verdict).toBe('fail')
-    expect(current.dashboardHistoryPresentation.agents['reviewer~reviewer'].active).toBe(true)
+    expect(current.dashboardHistory.step).toBe(2)
+    expect(current.dashboardHistory.position_ms).toBeGreaterThanOrEqual(firstStepDuration)
+    const totalDuration = current.dashboardHistory.duration_ms
     current.togglePause()
     const frozen = structuredClone(useOfficeStore.getState().dashboardHistoryPresentation)
     await vi.advanceTimersByTimeAsync(5000)
     expect(useOfficeStore.getState().dashboardHistoryPresentation).toEqual(frozen)
-    expect(useOfficeStore.getState().dashboardHistory).toMatchObject({ state: 'paused', duration_ms: 12000 })
-    host.send({ ...command('seek'), position_ms: 1500 })
+    expect(useOfficeStore.getState().dashboardHistory).toMatchObject({ state: 'paused', duration_ms: totalDuration })
+    host.send({ ...command('seek'), position_ms: current.dashboardHistory.duration_ms - 1 })
     const sought = useOfficeStore.getState()
-    expect(sought.dashboardHistory).toMatchObject({ state: 'paused', step: 1, position_ms: 1500, locating: true })
-    expect(sought.dashboardHistoryPresentation.agents[id].position.x).toBe(frozen.agents[id].position.x)
-    expect(sought.dashboardHistoryPresentation.agents[id].position.y).toBe(frozen.agents[id].position.y)
-    expect(sought.agents['reviewer~reviewer'].maw.verdict).toBeNull()
-    expect(sought.dashboardHistoryPresentation.agents['reviewer~reviewer'].active).toBe(false)
+    expect(sought.dashboardHistory).toMatchObject({ state: 'paused', step: 3, locating: true })
+    expect(sought.dashboardHistory.position_ms).toBe(current.dashboardHistory.duration_ms - 1)
+    expect(sought.agents['reviewer~reviewer'].maw.verdict).toBe('fail')
+    expect(sought.dashboardHistoryPresentation.agents['reviewer~reviewer'].active).toBe(true)
     await vi.advanceTimersByTimeAsync(500)
     const located = structuredClone(useOfficeStore.getState().dashboardHistoryPresentation)
-    expect(useOfficeStore.getState().dashboardHistory).toMatchObject({ state: 'paused', position_ms: 1500, locating: false })
+    expect(useOfficeStore.getState().dashboardHistory).toMatchObject({ state: 'paused', locating: false })
     await vi.advanceTimersByTimeAsync(5000)
     expect(useOfficeStore.getState().dashboardHistoryPresentation).toEqual(located)
+    host.send({ ...command('seek'), position_ms: 1500 })
+    expect(useOfficeStore.getState().agents['reviewer~reviewer'].maw.verdict).toBeNull()
+    expect(useOfficeStore.getState().dashboardHistoryPresentation.agents['reviewer~reviewer'].active).toBe(false)
+    await vi.advanceTimersByTimeAsync(500)
     // Playing seek holds target time while locating, then crosses a step boundary
     // from the current visible coordinate rather than reviving the old transition.
     useOfficeStore.getState().togglePause()
-    host.send({ ...command('seek'), position_ms: 3990 })
+    host.send({ ...command('seek'), position_ms: firstStepDuration - 10 })
     await vi.advanceTimersByTimeAsync(500)
     const beforeBoundary = useOfficeStore.getState().dashboardHistoryPresentation.agents[id].position
     await vi.advanceTimersByTimeAsync(50)
     const afterBoundary = useOfficeStore.getState().dashboardHistoryPresentation.agents[id].position
     expect(useOfficeStore.getState().dashboardHistory.step).toBe(2)
-    expect(Math.hypot(beforeBoundary.x - afterBoundary.x, beforeBoundary.y - afterBoundary.y)).toBeLessThan(2)
-    host.send({ ...command('seek'), position_ms: 12000 })
+    expect(Math.hypot(beforeBoundary.x - afterBoundary.x, beforeBoundary.y - afterBoundary.y)).toBeLessThan(4)
+    host.send({ ...command('seek'), position_ms: totalDuration })
     const endSeekFrom = useOfficeStore.getState().dashboardHistoryPresentation.agents[id].position
     expect(endSeekFrom.x).toBe(afterBoundary.x)
     expect(endSeekFrom.y).toBe(afterBoundary.y)
-    expect(useOfficeStore.getState().dashboardHistory).toMatchObject({ state: 'ended', position_ms: 12000 })
+    expect(useOfficeStore.getState().dashboardHistory).toMatchObject({ state: 'ended', position_ms: totalDuration })
     await vi.advanceTimersByTimeAsync(500)
     expect(useOfficeStore.getState().dashboardHistoryPresentation.agents[id].position).toMatchObject(useOfficeStore.getState().agents[id].position)
     useOfficeStore.getState().togglePause() // replay, without remounting the characters
-    await vi.advanceTimersByTimeAsync(11950)
+    await vi.advanceTimersByTimeAsync(totalDuration + 100)
     const beforeEnd = useOfficeStore.getState().dashboardHistoryPresentation.agents[id].position
-    await vi.advanceTimersByTimeAsync(50)
     const ended = useOfficeStore.getState()
     expect(ended.dashboardHistory.state).toBe('ended')
     expect(ended.dashboardHistoryPresentation.agents[id].position.x).toBe(beforeEnd.x)

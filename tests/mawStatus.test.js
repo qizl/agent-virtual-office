@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest'
 import http from 'node:http'
 import { createMawStatus, MAW_MEMBER_LIMIT, MAW_MAX_BODY_BYTES } from '../src/server/mawStatus.mjs'
 import { envelopeIsNewer } from '../src/inference/mawIntegration.js'
+import { mawHandoffId } from '../src/inference/dashboardSnapshot.js'
 
 // Drive the connect-style middleware through a real HTTP server so POST/GET/SSE
 // semantics (lease, epoch/seq, consumer idle) are exercised end to end.
@@ -89,6 +90,41 @@ describe('MAW snapshot transport', () => {
     expect(body.server_epoch).toBe(ack.server_epoch)
   })
 
+  it('validates and retains exact task identities and handoff edges', async () => {
+    const { base } = await makeChannel()
+    const executorTask = { seq: 1, round: 1, type: 'dev', source_ref: 'executor-1/task-001.json', ref_task: null }
+    const reviewerTask = { seq: 2, round: 1, type: 'review', source_ref: 'reviewer-1/task-002.json', ref_task: executorTask.source_ref }
+    const edge = { id: mawHandoffId('submission', 'task02y', 'task04w', executorTask.source_ref, reviewerTask.source_ref),
+      kind: 'submission', sender_member_id: 'task02y', recipient_member_id: 'task04w',
+      source_task: executorTask.source_ref, target_task: reviewerTask.source_ref }
+    const valid = snapshot({ assignment_state: 'assigned', handoff_state: 'complete', handoffs: [edge], members: [
+      snapshot().members[0], { ...snapshot().members[1], current_task: executorTask },
+      snapshot().members[2], { ...snapshot().members[3], current_task: reviewerTask },
+    ] })
+    const accepted = await fetch(`${base}/api/maw/status`, { method: 'POST', body: JSON.stringify(valid) })
+    expect(accepted.status).toBe(200)
+    const body = await (await fetch(`${base}/api/maw/status`)).json()
+    expect(body.snapshot.handoffs).toEqual([edge])
+    expect(body.snapshot.members[1].current_task).toEqual(executorTask)
+
+    for (const invalid of [
+      snapshot({ assignment_state: null }),
+      snapshot({ handoff_state: 'partial' }),
+      snapshot({ ...valid, handoffs: [{ ...edge, recipient_member_id: 'foreign' }] }),
+      snapshot({ ...valid, handoffs: [{ ...edge, target_task: 'reviewer-1/task-099.json' }] }),
+      snapshot({ ...valid, handoffs: [{ ...edge, id: 'a'.repeat(32) }] }),
+      snapshot({ ...valid, handoffs: [{ ...edge, kind: 'review-result' }] }),
+      snapshot({ ...valid, handoffs: [edge, edge] }),
+      snapshot({ ...valid, handoff_state: 'unavailable' }),
+      snapshot({ ...valid, members: valid.members.map((member) => member.id === 'task02y'
+        ? { ...member, current_task: { ...executorTask, source_ref: '../private.json' } } : member) }),
+    ]) {
+      const rejected = await fetch(`${base}/api/maw/status`, { method: 'POST', body: JSON.stringify(invalid) })
+      expect(rejected.status).toBe(400)
+      expect((await rejected.json()).error.code).toBe('invalid-snapshot')
+    }
+  })
+
   it('same seq + same content is an idempotent duplicate; same seq + new content is a 409', async () => {
     const { base } = await makeChannel()
     await fetch(`${base}/api/maw/status`, { method: 'POST', body: JSON.stringify(snapshot()) })
@@ -103,6 +139,24 @@ describe('MAW snapshot transport', () => {
     })
     expect(conflict.status).toBe(409)
     expect((await conflict.json()).error.code).toBe('sequence-content-conflict')
+  })
+
+  it('same seq conflicts when only the handoff facts change', async () => {
+    const { base } = await makeChannel()
+    const executorTask = { seq: 1, round: 1, type: 'dev', source_ref: 'executor-1/task-001.json', ref_task: null }
+    const reviewerTask = { seq: 2, round: 1, type: 'review', source_ref: 'reviewer-1/task-002.json', ref_task: executorTask.source_ref }
+    const members = [
+      snapshot().members[0], { ...snapshot().members[1], current_task: executorTask },
+      snapshot().members[2], { ...snapshot().members[3], current_task: reviewerTask },
+    ]
+    const first = snapshot({ members, assignment_state: 'assigned', handoff_state: 'complete', handoffs: [] })
+    const edge = { id: mawHandoffId('submission', 'task02y', 'task04w', executorTask.source_ref, reviewerTask.source_ref),
+      kind: 'submission', sender_member_id: 'task02y', recipient_member_id: 'task04w',
+      source_task: executorTask.source_ref, target_task: reviewerTask.source_ref }
+    await fetch(`${base}/api/maw/status`, { method: 'POST', body: JSON.stringify(first) })
+    const changed = await fetch(`${base}/api/maw/status`, { method: 'POST', body: JSON.stringify({ ...first, handoffs: [edge] }) })
+    expect(changed.status).toBe(409)
+    expect((await changed.json()).error.code).toBe('sequence-content-conflict')
   })
 
   it('older producer seq is rejected without overwriting', async () => {

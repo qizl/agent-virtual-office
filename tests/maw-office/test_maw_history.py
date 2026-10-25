@@ -155,7 +155,53 @@ class HistoryTest(unittest.TestCase):
         self.assertEqual(published["cue"]["activity"], "publication")
         self.assertEqual(published["cue"]["related_member_ids"], [executor(published)["id"]])
         self.assertEqual(executor(published)["status"], "idle")
+        self.assertNotIn("handoff", delivery["cue"])
+        handoff = published["cue"]["handoff"]
+        self.assertEqual(handoff["kind"], "submission")
+        self.assertEqual(handoff["sender_member_id"], executor(published)["id"])
+        self.assertEqual(handoff["recipient_member_id"], published["cue"]["actor_member_id"])
+        self.assertEqual((handoff["source_task"], handoff["target_task"]),
+                         ("executor-1/task-001.json", "reviewer-1/task-002.json"))
+        self.assertIsNone(next(member for member in delivery["snapshot"]["members"] if member["role"] == "reviewer")["current_task"])
         self.assertNotIn("duration", json.dumps(result))
+
+    def test_future_task_supplement_cannot_bind_an_earlier_publication(self):
+        root, directory = runtime(executor_tasks=[fixtures.task(1, status="dev-complete")],
+                                  reviewer_tasks=[fixtures.task(2, type_="review", status="initialized", ref_task="executor-1/task-001")])
+        # Only reviewer publication is recorded. Current dev state is an undated
+        # supplement and cannot establish the sender in the older transaction.
+        task = fixtures.task(2, type_="review", status="initialized", ref_task="executor-1/task-001")
+        operation(directory, {"action": "create-review-task", "owner": "reviewer-1", "seq": 2,
+                              "task": task, "publication": {"task_file": "reviewer-1/task-002.json"}})
+        result = read(root)
+        first = result["steps"][0]
+        self.assertNotIn("handoff", first["cue"])
+        self.assertEqual(first["cue"]["related_member_ids"], [])
+        self.assertIsNone(executor(first)["current_task"])
+        self.assertEqual(first["snapshot"]["handoffs"], [])
+
+    def test_history_review_result_has_exact_reverse_direction_and_preserves_failure(self):
+        root, directory = runtime(executor_tasks=[fixtures.task(1, status="review-failed")],
+                                  reviewer_tasks=[fixtures.task(2, type_="review", status="review-failed", ref_task="executor-1/task-001")])
+        # Today's exit records do not prove an inability to meet in the past.
+        fixtures.write(directory / "executor-1" / "terminate.json", {"schema": "maw.terminate/1", "status": "confirmed"})
+        result = read(root)
+        review = next(step for step in result["steps"] if step["id"] == "task-result:reviewer-1/task-002")
+        edge = review["cue"]["handoff"]
+        self.assertEqual(edge["kind"], "review-result")
+        self.assertEqual(edge["sender_member_id"], review["cue"]["actor_member_id"])
+        self.assertEqual(edge["recipient_member_id"], executor(review)["id"])
+        self.assertEqual(executor(review)["current_task"]["source_ref"], "executor-1/task-001.json")
+        self.assertIsNone(executor(review)["verdict"])
+        sender = next(member for member in review["snapshot"]["members"] if member["id"] == edge["sender_member_id"])
+        self.assertEqual(sender["verdict"], "fail")
+        for mutate in (lambda cue: cue["handoff"].update(recipient_member_id="foreign"),
+                       lambda cue: cue["handoff"].update(source_task="reviewer-1/task-099.json"),
+                       lambda cue: cue["handoff"].update(kind="submission")):
+            cue = copy.deepcopy(review["cue"])
+            mutate(cue)
+            with self.assertRaises(ValueError):
+                history._validate_cue(cue, review["snapshot"])
 
     def test_unbound_delivery_is_omitted_without_losing_valid_publication(self):
         for patch in (lambda op: op["writes"]["executor-1/task-001.json"].update(before=BEFORE),
@@ -411,14 +457,14 @@ class HistoryTest(unittest.TestCase):
                 else:
                     path = directory / "executor-1" / "task-002.json"
                     fixtures.write(path, fixtures.task(2))
-                original = history._projection_read_json_capped
+                original = history._read_history_input
 
                 def recursion_failure(input_path):
                     if input_path == path:
-                        raise RecursionError("excessive JSON nesting")
+                        return None, "corrupt", None
                     return original(input_path)
 
-                with mock.patch.object(history, "_projection_read_json_capped", side_effect=recursion_failure):
+                with mock.patch.object(history, "_read_history_input", side_effect=recursion_failure):
                     result = read(root)
                 self.assertTrue(result["eligible"])
                 self.assertFalse(result["complete"])
@@ -455,6 +501,37 @@ class HistoryTest(unittest.TestCase):
 
         def changed(*args):
             fixtures.write(directory / "executor-1" / "task-001.json", fixtures.task(1, status="review-passed"))
+            return actual(*args)
+
+        with mock.patch.object(history, "_task_records", side_effect=changed):
+            with self.assertRaises(history.BridgeError) as error:
+                read(root)
+        self.assertEqual(error.exception.code, "input-inconsistent")
+
+    def test_operation_content_change_during_history_assembly_is_refused(self):
+        root, directory = runtime(executor_tasks=[fixtures.task(1, status="dev-complete")])
+        op = operation(directory, {"action": "complete-node", "node": "develop"})
+        actual = history._task_records
+
+        def changed(*args):
+            path = directory / "context" / "operations" / f"{op['op_id']}.json"
+            current = json.loads(path.read_text())
+            current["created_at"] = "2026-10-23T13:00:00+08:00"
+            fixtures.write(path, current)
+            return actual(*args)
+
+        with mock.patch.object(history, "_task_records", side_effect=changed):
+            with self.assertRaises(history.BridgeError) as error:
+                read(root)
+        self.assertEqual(error.exception.code, "input-inconsistent")
+
+    def test_operation_added_during_history_assembly_is_refused(self):
+        root, directory = runtime(executor_tasks=[fixtures.task(1, status="dev-complete")])
+        operation(directory, {"action": "complete-node", "node": "develop"})
+        actual = history._task_records
+
+        def changed(*args):
+            operation(directory, {"action": "complete-node", "node": "evaluate"}, revision=2)
             return actual(*args)
 
         with mock.patch.object(history, "_task_records", side_effect=changed):

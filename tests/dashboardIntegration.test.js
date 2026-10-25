@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { detectIntegrationConfig, detectProjectMode, getPlatformConfig } from '../src/systems/platformDetect.js'
 import { startDashboardIntegration, validateDashboardEnvelope } from '../src/inference/dashboardIntegration.js'
+import { mawHandoffId, validateDashboardSnapshot } from '../src/inference/dashboardSnapshot.js'
 import { useOfficeStore } from '../src/systems/store.js'
 
 function envelope(seq = 1, overrides = {}) {
@@ -74,6 +75,30 @@ describe('Dashboard envelope validation', () => {
     expect(validateDashboardEnvelope(atLimit)).toBe(false)
     expect(validateDashboardEnvelope({ server_epoch: 1, seq: 0, snapshot: null })).toBe(true)
 
+  })
+
+  it('validates exact-task handoff relations while preserving legacy snapshots', () => {
+    expect(mawHandoffId('submission', 'exec-1', 'rev-1', 'executor-1/task-001.json', 'reviewer-1/task-002.json'))
+      .toBe('4534b921036473945a2e397f0428183c')
+    const base = {
+      schema: 'avo.maw-snapshot/1', sampled_at: 1000, quality: 'ok', quality_detail: null,
+      workflow: null, terminal: null, members: [
+        { id: 'exec-1', role: 'executor', status: 'awaiting-approval',
+          current_task: { seq: 1, round: 1, type: 'dev', source_ref: 'executor-1/task-001.json', ref_task: null } },
+        { id: 'rev-1', role: 'reviewer', status: 'planning',
+          current_task: { seq: 2, round: 1, type: 'review', source_ref: 'reviewer-1/task-002.json', ref_task: 'executor-1/task-001.json' } },
+      ], assignment_state: 'assigned', handoff_state: 'complete',
+      handoffs: [{ id: mawHandoffId('submission', 'exec-1', 'rev-1', 'executor-1/task-001.json', 'reviewer-1/task-002.json'),
+        kind: 'submission', sender_member_id: 'exec-1', recipient_member_id: 'rev-1',
+        source_task: 'executor-1/task-001.json', target_task: 'reviewer-1/task-002.json' }],
+    }
+    expect(validateDashboardSnapshot(base)).toBe(true)
+    expect(validateDashboardSnapshot({ ...base, handoffs: [{ ...base.handoffs[0], recipient_member_id: 'foreign' }] })).toBe(false)
+    expect(validateDashboardSnapshot({ ...base, handoffs: [{ ...base.handoffs[0], target_task: 'reviewer-1/task-099.json' }] })).toBe(false)
+    expect(validateDashboardSnapshot({ ...base, assignment_state: 'maybe' })).toBe(false)
+    expect(validateDashboardSnapshot({ ...base, handoffs: [base.handoffs[0], base.handoffs[0]] })).toBe(false)
+    expect(validateDashboardSnapshot({ schema: 'avo.maw-snapshot/1', sampled_at: 1000, quality: 'ok',
+      quality_detail: null, workflow: null, terminal: null, members: [] })).toBe(true)
   })
 })
 

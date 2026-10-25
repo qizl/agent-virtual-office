@@ -14,6 +14,7 @@ import heapq
 import importlib.util
 import json
 import re
+import stat
 import sys
 import time
 from pathlib import Path
@@ -42,17 +43,12 @@ ACTIVITIES = {"ready", "publication", "work", "delivery", "result", "rework", "c
 MAX_TASK_REF_LENGTH = 128
 
 
-_projection_read_json_capped = projection.read_json_capped
-
-
-def _read_history_json_capped(path):
+def _decode_history_json(raw):
     """Reject recursion-heavy files before fingerprints or frame copies use them."""
     try:
-        data, why = _projection_read_json_capped(path)
-    except RecursionError:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return None, "corrupt"
-    if why is not None:
-        return data, why
     pending = [(data, 0)]
     while pending:
         value, depth = pending.pop()
@@ -63,6 +59,26 @@ def _read_history_json_capped(path):
         elif isinstance(value, list):
             pending.extend((child, depth + 1) for child in value)
     return data, None
+
+
+def _read_history_input(path):
+    """Read one capped input and retain its exact byte identity when readable."""
+    try:
+        raw = projection.read_bytes_capped(path)
+    except FileNotFoundError:
+        return None, "missing", None
+    except OSError:
+        return None, "corrupt", None
+    try:
+        data, why = _decode_history_json(raw)
+    except RecursionError:
+        return None, "corrupt", hashlib.sha256(raw).hexdigest()
+    return data, why, hashlib.sha256(raw).hexdigest()
+
+
+def _read_history_json_capped(path):
+    data, why, _digest = _read_history_input(path)
+    return data, why
 
 
 # This projection module is loaded privately for history. Its per-file boundary
@@ -124,7 +140,8 @@ def _dashboard_snapshot(state, sampled_at):
     raw = projection.validate_snapshot(projection.build_snapshot(snapshot_state, producer, 1, sampled_at))
     return {"schema": raw["schema"], "workflow": raw["workflow"], "quality": raw["quality"],
             "quality_detail": raw["quality_detail"], "terminal": raw["terminal"], "sampled_at": sampled_at,
-            "producer_id": producer, "producer_seq": 1, "accepted_at": sampled_at, "members": raw["members"]}
+            "producer_id": producer, "producer_seq": 1, "accepted_at": sampled_at, "members": raw["members"],
+            "assignment_state": raw["assignment_state"], "handoff_state": raw["handoff_state"], "handoffs": raw["handoffs"]}
 
 
 def _current_signature(state):
@@ -137,6 +154,7 @@ def _validate_frame(snapshot):
     raw = {"schema": snapshot["schema"], "producer": snapshot["producer_id"], "seq": snapshot["producer_seq"],
            "sampled_at": snapshot["sampled_at"], "workflow": snapshot["workflow"], "quality": snapshot["quality"],
            "quality_detail": snapshot["quality_detail"], "terminal": snapshot["terminal"], "members": snapshot["members"]}
+    raw.update({field: snapshot[field] for field in ("assignment_state", "handoff_state", "handoffs") if field in snapshot})
     projection.validate_snapshot(raw)
     if len(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()) > projection.MAX_SNAPSHOT_BYTES:
         raise BridgeError("payload-too-large", "history frame exceeds the snapshot limit", projection.EXIT_PROTOCOL)
@@ -313,12 +331,22 @@ def _validate_operation(op, name, state):
 
 def _operation_records(state, task_dir, warnings):
     directory = projection.checked_path(task_dir, "context", "operations")
+    directory_before = _path_identity(directory, directory=True)
     names, limited = _bounded_names(directory, lambda name: name.endswith(".json"), MAX_OPERATIONS)
+    directory_after_names = _path_identity(directory, directory=True)
+    if directory_before != directory_after_names:
+        raise BridgeError("input-inconsistent", "operation directory changed during history observation", projection.EXIT_NO_DATA)
     if limited:
         _warning(warnings, "operation-input-limit")
-    records, seen = [], set()
+    records, seen, identities = [], set(), []
     for name in names:
-        op, why = projection.read_json_capped(projection.checked_path(directory, name))
+        path = projection.checked_path(directory, name)
+        before = _path_identity(path, directory=False)
+        op, why, digest = _read_history_input(path)
+        after = _path_identity(path, directory=False)
+        if before != after:
+            raise BridgeError("input-inconsistent", "operation file changed during history observation", projection.EXIT_NO_DATA)
+        identities.append((name, before, digest))
         try:
             if why:
                 raise ValueError("unreadable operation")
@@ -329,6 +357,9 @@ def _operation_records(state, task_dir, warnings):
             records.append((effective, op["op_id"], op, action))
         except (ValueError, TypeError, KeyError, OverflowError):
             _warning(warnings, "operation-record-invalid")
+    directory_after_reads = _path_identity(directory, directory=True)
+    if directory_before != directory_after_reads:
+        raise BridgeError("input-inconsistent", "operation directory changed during history observation", projection.EXIT_NO_DATA)
     revisions = [record[0] for record in records]
     conflicting = {revision for revision in revisions if revisions.count(revision) > 1}
     if conflicting:
@@ -342,7 +373,44 @@ def _operation_records(state, task_dir, warnings):
         if (len(revisions) != current_revision - 1 or revisions[0] != 2 or revisions[-1] != current_revision
                 or any(right != left + 1 for left, right in zip(revisions, revisions[1:]))):
             _warning(warnings, "operation-history-incomplete")
-    return sorted(records, key=lambda record: (record[0], record[1]))
+    token = (directory_before, tuple(names), limited, tuple(identities))
+    return sorted(records, key=lambda record: (record[0], record[1])), token
+
+
+def _path_identity(path, *, directory):
+    """Return bounded filesystem identity without following a substituted link."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    expected = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    if not expected:
+        raise BridgeError("unsafe-file-type", "operation history contains an unsafe file type", projection.EXIT_REFUSED)
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _operation_input_token(task_dir):
+    """Re-read the same bounded operation set to detect replacement or mutation."""
+    directory = projection.checked_path(task_dir, "context", "operations")
+    directory_before = _path_identity(directory, directory=True)
+    names, limited = _bounded_names(directory, lambda name: name.endswith(".json"), MAX_OPERATIONS)
+    directory_after_names = _path_identity(directory, directory=True)
+    if directory_before != directory_after_names:
+        raise BridgeError("input-inconsistent", "operation directory changed during history observation", projection.EXIT_NO_DATA)
+    identities = []
+    for name in names:
+        path = projection.checked_path(directory, name)
+        before = _path_identity(path, directory=False)
+        _data, _why, digest = _read_history_input(path)
+        after = _path_identity(path, directory=False)
+        if before != after:
+            raise BridgeError("input-inconsistent", "operation file changed during history observation", projection.EXIT_NO_DATA)
+        identities.append((name, before, digest))
+    directory_after_reads = _path_identity(directory, directory=True)
+    if directory_before != directory_after_reads:
+        raise BridgeError("input-inconsistent", "operation directory changed during history observation", projection.EXIT_NO_DATA)
+    return (directory_before, tuple(names), limited, tuple(identities))
 
 
 def _member_for(frame, state, folder):
@@ -359,10 +427,11 @@ def _task_ref(value):
 
 def _neutral_frame(template):
     frame = copy.deepcopy(template)
-    frame.update(terminal=None, workflow="MAW · 任务记录回顾", quality="ok", quality_detail=None)
+    frame.update(terminal=None, workflow="MAW · 任务记录回顾", quality="ok", quality_detail=None,
+                 assignment_state="unknown", handoff_state="complete", handoffs=[])
     for member in frame["members"]:
         member.update(status="idle", label="此步无活动记录", detail=None, round=None,
-                      task_kind=None, verdict=None, terminate=None, stalled=False)
+                      task_kind=None, verdict=None, terminate=None, stalled=False, current_task=None, handoff_pending=None)
     return frame
 
 
@@ -371,7 +440,8 @@ def _validate_cue(cue, snapshot):
     if cue is None:
         return
     member_ids = {member["id"] for member in snapshot["members"]}
-    if (not isinstance(cue, dict) or set(cue) != {"actor_member_id", "activity", "task", "related_member_ids"}
+    required = {"actor_member_id", "activity", "task", "related_member_ids"}
+    if (not isinstance(cue, dict) or not required.issubset(cue) or set(cue) - required - {"handoff"}
             or not isinstance(cue["activity"], str) or cue["activity"] not in ACTIVITIES
             or (cue["actor_member_id"] is not None and (not isinstance(cue["actor_member_id"], str)
                                                        or cue["actor_member_id"] not in member_ids))):
@@ -389,6 +459,13 @@ def _validate_cue(cue, snapshot):
                 or not isinstance(task["source_ref"], str) or _task_ref(task["source_ref"]) != task["source_ref"]
                 or (task["ref_task"] is not None and _task_ref(task["ref_task"]) != task["ref_task"])):
             raise ValueError("invalid history cue task")
+    handoff = cue.get("handoff")
+    if handoff is not None:
+        if (not projection.valid_handoff(handoff, snapshot["members"]) or task is None
+                or handoff not in snapshot.get("handoffs", [])
+                or task["source_ref"] not in (handoff["source_task"], handoff["target_task"])
+                or cue["actor_member_id"] not in (handoff["sender_member_id"], handoff["recipient_member_id"])):
+            raise ValueError("invalid history handoff")
 
 
 def _cue(actor, activity, task=None, related=()):
@@ -415,8 +492,53 @@ def _task_cue(frame, state, folder, task, known_tasks):
         activity = "delivery"
     else:
         activity = "result"
-    return _cue(actor, activity, {"seq": task["seq"], "round": task["round"], "type": kind,
-                                 "source_ref": source, "ref_task": parent}, related)
+    cue = _cue(actor, activity, {"seq": task["seq"], "round": task["round"], "type": kind,
+                                "source_ref": source, "ref_task": parent}, related)
+    # Only identities already encountered at this causal step may be exposed.
+    latest = {}
+    for ref, record in known_tasks.items():
+        owner = ref.split("/", 1)[0]
+        if owner not in latest or record["seq"] > latest[owner]["seq"]:
+            latest[owner] = record
+    for owner, record in latest.items():
+        member = _member_for(frame, state, owner)
+        if member:
+            member["current_task"] = projection.task_identity(owner, record)
+    frame["assignment_state"] = "assigned" if known_tasks else "unknown"
+
+    def edge(direction, sender_folder, recipient_folder, source_ref, target_ref):
+        sender, recipient = _member_for(frame, state, sender_folder), _member_for(frame, state, recipient_folder)
+        if sender is None or recipient is None:
+            return None
+        fact = projection.handoff_fact(direction, sender["id"], recipient["id"], source_ref, target_ref)
+        return fact if projection.valid_handoff(fact, frame["members"]) else None
+
+    handoff = None
+    if kind == "dev" and activity == "delivery":
+        matches = [(ref, record) for ref, record in known_tasks.items() if record["type"] == "review"
+                   and record["round"] == task["round"] and _task_ref(record.get("ref_task")) == source]
+        if len(matches) == 1:
+            ref, review = matches[0]
+            if review["status"] not in ("review-passed", "review-failed"):
+                handoff = edge("submission", folder, ref.split("/", 1)[0], source, _task_ref(ref))
+        else:
+            actor["handoff_pending"] = "conflict" if matches else "missing"
+    elif kind == "review" and previous and previous["type"] == "dev" and previous["round"] == task["round"]:
+        if activity == "result":
+            handoff = edge("review-result", folder, parent.split("/", 1)[0], source, parent)
+        elif activity == "publication" and previous["status"] in ("dev-complete", "reviewing"):
+            matches = [record for record in known_tasks.values() if record["type"] == "review"
+                       and record["round"] == task["round"] and _task_ref(record.get("ref_task")) == parent]
+            if len(matches) == 1:
+                handoff = edge("submission", parent.split("/", 1)[0], folder, parent, source)
+            else:
+                actor["handoff_pending"] = "conflict"
+    elif kind == "review" and activity in ("publication", "result"):
+        actor["handoff_pending"] = "missing" if previous is None else "conflict"
+    if handoff:
+        frame["handoffs"] = [handoff]
+        cue["handoff"] = handoff
+    return cue
 
 
 def _manager(frame):
@@ -527,14 +649,14 @@ def read_history(project_root: Path, task_id: str, *, project: str, now=None) ->
             _warning(warnings, "current-input-incomplete")
         terminal, conflict = _terminal(state)
         task_dir = projection.safe_resolve(Path(project_root), f"{projection.RUNTIME_REL}/{task_id}")
-        operations = _operation_records(state, task_dir, warnings)
+        operations, operation_token = _operation_records(state, task_dir, warnings)
         tasks = _task_records(state, task_dir, warnings)
         for _revision, _identity, _op, action in operations:
             if action["action"] in CLOSE and action["manifest"]["status"] != terminal:
                 conflict = True
         if conflict:
             _warning(warnings, "terminal-conflict")
-        known_tasks = dict(tasks)
+        known_tasks = {}
         steps = []
 
         def append(identity, kind, label, recorded_at, refs, snapshot, cue):
@@ -557,15 +679,20 @@ def read_history(project_root: Path, task_id: str, *, project: str, now=None) ->
                 predecessor = _delivery_predecessor(op, action, state, warnings)
                 if predecessor:
                     folder, task = predecessor
+                    known_tasks[f"{folder}/task-{task['seq']:03d}"] = task
                     frame = _neutral_frame(final_snapshot)
                     _task_fact(frame, state, folder, task)
                     append(identity + ":source-state", "task-transition", "评审派发事务中记录的交付状态",
                            recorded_at, refs, frame, _task_cue(frame, state, folder, task, known_tasks))
                 frame = _neutral_frame(final_snapshot)
+                if action["action"] in PUBLICATIONS:
+                    owner = action["role"] if action["action"] == "assign-dev" else action["owner"]
+                    known_tasks[f"{owner}/task-{action['task']['seq']:03d}"] = action["task"]
                 kind, label, cue = _operation_fact(frame, state, action, known_tasks)
                 # Terminal conclusions belong to their actual final snapshot only.
                 append(identity, kind, label, recorded_at, refs, frame, cue)
             for ref, task in tasks:
+                known_tasks[ref] = task
                 frame = _neutral_frame(final_snapshot)
                 folder = ref.split("/", 1)[0]
                 _task_fact(frame, state, folder, task)
@@ -596,6 +723,8 @@ def read_history(project_root: Path, task_id: str, *, project: str, now=None) ->
         after = projection.read_with_consistency(Path(project_root), task_id, 30, task_validator=_task_shape)
         if after.get("_inconsistent") or _current_signature(after) != baseline:
             raise BridgeError("input-inconsistent", "task inputs changed during history observation", projection.EXIT_NO_DATA)
+        if _operation_input_token(task_dir) != operation_token:
+            raise BridgeError("input-inconsistent", "operation history changed during observation", projection.EXIT_NO_DATA)
         return result
     except BridgeError:
         raise

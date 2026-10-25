@@ -125,5 +125,112 @@ class DashboardReadTest(unittest.TestCase):
             self.assertTrue(projection.unsafe_component(fixtures.uuid_tmp()))
 
 
+class InteractionProjectionTest(unittest.TestCase):
+    def snapshot(self, **kwargs):
+        root = fixtures.build_runtime(fixtures.uuid_tmp(), **kwargs)
+        return root, projection.read_snapshot(root, "maw-synth-001", now=1000)
+
+    def test_assignment_requires_complete_observation(self):
+        root, value = self.snapshot()
+        self.assertEqual(value["assignment_state"], "unassigned")
+        state = projection.read_runtime_state(root, "maw-synth-001")
+        state["degraded"].append("executor-1/tasks:corrupt")
+        raw = projection.build_snapshot(state, "producer-test", 1, 1000)
+        self.assertEqual((raw["assignment_state"], raw["handoff_state"]), ("unknown", "unavailable"))
+        state["degraded"].clear()
+        del state["roles"]["reviewer-1"]
+        self.assertEqual(projection.build_snapshot(state, "producer-test", 1, 1000)["assignment_state"], "unknown")
+
+    def test_delayed_exact_reviewer_publishes_one_stable_submission(self):
+        root, first = self.snapshot(executor_tasks=[fixtures.task(1, status="dev-complete")])
+        actor = fixtures.member_by_role(first["members"], "executor")
+        self.assertEqual(actor["current_task"]["source_ref"], "executor-1/task-001.json")
+        self.assertEqual(actor["handoff_pending"], "missing")
+        self.assertEqual(first["handoffs"], [])
+        directory = root / RUNTIME_REL / "maw-synth-001"
+        manifest = json.loads((directory / "task.json").read_text())
+        manifest["roles"].append("reviewer-2")
+        fixtures.write(directory / "task.json", manifest)
+        fixtures.write(directory / "reviewer-2" / "ready.json", {"schema": "maw.ready/1", "status": "confirmed"})
+        fixtures.write(directory / "reviewer-2" / "task-002.json",
+                       fixtures.task(2, type_="review", status="initialized", ref_task="executor-1/task-001"))
+        value = projection.read_snapshot(root, "maw-synth-001", now=2000)
+        self.assertEqual(value["assignment_state"], "assigned")
+        self.assertEqual(len(value["handoffs"]), 1)
+        edge = value["handoffs"][0]
+        self.assertEqual(projection.handoff_fact("submission", "exec-1", "rev-1", "executor-1/task-001.json",
+                                                  "reviewer-1/task-002.json")["id"], "4534b921036473945a2e397f0428183c")
+        exact_reviewer = next(member for member in value["members"] if (member.get("current_task") or {}).get("source_ref") == "reviewer-2/task-002.json")
+        self.assertEqual((edge["kind"], edge["sender_member_id"], edge["recipient_member_id"]),
+                         ("submission", actor["id"], exact_reviewer["id"]))
+        self.assertEqual(value["handoffs"], projection.read_snapshot(root, "maw-synth-001", now=3000)["handoffs"])
+
+    def test_conflict_not_ready_and_stale_target_never_guess_a_recipient(self):
+        dev = fixtures.task(1, status="dev-complete")
+        review = fixtures.task(2, type_="review", status="initialized", ref_task="executor-1/task-001")
+        root, value = self.snapshot(executor_tasks=[dev], reviewer_tasks=[review], reviewer_ready=None)
+        self.assertEqual(value["handoffs"], [])
+        self.assertEqual(fixtures.member_by_role(value["members"], "executor")["handoff_pending"], "not-ready")
+        directory = root / RUNTIME_REL / "maw-synth-001"
+        fixtures.write(directory / "reviewer-1" / "ready.json", {"schema": "maw.ready/1", "status": "confirmed"})
+        fixtures.write(directory / "reviewer-1" / "task-003.json", fixtures.task(3, type_="review", ref_task="executor-1/task-001"))
+        value = projection.read_snapshot(root, "maw-synth-001", now=1000)
+        self.assertEqual(value["handoffs"], [])
+        self.assertEqual(fixtures.member_by_role(value["members"], "executor")["handoff_pending"], "conflict")
+        # A reviewer reassigned to an unrelated current task is unavailable.
+        fixtures.write(directory / "reviewer-1" / "task-003.json", fixtures.task(3, type_="review", ref_task=None))
+        value = projection.read_snapshot(root, "maw-synth-001", now=1000)
+        self.assertEqual(value["handoffs"], [])
+        self.assertEqual(fixtures.member_by_role(value["members"], "executor")["handoff_pending"], "not-ready")
+
+    def test_review_failure_returns_only_to_exact_author_and_not_rework_successor(self):
+        dev = fixtures.task(1, status="review-failed")
+        review = fixtures.task(2, type_="review", status="review-failed", ref_task="executor-1/task-001")
+        root, value = self.snapshot(executor_tasks=[dev], reviewer_tasks=[review])
+        self.assertEqual([edge["kind"] for edge in value["handoffs"]], ["review-result"])
+        self.assertEqual(value["handoffs"][0]["target_task"], "executor-1/task-001.json")
+        self.assertEqual(fixtures.member_by_role(value["members"], "executor")["status"], "blocked")
+        self.assertEqual(fixtures.member_by_role(value["members"], "reviewer")["verdict"], "fail")
+        directory = root / RUNTIME_REL / "maw-synth-001"
+        fixtures.write(directory / "executor-1" / "task-003.json",
+                       fixtures.task(3, status="dev-complete", round_=2, ref_task="executor-1/task-001"))
+        value = projection.read_snapshot(root, "maw-synth-001", now=1000)
+        self.assertEqual(value["handoffs"], [])
+        self.assertEqual(fixtures.member_by_role(value["members"], "executor")["handoff_pending"], "missing")
+        self.assertEqual(fixtures.member_by_role(value["members"], "reviewer")["handoff_pending"], "not-ready")
+
+    def test_interaction_input_limit_disables_whole_group(self):
+        root, _value = self.snapshot(executor_tasks=[fixtures.task(1)])
+        state = projection.read_runtime_state(root, "maw-synth-001")
+        state["roles"]["executor-1"]["tasks"] = [fixtures.task(index) for index in range(1, 201)]
+        state["roles"]["reviewer-1"]["tasks"] = [fixtures.task(201, type_="review", ref_task="executor-1/task-200")]
+        value = projection.build_snapshot(state, "producer-test", 1, 1000)
+        self.assertEqual(value["handoffs"], [])
+        self.assertEqual(value["handoff_state"], "unavailable")
+        self.assertEqual(value["assignment_state"], "unknown")
+
+    def test_new_snapshot_fields_reject_malformed_or_cross_task_relationships(self):
+        _root, value = self.snapshot(executor_tasks=[fixtures.task(1, status="dev-complete")],
+                                    reviewer_tasks=[fixtures.task(2, type_="review", status="initialized", ref_task="executor-1/task-001")])
+        raw = {**value, "producer": value["producer_id"], "seq": 1}
+        projection.validate_snapshot(raw)
+        mutations = [lambda v: v.update(assignment_state=None), lambda v: v.update(handoff_state="guessed"),
+                     lambda v: v["handoffs"][0].update(recipient_member_id="foreign"),
+                     lambda v: v["handoffs"][0].update(source_task="executor-1/task-999.json"),
+                     lambda v: v["handoffs"][0].update(kind="handover"),
+                     lambda v: v["handoffs"][0].update(extra=True),
+                     lambda v: v["handoffs"].append(copy.deepcopy(v["handoffs"][0])),
+                     lambda v: v.update(handoffs=[None] * 201),
+                     lambda v: fixtures.member_by_role(v["members"], "executor")["current_task"].update(source_ref="../private.json"),
+                     lambda v: fixtures.member_by_role(v["members"], "executor")["current_task"].update(seq=True),
+                     lambda v: fixtures.member_by_role(v["members"], "reviewer")["current_task"].update(round=2)]
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                invalid = copy.deepcopy(raw)
+                mutate(invalid)
+                with self.assertRaises(projection.BridgeError):
+                    projection.validate_snapshot(invalid)
+
+
 if __name__ == "__main__":
     unittest.main()

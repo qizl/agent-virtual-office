@@ -2,6 +2,8 @@
 // store writes, live queues or inferred activity; its caller owns elapsed display time.
 import { calculateJourney, calcFacing } from '../systems/movementSystem.js'
 import { clampToVisible, MAW_ROLE_WORK_BEHAVIOR } from '../systems/mawChoreography.js'
+import { handoffApproachPoint } from '../systems/mawHandoff.js'
+import { validateMawHandoff } from './dashboardSnapshot.js'
 
 export const HISTORY_ACTIVITIES = ['ready', 'publication', 'work', 'delivery', 'result', 'rework', 'coordination', 'terminal']
 const TASK_TYPES = ['dev', 'plan-review', 'review', 'aggregate-review']
@@ -14,11 +16,16 @@ const point = (p) => p && Number.isFinite(p.x) && Number.isFinite(p.y)
 const clamp = (n) => Math.max(0, Math.min(1, n))
 const ease = (n) => { const t = clamp(n); return t * t * (3 - 2 * t) }
 const fixedRouteRandom = () => 0.5
+export const HISTORY_MAX_STEP_MS = 60_000
+export const HISTORY_MAX_TOTAL_MS = 12_000_000
+export const HISTORY_MAX_STEPS = 200
+const HISTORY_WALK_SPEED = 60
+const HANDOFF_TALK_MS = 3000
 
 /** Malformed or older cues are neutral, never guessed from prose or snapshot deltas. */
 export function historyCue(step) {
   const cue = step?.cue
-  if (!object(cue) || Object.keys(cue).some((key) => !['actor_member_id', 'activity', 'task', 'related_member_ids'].includes(key))
+  if (!object(cue) || Object.keys(cue).some((key) => !['actor_member_id', 'activity', 'task', 'related_member_ids', 'handoff'].includes(key))
     || !HISTORY_ACTIVITIES.includes(cue.activity) || !Array.isArray(cue.related_member_ids)
     || cue.related_member_ids.length > 1) return null
   const ids = new Set(step.snapshot?.members?.map((m) => m.id) || [])
@@ -44,10 +51,21 @@ export function historyCue(step) {
   }
   if (cue.related_member_ids.length) {
     const related = step.snapshot?.members?.find((member) => member.id === cue.related_member_ids[0])
-    if (!task?.ref_task || task.ref_task.match(TASK_REF)[1] !== related?.role) return null
+    if (!cue.handoff && (!task?.ref_task || task.ref_task.match(TASK_REF)[1] !== related?.role)) return null
   }
   if (cue.activity === 'ready' && (!actor || actor.status !== 'idle')) return null
   if (cue.activity === 'terminal' && !step.snapshot?.terminal) return null
+  if (cue.handoff !== undefined) {
+    const handoff = cue.handoff
+    if (!validateMawHandoff(handoff, step.snapshot?.members || [])) return null
+    if ((handoff.kind === 'submission'
+      && !((actor?.id === handoff.sender_member_id && cue.activity === 'delivery' && task?.source_ref === handoff.source_task)
+        || (actor?.id === handoff.recipient_member_id && cue.activity === 'publication' && task?.source_ref === handoff.target_task)))
+      || (handoff.kind === 'review-result' && (actor?.id !== handoff.sender_member_id || cue.activity !== 'result'
+        || task?.source_ref !== handoff.source_task))
+      || cue.related_member_ids.some((id) => id !== (actor.id === handoff.sender_member_id ? handoff.recipient_member_id : handoff.sender_member_id))) return null
+    if (step.snapshot?.handoff_state === 'unavailable') return null
+  }
   return cue
 }
 
@@ -103,7 +121,185 @@ function actionPosition(base, cue, elapsed, active) {
   return clampToVisible({ x: base.x + beat * (cue.activity === 'delivery' ? 18 : -10), y: base.y + beat * 8 })
 }
 
+function routeLength(path) {
+  return path.slice(1).reduce((sum, p, i) => sum + Math.hypot(p.x - path[i].x, p.y - path[i].y), 0)
+}
+
+function segment(from, to, start_ms = 0, duration_ms = null) {
+  const path = route(from, to)
+  const distance = routeLength(path)
+  return { path, distance, start_ms, end_ms: start_ms + (duration_ms ?? Math.ceil(distance / HISTORY_WALK_SPEED * 1000)),
+    ease: duration_ms !== null }
+}
+
+function plannedEntryPosition(entry, elapsed) {
+  let position = { ...entry.from, facing: 'down' }
+  let moving = false
+  for (const leg of entry.segments) {
+    if (elapsed < leg.start_ms) break
+    const ratio = leg.end_ms === leg.start_ms ? 1 : clamp((elapsed - leg.start_ms) / (leg.end_ms - leg.start_ms))
+    position = sampleHistoryRoute(leg.path, leg.ease ? ease(ratio) : ratio)
+    moving = elapsed < leg.end_ms && leg.distance > 1
+    if (elapsed < leg.end_ms) break
+  }
+  return { position, moving }
+}
+
+function degradeHistoryPlan(plan, warnings) {
+  warnings.add('history-animation-incomplete')
+  plan.duration_ms = 4000
+  plan.cue = null
+  plan.handoff = null
+  delete plan.terminal_start_ms
+  delete plan.finalSnapshot
+  plan.stage = '记录回顾 · 动画时轴不完整'
+  for (const entry of Object.values(plan.entries)) {
+    entry.active = false
+    entry.related = false
+    entry.gesture = { behavior: 'idle', expression: 'normal' }
+    entry.base = { ...entry.from }
+    delete entry.terminalBase
+    entry.segments = [segment(entry.from, entry.from, 0, 4000)]
+  }
+}
+
+/** Compile once from the default roster; playback and seeking sample this same plan. */
+export function prepareHistoryTimeline(steps, agents, finalSnapshot = null) {
+  if (!Array.isArray(steps) || steps.length > HISTORY_MAX_STEPS) throw new Error('history-timeline-invalid')
+  const positions = {}
+  const plans = [], starts = [], warnings = new Set()
+  let duration_ms = 0
+  for (const step of steps) {
+    const cue = historyCue(step)
+    const entries = {}
+    const members = new Map((step.snapshot?.members || []).map((member) => [member.id, member]))
+    for (const [id, agent] of Object.entries(agents)) {
+      const member = members.get(agent.maw?.key)
+      if (!agent.mawMember || !member) continue
+      const from = point(positions[id]) ? positions[id] : agent.position
+      const resting = ['idle', 'done'].includes(member.status) || !!step.snapshot?.terminal
+      const base = resting ? (agent.maw?.restSeat || agent.position) : (agent.maw?.workSeat || agent.position)
+      const active = cue?.actor_member_id === member.id
+      entries[id] = { from: { ...from }, base: { ...base }, active,
+        related: cue?.related_member_ids.includes(member.id) || false,
+        gesture: gesture(active ? cue : null, { ...agent, maw: { ...agent.maw, verdict: member.verdict } }),
+        segments: [segment(from, base)] }
+    }
+    const plan = { step_id: step.id, stage: historyStage(step), cue, entries, compiled: true,
+      duration_ms: Math.max(4000, ...Object.values(entries).map((entry) => entry.segments[0].end_ms)), handoff: null }
+    if (step.cue?.handoff && !cue) warnings.add('history-animation-incomplete')
+    if (cue?.handoff) {
+      const sender = Object.keys(entries).find((id) => agents[id].maw.key === cue.handoff.sender_member_id)
+      const recipient = Object.keys(entries).find((id) => agents[id].maw.key === cue.handoff.recipient_member_id)
+      const receiverSeat = agents[recipient]?.maw?.workSeat
+      const approach = handoffApproachPoint(receiverSeat)
+      if (sender && recipient && point(approach)) {
+        const senderOut = segment(entries[sender].from, approach)
+        const recipientOut = segment(entries[recipient].from, receiverSeat)
+        const talk_start_ms = Math.max(senderOut.end_ms, recipientOut.end_ms)
+        const talk_end_ms = talk_start_ms + HANDOFF_TALK_MS
+        const senderBack = segment(approach, entries[sender].base, talk_end_ms)
+        const recipientBack = segment(receiverSeat, entries[recipient].base, talk_end_ms)
+        const plannedDuration = Math.max(4000, senderBack.end_ms, recipientBack.end_ms,
+          ...Object.entries(entries).filter(([id]) => id !== sender && id !== recipient).map(([, entry]) => entry.segments[0].end_ms))
+        if (Number.isSafeInteger(plannedDuration) && plannedDuration <= HISTORY_MAX_STEP_MS
+          && duration_ms + plannedDuration <= HISTORY_MAX_TOTAL_MS) {
+          entries[sender].segments = [senderOut, senderBack]
+          entries[recipient].segments = [recipientOut, recipientBack]
+          plan.duration_ms = plannedDuration
+          plan.handoff = { sender, recipient, talk_start_ms, talk_end_ms }
+        } else warnings.add('history-animation-incomplete')
+      } else warnings.add('history-animation-incomplete')
+      if (!plan.handoff) {
+        // A route that cannot be represented within the budget stays neutral.
+        // No truncated path or accelerated conversation implies a false handoff.
+        plan.stage = '记录回顾 · 交接动画不可用'
+        plan.cue = null
+        plan.duration_ms = 4000
+        for (const entry of Object.values(entries)) {
+          entry.active = false; entry.related = false
+          entry.gesture = { behavior: 'idle', expression: 'normal' }
+          entry.base = { ...entry.from }
+          entry.segments = [segment(entry.from, entry.from, 0, 4000)]
+        }
+      }
+    }
+    if (plan.duration_ms > HISTORY_MAX_STEP_MS || duration_ms + plan.duration_ms > HISTORY_MAX_TOTAL_MS) {
+      degradeHistoryPlan(plan, warnings)
+    }
+    if (step === steps.at(-1) && finalSnapshot?.terminal) {
+      const terminal_start_ms = plan.duration_ms
+      let terminal_end_ms = terminal_start_ms
+      const finalMembers = new Map((finalSnapshot.members || []).map((member) => [member.id, member]))
+      for (const [id, entry] of Object.entries(entries)) {
+        if (!finalMembers.has(agents[id].maw.key)) continue
+        const target = agents[id].maw?.restSeat || agents[id].position
+        const lastTarget = entry.segments.at(-1)?.path.at(-1) || entry.base
+        const returnHome = segment(lastTarget, target, terminal_start_ms)
+        entry.segments.push(returnHome)
+        terminal_end_ms = Math.max(terminal_end_ms, returnHome.end_ms)
+        entry.terminalBase = { ...target }
+      }
+      plan.terminal_start_ms = terminal_start_ms
+      plan.duration_ms = terminal_end_ms
+      plan.finalSnapshot = finalSnapshot
+    }
+    if (plan.duration_ms > HISTORY_MAX_STEP_MS || duration_ms + plan.duration_ms > HISTORY_MAX_TOTAL_MS) {
+      degradeHistoryPlan(plan, warnings)
+    }
+    starts.push(duration_ms)
+    duration_ms += plan.duration_ms
+    plans.push(plan)
+    for (const [id, entry] of Object.entries(entries)) positions[id] = { ...(entry.terminalBase || entry.base) }
+  }
+  return { plans, starts, duration_ms, warnings: [...warnings] }
+}
+
+function sampleCompiledPresentation(plan, progress) {
+  const elapsed = Math.max(0, Math.min(plan.duration_ms, progress.step_elapsed_ms || 0))
+  const agents = {}
+  const talking = !plan.terminal && plan.handoff && elapsed >= plan.handoff.talk_start_ms && elapsed < plan.handoff.talk_end_ms
+  for (const [id, entry] of Object.entries(plan.entries)) {
+    const sample = plannedEntryPosition(entry, elapsed)
+    let position = sample.position
+    const locating = plan.seek && progress.locating
+    if (locating) position = sampleHistoryRoute(entry.seekPath, ease(progress.transition_elapsed_ms / 500))
+    const participant = plan.handoff && [plan.handoff.sender, plan.handoff.recipient].includes(id)
+    let facing = position.facing || 'down'
+    if (talking && participant && !locating) {
+      const partner = plan.handoff.sender === id ? plan.handoff.recipient : plan.handoff.sender
+      const other = plannedEntryPosition(plan.entries[partner], elapsed).position
+      facing = calcFacing(position.x, position.y, other.x, other.y)
+    }
+    const isMoving = locating
+      ? progress.transition_elapsed_ms < 500 && routeLength(entry.seekPath) > 1
+      : !plan.terminal && sample.moving
+    const returningToTerminal = Number.isFinite(plan.terminal_start_ms) && elapsed >= plan.terminal_start_ms
+    const gesture = plan.terminal || returningToTerminal ? { behavior: 'idle', expression: 'normal' }
+      : talking && participant && !locating ? { behavior: 'chat', expression: entry.gesture.expression } : entry.gesture
+    agents[id] = { ...gesture, position, active: !plan.terminal && entry.active, related: !plan.terminal && entry.related,
+      isMoving, facing, frame: Math.floor(elapsed / 150) % 4,
+      walkFrame: Math.floor((locating ? progress.transition_elapsed_ms : elapsed) / 150) % 4 }
+  }
+  const links = talking && !progress.locating ? [{ from: agents[plan.handoff.sender].position, to: agents[plan.handoff.recipient].position }] : []
+  return { step_id: plan.step_id, stage: plan.stage, agents, links }
+}
+
 export function buildHistoryPresentation(step, agents, previous = {}, context = {}) {
+  if (context.plan?.compiled) {
+    const terminal = context.reason === 'end' || step.cue?.activity === 'terminal'
+    const plan = { ...context.plan, terminal, stage: terminal ? '终局记录' : context.plan.stage,
+      entries: Object.fromEntries(Object.entries(context.plan.entries).map(([id, entry]) => [id, { ...entry }])), seek: context.reason === 'seek' }
+    if (plan.seek) {
+      const elapsed = context.position_ms - context.step_start_ms
+      for (const [id, entry] of Object.entries(plan.entries)) {
+        const target = plannedEntryPosition(entry, elapsed).position
+        entry.from = point(previous[id]) ? previous[id] : target
+        entry.seekPath = route(entry.from, target)
+      }
+    }
+    return plan
+  }
   const cue = historyCue(step)
   const entries = {}
   const elapsed = Math.min(4000, Math.max(0, context.position_ms - context.index * 4000)) || 0
@@ -124,6 +320,7 @@ export function buildHistoryPresentation(step, agents, previous = {}, context = 
 }
 
 export function sampleHistoryPresentation(plan, progress) {
+  if (plan.compiled) return sampleCompiledPresentation(plan, progress)
   const elapsed = Math.max(0, Math.min(4000, progress.step_elapsed_ms || 0))
   const agents = {}
   for (const [id, entry] of Object.entries(plan.entries)) {

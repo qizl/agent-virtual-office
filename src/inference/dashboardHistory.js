@@ -3,6 +3,8 @@ import { validateDashboardSnapshot } from './dashboardSnapshot.js'
 export const HISTORY_STEP_MS = 4000
 export const HISTORY_SEEK_MS = 500
 const STEP_MS = HISTORY_STEP_MS
+const MAX_STEP_MS = 60_000
+const MAX_TIMELINE_MS = 12_000_000
 const TICK_MS = 50
 const REQUEST_TIMEOUT_MS = 10_000
 const MAX_HISTORY_BYTES = 1024 * 1024
@@ -26,12 +28,14 @@ const WARNING_MESSAGES = {
   'task-input-limit': '任务记录超出读取上限',
   'milestone-output-limit': '里程碑超出显示上限',
   'response-size-limit': '历史内容超出响应上限',
+  'history-animation-incomplete': '部分交接动画无法完整编排，已保留中性记录回顾',
 }
 const ERROR_MESSAGES = {
   'history-too-large': '历史响应超出大小上限',
   'history-timeout': '历史读取超时，请重试',
   'invalid-history': '历史数据无法校验，已停止播放',
   'history-read-failed': '历史读取失败，请重试',
+  'history-timeline-invalid': '历史动画时轴无法校验，已停止播放',
 }
 
 async function readHistoryBody(response) {
@@ -86,6 +90,7 @@ export function validateDashboardHistory(data, binding) {
 // Position is presentation time, never a claim about the duration of recorded work.
 export function createDashboardHistoryController({ config, onStart, onFrame, onState, onPause,
   onProgress = () => {},
+  prepareTimeline = (steps) => ({ plans: steps.map(() => null), starts: steps.map((_, i) => i * STEP_MS), duration_ms: steps.length * STEP_MS }),
   scope = typeof window === 'undefined' ? null : window }) {
   let torn = false
   let requestGeneration = 0
@@ -93,6 +98,7 @@ export function createDashboardHistoryController({ config, onStart, onFrame, onS
   let requestTimer = null
   let timer = null
   let data = null
+  let timeline = null
   let state = 'live'
   let index = -1
   let position = 0
@@ -107,7 +113,29 @@ export function createDashboardHistoryController({ config, onStart, onFrame, onS
   const origin = scope?.location?.origin
   const rafClock = typeof scope?.requestAnimationFrame === 'function'
   const pausedAnimations = new Set()
-  const duration = () => (data?.steps.length || 0) * STEP_MS
+  const duration = () => timeline?.duration_ms ?? (data?.steps.length || 0) * STEP_MS
+  const stepStart = () => timeline?.starts[index] || 0
+  const stepDuration = () => timeline?.plans[index]?.duration_ms || STEP_MS
+  function stepIndex(positionMs) {
+    let next = 0
+    while (next + 1 < (timeline?.starts.length || 0) && timeline.starts[next + 1] <= positionMs) next += 1
+    return Math.min((data?.steps.length || 0) - 1, next)
+  }
+  function prepare(history) {
+    const steps = history.steps
+    const compiled = prepareTimeline(steps, history)
+    if (!compiled || !Array.isArray(compiled.plans) || !Array.isArray(compiled.starts)
+      || compiled.plans.length !== steps.length || compiled.starts.length !== steps.length
+      || !Number.isSafeInteger(compiled.duration_ms) || compiled.duration_ms > MAX_TIMELINE_MS) throw new Error('history-timeline-invalid')
+    let accumulated = 0
+    for (let i = 0; i < steps.length; i += 1) {
+      const ms = compiled.plans[i]?.duration_ms ?? STEP_MS
+      if (compiled.starts[i] !== accumulated || !Number.isSafeInteger(ms) || ms < STEP_MS || ms > MAX_STEP_MS) throw new Error('history-timeline-invalid')
+      accumulated += ms
+    }
+    if (accumulated !== compiled.duration_ms) throw new Error('history-timeline-invalid')
+    return compiled
+  }
 
   function publish(next, code = null, force = true) {
     if (torn) return
@@ -115,6 +143,8 @@ export function createDashboardHistoryController({ config, onStart, onFrame, onS
     const step = data?.steps[index]
     current = { state, step: index + 1, total: data?.steps.length || 0,
       position_ms: position, duration_ms: duration(), locating,
+      step_start_ms: stepStart(), step_duration_ms: stepDuration(),
+      step_elapsed_ms: index < 0 ? 0 : Math.min(stepDuration(), position - stepStart()),
       complete: data?.complete ?? true,
       code, label: step?.label || null, recorded_at: step?.recorded_at ?? null,
       message: data ? ['任务记录回顾 · 非实时', locating && state === 'paused' ? '暂停定位中' : null, step?.label,
@@ -123,7 +153,6 @@ export function createDashboardHistoryController({ config, onStart, onFrame, onS
         .filter(Boolean).join(' · ').slice(0, 2048) : ERROR_MESSAGES[code] || null }
     if (next === 'unavailable' && !data?.steps.length && !data?.warnings?.length) current.message = '没有可播放的已记录里程碑'
     onProgress({ ...current, step_index: index,
-      step_elapsed_ms: index < 0 ? 0 : Math.min(STEP_MS, position - index * STEP_MS),
       transition_elapsed_ms: locatingElapsed, transition_duration_ms: locating ? HISTORY_SEEK_MS : 0 })
     // Presentation samples every animation frame; parent controls and announcements
     // are throttled to 20Hz from that same clock, never a second timing source.
@@ -159,11 +188,12 @@ export function createDashboardHistoryController({ config, onStart, onFrame, onS
     }
   }
   function frame(reason) {
-    index = Math.min(data.steps.length - 1, Math.floor(position / STEP_MS))
+    index = stepIndex(position)
     const step = position === duration() ? { ...data.steps[index], snapshot: data.final_snapshot,
       cue: { actor_member_id: null, activity: 'terminal', task: null, related_member_ids: [] } } : data.steps[index]
     onFrame(position === duration() ? data.final_snapshot : step.snapshot,
-      { step, index, position_ms: position, reason })
+      { step, index, position_ms: position, reason, plan: timeline.plans[index],
+        step_start_ms: stepStart(), step_duration_ms: stepDuration() })
   }
   function advance(now) {
     let elapsed = Math.max(0, now - lastTick)
@@ -180,7 +210,7 @@ export function createDashboardHistoryController({ config, onStart, onFrame, onS
     if (state === 'playing' && !locating) {
       const previous = index
       position = Math.min(duration(), position + elapsed)
-      const next = Math.min(data.steps.length - 1, Math.floor(position / STEP_MS))
+      const next = stepIndex(position)
       if (next !== previous) frame('step')
       if (position === duration()) {
         frame('end')
@@ -239,6 +269,7 @@ export function createDashboardHistoryController({ config, onStart, onFrame, onS
     controller = new AbortController()
     const activeController = controller
     data = null
+    timeline = null
     index = -1
     position = 0
     publish('loading')
@@ -265,13 +296,15 @@ export function createDashboardHistoryController({ config, onStart, onFrame, onS
           publish('unavailable', 'history-unavailable')
           return
         }
-        data = history
+        timeline = prepare(history)
+        const warnings = [...new Set([...history.warnings, ...(timeline.warnings || [])])]
+        data = { ...history, complete: history.complete && !(timeline.warnings?.length), warnings }
         onStart()
         restart()
       } catch (error) {
         activeController.abort()
         if (!torn && mine === requestGeneration) {
-          const code = ['history-too-large', 'history-timeout', 'invalid-history'].includes(error?.message) ? error.message : 'history-read-failed'
+          const code = ['history-too-large', 'history-timeout', 'invalid-history', 'history-timeline-invalid'].includes(error?.message) ? error.message : 'history-read-failed'
           publish('error', code)
         }
       } finally {
