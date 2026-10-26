@@ -344,8 +344,11 @@ export function createDashboardHistoryController({ config, onStart, onFrame, onS
   scope?.addEventListener?.('message', receive)
   publish('live')
   return {
-    onTerminal(terminal) {
-      if (!autoAttempted && COMPLETED.includes(terminal)) { autoAttempted = true; request() }
+    onTerminal(terminal, firstObservation = false) {
+      if (firstObservation && !autoAttempted && COMPLETED.includes(terminal)) {
+        autoAttempted = true
+        request()
+      }
     },
     toggle, restart, seek,
     isActive: () => ['playing', 'paused', 'ended'].includes(state),

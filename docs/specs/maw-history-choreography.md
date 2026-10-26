@@ -38,6 +38,7 @@ During a live nonterminal workflow, CR-6 keeps the existing 90-second eligibilit
 - An accessible draggable progress bar seeks within presentation time and preserves the prior playing or paused state. Seeking backward restores only facts known at that target frame. Rapid seeks cancel obsolete transitions. An explicit seek while paused may perform one short positioning transition and then freeze; an ordinary pause never moves characters.
 - Parent commands and status retain same-origin, exact iframe identity and fixed project/task checks. Seek positions and durations are finite bounded integers: position_ms is within 0..duration_ms; duration_ms is the cumulative bounded step time, between total steps times 4000 and total steps times 60000, never exceeding 12,000,000. The seek command carries position_ms; state carries position_ms and duration_ms.
 - Fullscreen retains the same iframe, playback and task binding. Task changes and page exit cancel old timers and responses.
+- A live task that reaches a completed terminal state while this visualization remains mounted stays in live mode and keeps CR-8 free roaming; automatic history playback is eligible only when the first valid snapshot observed for the mount is already completed. Re-entering the visualization creates a new mount and may autoplay that completed history.
 
 ## 5. Acceptance
 

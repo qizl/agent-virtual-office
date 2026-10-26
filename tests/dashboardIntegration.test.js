@@ -122,6 +122,26 @@ describe('Dashboard fixed binding and lifecycle', () => {
     expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(0)
   })
 
+  it('keeps the live scene after a task completes during the same visualization mount', async () => {
+    const running = envelope(1, { execution_state: 'started' })
+    const completed = envelope(2, { execution_state: 'started', terminal: 'completed',
+      members: running.snapshot.members.map((member) => ({ ...member, status: 'done', verdict: 'pass' })) })
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(reply({ ok: true, data: running }))
+      .mockResolvedValue(reply({ ok: true, data: completed }))
+    vi.stubGlobal('fetch', fetchMock)
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().dashboardHistory).toMatchObject({ state: 'live' })
+    await vi.advanceTimersByTimeAsync(2000)
+
+    expect(fetchMock.mock.calls.some(([url]) => url.startsWith('/api/visualization/history'))).toBe(false)
+    expect(useOfficeStore.getState().dashboardHistory).toMatchObject({ state: 'live' })
+    expect(useOfficeStore.getState().mawMeta).toMatchObject({ terminal: 'completed' })
+    expect(useOfficeStore.getState().isPaused).toBe(false)
+  })
+
   it('baselines old handoffs on the first determinate started fact after an unknown observation', async () => {
     const dev = { seq: 1, round: 1, type: 'dev', source_ref: 'executor-1/task-001.json', ref_task: null }
     const review = { seq: 2, round: 1, type: 'review', source_ref: 'reviewer-1/task-002.json', ref_task: dev.source_ref }

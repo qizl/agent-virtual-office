@@ -53,6 +53,7 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
   let inFlight = null
   let lastKey = null
   let lastContent = null
+  let historyEntryObserved = false
   let lastValidAt = null
   let isStale = false
   let needsRecovery = false
@@ -140,6 +141,9 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     const content = JSON.stringify(envelope.snapshot)
     if (lastKey && (epoch < lastKey[0] || (epoch === lastKey[0] && seq < lastKey[1]))) return false
     if (lastKey && epoch === lastKey[0] && seq === lastKey[1] && content !== lastContent) return false
+    const snapshot = envelope.snapshot
+    const firstHistoryObservation = snapshot != null && !historyEntryObserved
+    if (snapshot != null) historyEntryObserved = true
     lastKey = [epoch, seq]
     lastContent = content
     lastValidAt = Date.now()
@@ -147,7 +151,6 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     const recovering = needsRecovery || isStale
     if (recovering) recovery += 1
     needsRecovery = false
-    const snapshot = envelope.snapshot
     const hasMembers = snapshot?.members?.length > 0
     const complete = hasMembers && snapshot.quality === 'ok'
     // The first determinate runtime observation owns this mount's entry choice.
@@ -179,7 +182,9 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     if (isStale) store.getState().freezeMawSnapshot(envelope.snapshot.quality_detail || 'source-stale')
     armStaleTimer()
     sync(isStale ? 'stale' : 'synced')
-    history.onTerminal(envelope.snapshot?.terminal)
+    // Automatic playback is a page-entry behavior only. A later terminal
+    // transition in this still-mounted live view must leave CR-8 roaming in charge.
+    history.onTerminal(snapshot?.terminal, firstHistoryObservation)
     return true
   }
 
