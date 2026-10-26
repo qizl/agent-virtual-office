@@ -405,6 +405,34 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
   let movementElapsed = 0
   let movementStamp = Date.now()
   let movementPaused = store.getState().isPaused
+  const activeDelays = new Set()
+
+  function armActiveDelay(delay) {
+    if (torn || movementPaused || !activeDelays.has(delay)) return
+    delay.dueAt = movementElapsed + delay.remaining
+    const timer = setTimeout(() => {
+      pendingTimers.delete(timer)
+      delay.timer = null
+      activeDelays.delete(delay)
+      movementTime()
+      if (!torn && choreoEpoch === delay.epoch) delay.fn()
+    }, delay.remaining)
+    delay.timer = timer
+    pendingTimers.add(timer)
+  }
+
+  function laterDuringMovement(fn, ms) {
+    movementTime()
+    const delay = { fn, remaining: Math.max(0, ms), epoch: choreoEpoch, dueAt: null, timer: null }
+    activeDelays.add(delay)
+    armActiveDelay(delay)
+  }
+
+  function clearPendingTimers() {
+    for (const timer of pendingTimers) clearTimeout(timer)
+    pendingTimers.clear()
+    activeDelays.clear()
+  }
 
   // Observe pause transitions synchronously, so even a partial arrival-poll
   // interval is charged only for the time the office could actually move.
@@ -412,7 +440,22 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
     const now = Date.now()
     if (!movementPaused) movementElapsed += now - movementStamp
     movementStamp = now
-    movementPaused = store.getState().isPaused
+    const paused = store.getState().isPaused
+    if (paused !== movementPaused) {
+      movementPaused = paused
+      for (const delay of activeDelays) {
+        if (paused) {
+          if (delay.timer != null) {
+            clearTimeout(delay.timer)
+            pendingTimers.delete(delay.timer)
+            delay.timer = null
+          }
+          delay.remaining = Math.max(0, delay.dueAt - movementElapsed)
+        } else {
+          armActiveDelay(delay)
+        }
+      }
+    }
     return movementElapsed
   }
 
@@ -971,8 +1014,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       // A disconnected Dashboard did not observe intermediate work. Cancel every
       // old callback and baseline the CURRENT facts, without rest/task or handover replay.
       choreoEpoch += 1
-      for (const timer of pendingTimers) clearTimeout(timer)
-      pendingTimers.clear()
+      clearPendingTimers()
       clearFactualHandoffs({ restore: false })
       seenHandoffs.clear()
       for (const id of factualHandoffs(s).keys()) seenHandoffs.add(id)
@@ -1006,8 +1048,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       // Entry wins over a coincident recovery baseline: an earlier failed or
       // unknown observation did not consume the first determinate start fact.
       choreoEpoch += 1
-      for (const timer of pendingTimers) clearTimeout(timer)
-      pendingTimers.clear()
+      clearPendingTimers()
       clearFactualHandoffs({ restore: false })
       pendingEnter.clear()
       pendingRelocation.clear()
@@ -1158,7 +1199,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       // may the stale callback keep walking: losing ownership TERMINATES it.
       const seq = ++pendingSeq
       pendingEnter.set(agentId, { seq, from: previous ?? null }) // rolled back if this walk dies pre-fire
-      later(() => {
+      const launch = () => {
         const mine = pendingEnter.get(agentId)
         if (!mine || mine.seq !== seq) return // ownership lost (a newer pending walk or a prune) — terminate; the owner walks
         pendingEnter.delete(agentId)
@@ -1173,7 +1214,9 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
           processFactualHandoffs()
         }
         arriveThen(agentId, 0, finish, () => openingMembers.delete(agentId))
-      }, delay)
+      }
+      if (forceWorkPost) laterDuringMovement(launch, delay)
+      else later(launch, delay)
     }
 
     // handover triggers: any member entering awaiting-approval (same-phase or not —
@@ -1205,7 +1248,6 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
     openingMembers.clear()
     clearFactualHandoffs({ stop: true })
     if (wanderTimer) clearInterval(wanderTimer)
-    for (const t of pendingTimers) clearTimeout(t)
-    pendingTimers.clear()
+    clearPendingTimers()
   }
 }

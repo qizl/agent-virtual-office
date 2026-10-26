@@ -20,6 +20,14 @@
 export const GAP_SNAP_MS = 5000
 export const ARRIVE_EPSILON = 1.5
 
+// Keep RAF time anchored to the latest callback while the live office is paused.
+// This prevents resume from treating pause duration as hidden-tab jank and snapping
+// a character to its next waypoint.
+export function walkFrameTiming(timestamp, previousTimestamp, paused = false) {
+  const gapMs = paused || previousTimestamp == null ? 0 : timestamp - previousTimestamp
+  return { lastTimestamp: timestamp, gapMs, dtSeconds: Math.min(gapMs / 1000, 0.1), paused }
+}
+
 export function stepWalkFrame(vp, tp, dtSeconds, gapMs, walkSpeed) {
   // Fast-forward: a frozen/janked leg resumes AT its target, not gliding from the pile.
   if (gapMs > GAP_SNAP_MS) {

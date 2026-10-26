@@ -6,7 +6,7 @@ import { eventBubble, charName, useLocale, t } from '../i18n'
 import { BlockedReasonBadge } from './blockedReasonBadge'
 import { recurringInfo } from '../systems/recurringFailure'
 import { selectVisibleBubbles, BUBBLE_VISIBLE_CAP } from '../systems/bubbleVisibility.js'
-import { stepWalkFrame } from '../systems/walkFrame.js'
+import { stepWalkFrame, walkFrameTiming } from '../systems/walkFrame.js'
 import { WALK_SPEED, WALK_FRAME_INTERVAL, BEHAVIOR_STUCK_RETRIES, BEHAVIOR_STUCK_RETRY_MS, WATCHDOG_INTERVAL, WATCHDOG_TIMEOUT, shouldSkipBehaviorWatchdog, BLOCKED_FAMILY } from '../systems/constants.js'
 import BehaviorBubble, { shouldFlipBubbleBelow, isSpeakerOnScreen } from './BehaviorBubble'
 import OneShotSmil from './OneShotSmil.jsx'
@@ -964,10 +964,12 @@ function AgentCharacter({ agent }) {
       // even when this frame immediately snaps/arrives at a waypoint after a long host pause.
       lostRafRestartRef.current = 0
 
-      if (!lastTimeRef.current) lastTimeRef.current = timestamp
-      const gapMs = timestamp - lastTimeRef.current
-      const dt = Math.min(gapMs / 1000, 0.1)
-      lastTimeRef.current = timestamp
+      const timing = walkFrameTiming(timestamp, lastTimeRef.current, useOfficeStore.getState().isPaused)
+      lastTimeRef.current = timing.lastTimestamp
+      if (timing.paused) {
+        rafRef.current = requestAnimationFrame(animate)
+        return
+      }
 
       const vp = visualPosRef.current
       const tp = targetPosRef.current
@@ -977,7 +979,7 @@ function AgentCharacter({ agent }) {
       // frozen — hidden tab or main-thread stall) snaps this leg to its target instead of
       // resuming a slow glide from the frozen pile (owner bug 2026-06-11: "8人只看到6人",
       // frozen walkers stacked, then visibly drifted apart on tab return).
-      const arrived = stepWalkFrame(vp, tp, dt, gapMs, WALK_SPEED)
+      const arrived = stepWalkFrame(vp, tp, timing.dtSeconds, timing.gapMs, WALK_SPEED)
 
       if (!arrived) {
         // Throttle React state updates to every other frame (~30fps)

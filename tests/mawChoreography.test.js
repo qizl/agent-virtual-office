@@ -1327,6 +1327,41 @@ describe('startMawChoreography (controller)', () => {
     } finally { cleanup() }
   })
 
+  it('AVO-202 freezes remaining nine-member entry staggers and resumes their original offsets', () => {
+    const store = useOfficeStore
+    store.setState({ integration: 'dashboard', isPaused: false })
+    const cleanup = startMawChoreography(store, { resumeCurrent: true })
+    try {
+      const members = Array.from({ length: 9 }, (_, i) => mawMember(`opening-${i}`, 'executor', 'idle'))
+      const first = envelope(members)
+      store.getState().applyMawSnapshot({ ...first, dashboard_opening: 1,
+        snapshot: { ...first.snapshot, execution_state: 'not-started' } })
+      vi.advanceTimersByTime(0)
+      const entering = () => Object.values(store.getState().agents).filter((agent) => agent.inGroupEvent)
+      const firstRoute = entering()[0]
+      expect(entering()).toHaveLength(1)
+
+      vi.advanceTimersByTime(100)
+      store.setState({ isPaused: true })
+      vi.advanceTimersByTime(2_000)
+      expect(entering()).toHaveLength(1)
+      expect(store.getState().agents[firstRoute.id]).toMatchObject({ inGroupEvent: true,
+        groupTarget: firstRoute.groupTarget })
+
+      store.setState({ isPaused: false })
+      vi.advanceTimersByTime(499)
+      expect(entering()).toHaveLength(1)
+      vi.advanceTimersByTime(1)
+      expect(entering()).toHaveLength(2)
+      expect(entering()[0].id).toBe(firstRoute.id)
+      vi.advanceTimersByTime(599)
+      expect(entering()).toHaveLength(2)
+      vi.advanceTimersByTime(1)
+      expect(entering()).toHaveLength(3)
+      expect(entering()[0].id).toBe(firstRoute.id)
+    } finally { cleanup() }
+  })
+
   it('the settle check follows the PUBLISHED walk target when avoidOverlap moves it', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)

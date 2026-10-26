@@ -7,9 +7,24 @@
  * watched the stacked pile drift apart. A gap > GAP_SNAP_MS must SNAP the leg to its target.
  */
 import { describe, it, expect } from 'vitest'
-import { stepWalkFrame, GAP_SNAP_MS, ARRIVE_EPSILON } from '../src/systems/walkFrame.js'
+import { stepWalkFrame, walkFrameTiming, GAP_SNAP_MS, ARRIVE_EPSILON } from '../src/systems/walkFrame.js'
 
 const SPEED = 80  // px/s — representative; the real WALK_SPEED is passed by the caller
+
+describe('walkFrameTiming — live pause', () => {
+  it('keeps the RAF baseline current while paused so resume advances smoothly without a snap', () => {
+    const position = { x: 120, y: 200 }
+    const paused = walkFrameTiming(86_000, 16, true)
+    expect(paused).toEqual({ lastTimestamp: 86_000, gapMs: 0, dtSeconds: 0, paused: true })
+    expect(stepWalkFrame(position, { x: 500, y: 200 }, paused.dtSeconds, paused.gapMs, SPEED)).toBe(false)
+    expect(position).toEqual({ x: 120, y: 200 })
+
+    const resumed = walkFrameTiming(86_016, paused.lastTimestamp, false)
+    expect(resumed).toEqual({ lastTimestamp: 86_016, gapMs: 16, dtSeconds: 0.016, paused: false })
+    expect(stepWalkFrame(position, { x: 500, y: 200 }, resumed.dtSeconds, resumed.gapMs, SPEED)).toBe(false)
+    expect(position).toEqual({ x: 121.28, y: 200 })
+  })
+})
 
 describe('stepWalkFrame — normal gliding', () => {
   it('advances toward the target by speed*dt and does not arrive mid-leg', () => {
