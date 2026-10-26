@@ -189,6 +189,32 @@ describe('Dashboard fixed binding and lifecycle', () => {
     }
   })
 
+  it.each([
+    ['a failed request', reply({ ok: false, error: { code: 'read-failed' } }, 503)],
+    ['an invalid snapshot', reply({ ok: true, data: envelope(1, { schema: 'invalid' }) })],
+  ])('does not consume terminal autoplay eligibility after %s', async (_label, firstResponse) => {
+    const completed = envelope(2, { execution_state: 'started', terminal: 'completed' })
+    const history = { schema: 'avo.maw-history/1', project: config.project, task: config.task,
+      terminal: 'completed', eligible: true, complete: true, warnings: [],
+      steps: [{ id: 'completion', kind: 'task-result', label: 'Recorded completion', recorded_at: null,
+        source_refs: ['tasks/executor/task-001.json'], snapshot: completed.snapshot }],
+      final_snapshot: completed.snapshot }
+    const fetchMock = vi.fn().mockImplementation(async (url) => {
+      if (url.startsWith('/api/visualization/history')) return reply({ ok: true, data: history })
+      return fetchMock.mock.calls.length === 1 ? firstResponse : reply({ ok: true, data: completed })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock.mock.calls.some(([url]) => url.startsWith('/api/visualization/history'))).toBe(false)
+    await vi.advanceTimersByTimeAsync(2000)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(fetchMock.mock.calls.some(([url]) => url.startsWith('/api/visualization/history'))).toBe(true)
+    expect(useOfficeStore.getState().dashboardHistory).toMatchObject({ state: 'playing', step: 1 })
+  })
+
   it('baselines old handoffs on the first determinate started fact after an unknown observation', async () => {
     const dev = { seq: 1, round: 1, type: 'dev', source_ref: 'executor-1/task-001.json', ref_task: null }
     const review = { seq: 2, round: 1, type: 'review', source_ref: 'reviewer-1/task-002.json', ref_task: dev.source_ref }
