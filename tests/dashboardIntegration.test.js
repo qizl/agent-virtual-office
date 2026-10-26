@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { detectIntegrationConfig, detectProjectMode, getPlatformConfig } from '../src/systems/platformDetect.js'
 import { startDashboardIntegration, validateDashboardEnvelope } from '../src/inference/dashboardIntegration.js'
 import { mawHandoffId, validateDashboardSnapshot } from '../src/inference/dashboardSnapshot.js'
+import { ZONE_FLOOR_RECTS } from '../src/systems/movementSystem.js'
 import { useOfficeStore } from '../src/systems/store.js'
 
 function envelope(seq = 1, overrides = {}) {
@@ -10,7 +11,10 @@ function envelope(seq = 1, overrides = {}) {
     members: [{ id: 'member1', role: 'executor', status: 'working', label: 'slice', detail: null,
       round: 1, task_kind: 'dev', verdict: null, terminate: null, stalled: false }], ...overrides } }
 }
-function reply(data, status = 200) { return { ok: status < 400, status, json: async () => data } }
+function reply(data, status = 200) {
+  const body = JSON.stringify(data)
+  return { ok: status < 400, status, json: async () => data, text: async () => body }
+}
 function deferred() { let resolve; const promise = new Promise((r) => { resolve = r }); return { promise, resolve } }
 const config = { integration: 'dashboard', project: 'project a', task: 'task&1', error: null }
 let cleanup
@@ -123,23 +127,66 @@ describe('Dashboard fixed binding and lifecycle', () => {
   })
 
   it('keeps the live scene after a task completes during the same visualization mount', async () => {
-    const running = envelope(1, { execution_state: 'started' })
+    const roles = ['manager', 'decision-maker', 'executor', 'reviewer']
+    const members = roles.map((role, index) => ({ ...envelope().snapshot.members[0],
+      id: `terminal-member-${index}`, role, status: 'working' }))
+    const running = envelope(1, { execution_state: 'started', members })
     const completed = envelope(2, { execution_state: 'started', terminal: 'completed',
-      members: running.snapshot.members.map((member) => ({ ...member, status: 'done', verdict: 'pass' })) })
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(reply({ ok: true, data: running }))
-      .mockResolvedValue(reply({ ok: true, data: completed }))
+      members: members.map((member) => ({ ...member, status: 'done', verdict: 'pass' })) })
+    const history = { schema: 'avo.maw-history/1', project: config.project, task: config.task,
+      terminal: 'completed', eligible: true, complete: true, warnings: [],
+      steps: [{ id: 'completion', kind: 'task-result', label: 'Recorded completion', recorded_at: null,
+        source_refs: ['tasks/executor/task-001.json'], snapshot: completed.snapshot }],
+      final_snapshot: completed.snapshot }
+    const fetchMock = vi.fn().mockImplementation(async (url) => {
+      if (url.startsWith('/api/visualization/history')) return reply({ ok: true, data: history })
+      return reply({ ok: true, data: fetchMock.mock.calls.length === 1 ? running : completed })
+    })
     vi.stubGlobal('fetch', fetchMock)
+    const walkerCleanup = useOfficeStore.subscribe(() => {
+      for (const agent of Object.values(useOfficeStore.getState().agents)) {
+        if (!agent?.inGroupEvent || !agent.groupTarget
+          || (agent.position?.x === agent.groupTarget.x && agent.position?.y === agent.groupTarget.y)) continue
+        setTimeout(() => {
+          const current = useOfficeStore.getState().agents[agent.id]
+          if (!current?.inGroupEvent || !current.groupTarget) return
+          useOfficeStore.setState({ agents: { ...useOfficeStore.getState().agents,
+            [agent.id]: { ...current, position: { ...current.groupTarget } } } })
+        }, 500)
+      }
+    })
     cleanup = startDashboardIntegration(useOfficeStore, config)
 
-    await vi.advanceTimersByTimeAsync(0)
-    expect(useOfficeStore.getState().dashboardHistory).toMatchObject({ state: 'live' })
-    await vi.advanceTimersByTimeAsync(2000)
+    try {
+      await vi.advanceTimersByTimeAsync(0)
+      expect(useOfficeStore.getState().dashboardHistory).toMatchObject({ state: 'live' })
+      await vi.advanceTimersByTimeAsync(30_000)
 
-    expect(fetchMock.mock.calls.some(([url]) => url.startsWith('/api/visualization/history'))).toBe(false)
-    expect(useOfficeStore.getState().dashboardHistory).toMatchObject({ state: 'live' })
-    expect(useOfficeStore.getState().mawMeta).toMatchObject({ terminal: 'completed' })
-    expect(useOfficeStore.getState().isPaused).toBe(false)
+      const live = useOfficeStore.getState()
+      expect(fetchMock.mock.calls.some(([url]) => url.startsWith('/api/visualization/history'))).toBe(false)
+      expect(live.dashboardHistory).toMatchObject({ state: 'live' })
+      expect(live.mawMeta).toMatchObject({ terminal: 'completed' })
+      expect(live.isPaused).toBe(false)
+      for (const agent of Object.values(live.agents)) {
+        expect(agent.status).toBe('done')
+        expect(agent.behavior).toBe('idle')
+        const point = agent.groupTarget || agent.position
+        expect([ZONE_FLOOR_RECTS.meetingRoom, ZONE_FLOOR_RECTS.lounge, ZONE_FLOOR_RECTS.research]
+          .some((rect) => point.x >= rect.x1 && point.x <= rect.x2 && point.y >= rect.y1 && point.y <= rect.y2),
+        `${agent.id}: ${JSON.stringify(point)}`).toBe(true)
+      }
+      expect(Object.values(live.agents).some((agent) => agent.inGroupEvent)).toBe(true)
+
+      cleanup()
+      cleanup = null
+      cleanup = startDashboardIntegration(useOfficeStore, config)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(fetchMock.mock.calls.some(([url]) => url.startsWith('/api/visualization/history'))).toBe(true)
+      expect(useOfficeStore.getState().dashboardHistory).toMatchObject({ state: 'playing', step: 1 },
+        JSON.stringify(useOfficeStore.getState().dashboardHistory))
+    } finally {
+      walkerCleanup()
+    }
   })
 
   it('baselines old handoffs on the first determinate started fact after an unknown observation', async () => {
