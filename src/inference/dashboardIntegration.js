@@ -64,6 +64,21 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
   let hydration = 0
   let entryDecided = false
   let opening = 0
+  function openingWasShown() {
+    // Same-origin iframes share this tab's session storage. Persist only the
+    // display decision, never observed execution facts or member positions.
+    const key = `avo:dashboard-entry:v1:${JSON.stringify([config.project, config.task])}`
+    try {
+      const storage = globalThis.sessionStorage
+      if (storage.getItem(key) === '1') return true
+      // Mark before applying the opening: leaving midway still counts as shown.
+      storage.setItem(key, '1')
+    } catch {
+      // Called once per mount, only after a complete pre-start observation.
+      console.warn('[Dashboard] initialization:', 'session-storage-unavailable')
+    }
+    return false
+  }
   let choreographyCleanup = startMawChoreography(store, { resumeCurrent: true })
   let historyToggleVersion = store.getState().dashboardHistoryToggle
   const originalPause = store.getState().isPaused
@@ -157,21 +172,24 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     // Unknown/legacy observations may establish a current-state baseline, but
     // assignment transitions and later start facts never replay an opening.
     let startsOpening = false
-    let baselinesStarted = false
+    let baselinesEntry = false
     if (!entryDecided && hasMembers) {
       if (snapshot.terminal != null || snapshot.execution_state === 'started') {
         entryDecided = true
         // An earlier unknown observation cannot baseline relationships that
         // only become readable with this first determinate running state.
-        baselinesStarted = true
+        baselinesEntry = true
       }
       else if (complete && snapshot.execution_state === 'not-started') {
         entryDecided = true
-        startsOpening = true
-        opening += 1
+        if (openingWasShown()) baselinesEntry = true
+        else {
+          startsOpening = true
+          opening += 1
+        }
       }
     }
-    if (hasMembers && !startsOpening && (!initialized || baselinesStarted)) hydration += 1
+    if (hasMembers && !startsOpening && (!initialized || baselinesEntry)) hydration += 1
     if (hasMembers) initialized = true
     // Reconnect before applying the fresh baseline, so only a genuinely new
     // first-entry marker may open; an interrupted old opening cannot replay.

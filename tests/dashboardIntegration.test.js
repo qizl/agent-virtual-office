@@ -17,12 +17,23 @@ function reply(data, status = 200) {
 }
 function deferred() { let resolve; const promise = new Promise((r) => { resolve = r }); return { promise, resolve } }
 const config = { integration: 'dashboard', project: 'project a', task: 'task&1', error: null }
+const entryStorageKey = (binding = config) => `avo:dashboard-entry:v1:${JSON.stringify([binding.project, binding.task])}`
+function mockSessionStorage(entries = []) {
+  const values = new Map(entries)
+  return {
+    getItem: vi.fn((key) => values.get(key) ?? null),
+    setItem: vi.fn((key, value) => values.set(key, value)),
+  }
+}
 let cleanup
+let entryStorage
 
 beforeEach(() => {
   vi.useFakeTimers()
   vi.setSystemTime(10000)
   vi.spyOn(console, 'warn').mockImplementation(() => {})
+  entryStorage = mockSessionStorage()
+  vi.stubGlobal('sessionStorage', entryStorage)
   useOfficeStore.setState({ mode: 'maw', integration: 'dashboard', agents: {}, mawMeta: null,
     dashboardSync: null, dashboardRetry: 0, showWorkflow: false, isPaused: false })
 })
@@ -113,6 +124,171 @@ describe('Dashboard envelope validation', () => {
 })
 
 describe('Dashboard fixed binding and lifecycle', () => {
+  it('hydrates an interrupted pre-start opening when the same task is remounted in the same tab', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply({ ok: true,
+      data: envelope(1, { execution_state: 'not-started' }) })))
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(1)
+    expect(useOfficeStore.getState().agents['member1~executor'].inGroupEvent).toBe(true)
+    cleanup()
+
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    const state = useOfficeStore.getState()
+    expect(state.mawMeta).toMatchObject({ dashboard_opening: 0, dashboard_hydration: 1 })
+    expect(state.agents['member1~executor'].position).toEqual(state.agents['member1~executor'].maw.workSeat)
+    expect(state.agents['member1~executor'].inGroupEvent).toBe(false)
+  })
+
+  it('marks a complete first pre-start observation before applying its opening snapshot', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply({ ok: true,
+      data: envelope(1, { execution_state: 'not-started' }) })))
+    const applySnapshot = vi.spyOn(useOfficeStore.getState(), 'applyMawSnapshot')
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(entryStorage.setItem).toHaveBeenCalledExactlyOnceWith(entryStorageKey(), '1')
+    expect(entryStorage.setItem.mock.invocationCallOrder[0]).toBeLessThan(applySnapshot.mock.invocationCallOrder[0])
+  })
+
+  it('isolates the opening marker by project and task, while a new tab session can open again', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(reply({ ok: true,
+      data: envelope(1, { execution_state: 'not-started' }) }))
+    vi.stubGlobal('fetch', fetchMock)
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(entryStorage.getItem).toHaveBeenCalledExactlyOnceWith(entryStorageKey())
+    expect(entryStorage.setItem).toHaveBeenCalledExactlyOnceWith(entryStorageKey(), '1')
+
+    for (const binding of [{ ...config, task: 'other-task' }, { ...config, project: 'other-project' }]) {
+      cleanup()
+      cleanup = startDashboardIntegration(useOfficeStore, binding)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(1)
+      expect(entryStorage.getItem).toHaveBeenLastCalledWith(entryStorageKey(binding))
+      expect(entryStorage.setItem).toHaveBeenLastCalledWith(entryStorageKey(binding), '1')
+    }
+
+    cleanup()
+    entryStorage = mockSessionStorage()
+    vi.stubGlobal('sessionStorage', entryStorage)
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(1)
+    expect(entryStorage.setItem).toHaveBeenCalledExactlyOnceWith(entryStorageKey(), '1')
+  })
+
+  it.each([
+    ['started', envelope(1, { execution_state: 'started' })],
+    ['terminal', envelope(1, { execution_state: 'started', terminal: 'cancelled' })],
+    ['unknown', envelope(1, { execution_state: 'unknown' })],
+    ['legacy', envelope()],
+    ['empty', { ...envelope(1), snapshot: null }],
+    ['degraded', envelope(1, { quality: 'degraded', execution_state: 'not-started' })],
+    ['invalid', envelope(1, { schema: 'invalid', execution_state: 'not-started' })],
+  ])('does not consult session storage for a first %s observation', async (_label, first) => {
+    const storageGetter = vi.fn(() => entryStorage)
+    Object.defineProperty(globalThis, 'sessionStorage', { configurable: true, get: storageGetter })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply({ ok: true, data: first })))
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(entryStorage.getItem).not.toHaveBeenCalled()
+    expect(entryStorage.setItem).not.toHaveBeenCalled()
+    expect(storageGetter).not.toHaveBeenCalled()
+  })
+
+  it('does not consult session storage for a failed first observation', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')))
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(entryStorage.getItem).not.toHaveBeenCalled()
+    expect(entryStorage.setItem).not.toHaveBeenCalled()
+  })
+
+  it('uses a pre-existing same-task marker to baseline prior handoffs after an unknown observation', async () => {
+    const dev = { seq: 1, round: 1, type: 'dev', source_ref: 'executor-1/task-001.json', ref_task: null }
+    const review = { seq: 2, round: 1, type: 'review', source_ref: 'reviewer-1/task-002.json', ref_task: dev.source_ref }
+    const members = [
+      { id: 'executor-one', role: 'executor', status: 'awaiting-approval', current_task: dev },
+      { id: 'reviewer-one', role: 'reviewer', status: 'planning', current_task: review },
+    ]
+    const oldSubmission = { id: mawHandoffId('submission', members[0].id, members[1].id, dev.source_ref, review.source_ref),
+      kind: 'submission', sender_member_id: members[0].id, recipient_member_id: members[1].id,
+      source_task: dev.source_ref, target_task: review.source_ref }
+    entryStorage = mockSessionStorage([[entryStorageKey(), '1']])
+    vi.stubGlobal('sessionStorage', entryStorage)
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(reply({ ok: true, data: envelope(1, {
+        execution_state: 'unknown', handoff_state: 'unavailable', members, handoffs: [],
+      }) }))
+      .mockResolvedValue(reply({ ok: true, data: envelope(2, {
+        execution_state: 'not-started', assignment_state: 'assigned', handoff_state: 'complete', members,
+        handoffs: [oldSubmission],
+      }) })))
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(entryStorage.getItem).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(2000)
+    const state = useOfficeStore.getState()
+    expect(state.mawMeta).toMatchObject({ dashboard_opening: 0, dashboard_hydration: 2 })
+    expect(Object.values(state.agents).every((agent) => agent.position.x === agent.maw.workSeat.x
+      && agent.position.y === agent.maw.workSeat.y && !agent.inGroupEvent)).toBe(true)
+    expect(entryStorage.getItem).toHaveBeenCalledExactlyOnceWith(entryStorageKey())
+    expect(entryStorage.setItem).not.toHaveBeenCalled()
+  })
+
+  it.each(['getter', 'getItem', 'setItem'])('bounds a failing storage %s diagnostic to once per mount', async (operation) => {
+    const failure = new Error('private session failure detail')
+    if (operation === 'getter') {
+      Object.defineProperty(globalThis, 'sessionStorage', { configurable: true, get() { throw failure } })
+    } else entryStorage[operation].mockImplementation(() => { throw failure })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply({ ok: true,
+      data: envelope(1, { execution_state: 'not-started' }) })))
+
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(useOfficeStore.getState().dashboardSync.state).toBe('synced')
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(1)
+    expect(console.warn).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(console.warn.mock.calls)).not.toContain(failure.message)
+
+    cleanup()
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(useOfficeStore.getState().dashboardSync.state).toBe('synced')
+    expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(1)
+    expect(console.warn).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not use the live entry marker for terminal history playback or replay', async () => {
+    const completed = envelope(1, { execution_state: 'started', terminal: 'completed' })
+    const history = { schema: 'avo.maw-history/1', project: config.project, task: config.task,
+      terminal: 'completed', eligible: true, complete: true, warnings: [],
+      steps: [{ id: 'completion', kind: 'task-result', label: 'Recorded completion', recorded_at: null,
+        source_refs: ['tasks/executor/task-001.json'], snapshot: completed.snapshot }],
+      final_snapshot: completed.snapshot }
+    const storageGetter = vi.fn(() => entryStorage)
+    Object.defineProperty(globalThis, 'sessionStorage', { configurable: true, get: storageGetter })
+    vi.stubGlobal('fetch', vi.fn(async (url) => reply({ ok: true,
+      data: url.startsWith('/api/visualization/history') ? history : completed })))
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().dashboardHistory.state).toBe('playing')
+    useOfficeStore.getState().togglePause()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().dashboardHistory.state).toBe('paused')
+    useOfficeStore.getState().togglePause()
+    await vi.advanceTimersByTimeAsync(useOfficeStore.getState().dashboardHistory.duration_ms + 50)
+    expect(useOfficeStore.getState().dashboardHistory.state).toBe('ended')
+    useOfficeStore.getState().togglePause()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().dashboardHistory).toMatchObject({ state: 'playing', position_ms: 0 })
+    expect(storageGetter).not.toHaveBeenCalled()
+    expect(entryStorage.getItem).not.toHaveBeenCalled()
+    expect(entryStorage.setItem).not.toHaveBeenCalled()
+  })
+
   it('hydrates a running task at its current workstations without entry or old handoffs', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(reply({ ok: true, data: envelope(1, {
       assignment_state: 'assigned', execution_state: 'started',
