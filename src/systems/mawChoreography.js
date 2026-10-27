@@ -1188,7 +1188,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       const forceWorkPost = openingBatch && openingMembers.has(member.id)
       const seat = forceWorkPost ? stableWorkSeat(member) : isManager
         ? (phase === 'task' ? MANAGER_GATE : stableRestSeat(member))
-        : phase === 'task' || workflowActive ? stableWorkSeat(member) : stableRestSeat(member)
+        : phase === 'task' || postIsDeskNow ? stableWorkSeat(member) : stableRestSeat(member)
       // Delivering members hurry back to the work seat and wait for the manager.
       const delay = !forceWorkPost && member.status === 'awaiting-approval' ? 0 : batchStagger * STAGGER_MS
       batchStagger += 1
@@ -1207,7 +1207,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
         if (!live || (!forceWorkPost && phaseOf(live.status) !== phase)) return // the phase moved on — its own transition owns the walk
         if (forceWorkPost && !openingMembers.has(agentId)) return
         if (handoffParticipants.has(agentId)) return
-        walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null, zoneBound: isManager ? undefined : !forceWorkPost && phase === 'rest' && !workflowActive ? 'meeting' : 'member' })
+        walk(agentId, seat, { behavior: 'idle', expression: 'normal', bubble: null, zoneBound: isManager ? undefined : !forceWorkPost && phase === 'rest' && !postIsDeskNow ? 'meeting' : 'member' })
         const finish = () => {
           openingMembers.delete(agentId)
           restorePresentation(agentId)

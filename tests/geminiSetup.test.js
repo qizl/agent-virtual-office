@@ -253,7 +253,7 @@ describe('Gemini project hook setup', () => {
     expect(executed.status, executed.stderr).toBe(0)
     const output = JSON.parse(executed.stdout.trim())
     expect(output.executable).toBe(process.execPath)
-    expect(output.script).toBe(path.join(projectRoot, '.gemini', 'hooks', 'office-status-gemini.js'))
+    expect(output.script).toBe(fs.realpathSync(path.join(projectRoot, '.gemini', 'hooks', 'office-status-gemini.js')))
   })
 
   it('rejects unknown platform selectors instead of falling through to Claude setup', () => {

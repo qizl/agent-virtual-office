@@ -781,12 +781,13 @@ describe('Antigravity passive watcher', () => {
     vi.setSystemTime(Date.now())
     const dirs = await makeRoots()
     await fs.writeFile(dirs.transcript, '')
+    const canonicalTranscript = await fs.realpath(dirs.transcript)
     let armed = false
     let failures = 0
     const injectedFs = new Proxy(fs, {
       get(target, property) {
         if (property === 'open') return async (candidate, ...args) => {
-          if (armed && candidate === dirs.transcript) {
+          if (armed && candidate === canonicalTranscript) {
             armed = false; failures++
             throw Object.assign(new Error('synthetic-private-read-error'), { code })
           }

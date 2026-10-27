@@ -709,6 +709,36 @@ describe('startMawChoreography (controller)', () => {
     }
   })
 
+  it('CR-8 completion sends every role to rest before the first random roam tick', () => {
+    const store = useOfficeStore
+    const previousIntegration = store.getState().integration
+    store.setState({ integration: 'dashboard' })
+    const cleanup = startMawChoreography(store, { resumeCurrent: true })
+    installWalker(store)
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.99)
+    try {
+      const roles = ['manager', 'decision-maker', 'executor', 'reviewer']
+      const members = roles.map((role, index) => mawMember(`complete-${index}`, role))
+      store.getState().applyMawSnapshot({ ...envelope(members), dashboard_hydration: 1 })
+
+      const completed = envelope(members.map((member) => ({ ...member, status: 'done' })), 2)
+      completed.snapshot.terminal = 'completed'
+      store.getState().applyMawSnapshot({ ...completed, dashboard_hydration: 1 })
+      vi.advanceTimersByTime(2_500) // settle all staggered returns before the first 5s roam tick
+
+      for (const agent of Object.values(store.getState().agents)) {
+        const point = agent.groupTarget || agent.position
+        expect(inRect(point, MEETING), `${agent.id}: ${JSON.stringify(point)}`).toBe(true)
+        expect(agent.status).toBe('done')
+        expect(agent.behavior).toBe('idle')
+      }
+    } finally {
+      randomSpy.mockRestore()
+      cleanup()
+      store.setState({ integration: previousIntegration })
+    }
+  })
+
   it('launch order includes the manager: every role takes its i×STAGGER_MS slot (CR-1)', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)

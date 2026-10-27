@@ -27,9 +27,9 @@
  *        `.claude` segment (every `.claude/worktrees/**` agent worktree, including this repo)
  */
 
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import { createServer } from 'vite'
-import { mkdtempSync, writeFileSync, appendFileSync, mkdirSync, unlinkSync, rmSync, readFileSync } from 'node:fs'
+import fs, { mkdtempSync, writeFileSync, appendFileSync, mkdirSync, unlinkSync, rmSync, readFileSync, realpathSync, symlinkSync, renameSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -190,6 +190,101 @@ describe('F-1 file-watcher fallback scope (must not fabricate status from OFFICE
     expect(await res.text()).toBe('null')
   }, 25_000)
 
+  it('excludes a real status-directory symlink reported as a project change', async () => {
+    const { server, base, tempStatus } = await bootDevServer()
+    const statusAlias = join(server.config.root, '.status-alias')
+    symlinkSync(tempStatus, statusAlias, process.platform === 'win32' ? 'junction' : 'dir')
+    const aliasedFile = join(statusAlias, 'debug-log.txt')
+    writeFileSync(aliasedFile, 'status observer data\n')
+    expect(realpathSync(aliasedFile)).toBe(realpathSync(join(tempStatus, 'debug-log.txt')))
+
+    // A watcher may report either spelling of the same real file. Deliver the
+    // project-side alias explicitly so this check does not depend on OS event spelling.
+    server.watcher.emit('change', aliasedFile)
+    await new Promise((r) => setTimeout(r, 2000))
+
+    expect(await (await fetch(`${base}/api/status`)).text()).toBe('null')
+  }, 25_000)
+
+  it('skips unavailable change paths with one bounded diagnostic and accepts a later real edit', async () => {
+    const { server, base } = await bootDevServer()
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const missingFile = join(server.config.root, 'missing-source.jsx')
+      server.watcher.emit('change', missingFile)
+      server.watcher.emit('change', missingFile)
+      expect(await (await fetch(`${base}/api/status`)).text()).toBe('null')
+      expect(warning.mock.calls).toEqual([['[Office] file-watcher:', 'path-unavailable']])
+
+      const sourceFile = join(server.config.root, 'recovered-source.jsx')
+      writeFileSync(sourceFile, '// real project edit\n')
+      server.watcher.emit('change', sourceFile)
+      const merged = await (await fetch(`${base}/api/status`)).json()
+      expect(merged.agents.find((agent) => agent.role === 'dev')).toMatchObject({ status: 'working', task: 'Edit' })
+    } finally { warning.mockRestore() }
+  }, 25_000)
+
+  it('recreates a removed status directory after a legitimate project edit', async () => {
+    const { server, base, tempStatus } = await bootDevServer()
+    const preservedStatus = `${tempStatus}-preserved`
+    renameSync(tempStatus, preservedStatus)
+    tempDirs.push(preservedStatus)
+    const sourceFile = join(server.config.root, 'recovery-source.jsx')
+    writeFileSync(sourceFile, '// legitimate project edit\n')
+    server.watcher.emit('change', sourceFile)
+
+    const merged = await (await fetch(`${base}/api/status`)).json()
+    expect(merged?.agents.find((agent) => agent.role === 'dev')?.status).toBe('working')
+    expect(JSON.parse(readFileSync(join(tempStatus, 'office-status.json'), 'utf8')).source).toBe('file-watcher')
+  }, 25_000)
+
+  it('initializes a missing configured status directory before accepting project edits', async () => {
+    const parent = mkdtempTracked('avo-dev-parity-initial-status-')
+    const initiallyMissingStatus = join(parent, 'status')
+    const { server, base } = await bootDevServer({ OFFICE_STATUS_DIR: initiallyMissingStatus })
+    const sourceFile = join(server.config.root, 'initial-source.jsx')
+    writeFileSync(sourceFile, '// legitimate project edit\n')
+    server.watcher.emit('change', sourceFile)
+
+    expect((await (await fetch(`${base}/api/status`)).json())?.agents[0].status).toBe('working')
+    expect(JSON.parse(readFileSync(join(initiallyMissingStatus, 'office-status.json'), 'utf8')).source).toBe('file-watcher')
+  }, 25_000)
+
+  it('keeps a redirected status-directory symlink excluded from project edits', async () => {
+    const aliasParent = mkdtempTracked('avo-dev-parity-status-link-')
+    const firstTarget = mkdtempTracked('avo-dev-parity-status-target-')
+    const statusAlias = join(aliasParent, 'status')
+    const linkType = process.platform === 'win32' ? 'junction' : 'dir'
+    symlinkSync(firstTarget, statusAlias, linkType)
+    const { server, base } = await bootDevServer({ OFFICE_STATUS_DIR: statusAlias })
+    const redirectedTarget = join(server.config.root, '.redirected-status')
+    mkdirSync(redirectedTarget)
+    const debugFile = join(redirectedTarget, 'debug-log.txt')
+    writeFileSync(debugFile, 'status observer data\n')
+    unlinkSync(statusAlias)
+    symlinkSync(redirectedTarget, statusAlias, linkType)
+
+    server.watcher.emit('change', debugFile)
+    expect(await (await fetch(`${base}/api/status`)).text()).toBe('null')
+  }, 25_000)
+
+  it('stays neutral when the status-directory boundary cannot be verified due to EACCES', async () => {
+    const { server, base, tempStatus } = await bootDevServer()
+    const sourceFile = join(server.config.root, 'access-source.jsx')
+    writeFileSync(sourceFile, '// legitimate project edit\n')
+    const originalRealpath = fs.realpathSync
+    const realpath = vi.spyOn(fs, 'realpathSync').mockImplementation((candidate, ...args) => {
+      if (candidate === tempStatus) throw Object.assign(new Error('private-path-access-error'), { code: 'EACCES' })
+      return originalRealpath(candidate, ...args)
+    })
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      server.watcher.emit('change', sourceFile)
+      expect(await (await fetch(`${base}/api/status`)).text()).toBe('null')
+      expect(warning.mock.calls).toEqual([['[Office] file-watcher:', 'path-unavailable']])
+    } finally { realpath.mockRestore(); warning.mockRestore() }
+  }, 25_000)
+
   it('R2-1: a project rooted under a .claude segment (e.g. .claude/worktrees/<name>) still gets fallback status', async () => {
     // Reproduces the reviewer's exact probe: root = <scratch>/.claude/worktrees/<name>. Every
     // worktree this repo's own convention creates is rooted exactly like this — the absolute-
@@ -224,6 +319,41 @@ describe('F-1 file-watcher fallback scope (must not fabricate status from OFFICE
     const merged = await (await fetch(`${base}/api/status`)).json()
     expect(merged, 'a .claude-rooted project must still get a fallback status').not.toBeNull()
     expect(merged.agents.find((a) => a.role === 'dev')?.status).toBe('working')
+  }, 25_000)
+
+  it('accepts a lexical root-alias event without treating an ancestor .claude segment as ignored', async () => {
+    const baseDir = mkdtempTracked('avo-dev-parity-alias-root-')
+    const actualBase = join(baseDir, 'actual')
+    const actualRoot = join(actualBase, '.claude', 'worktrees', 'project')
+    mkdirSync(actualRoot, { recursive: true })
+    writeFileSync(join(actualRoot, 'index.html'), '<!doctype html><html><body></body></html>')
+    writeFileSync(join(actualRoot, 'source.jsx'), '// existing source\n')
+    mkdirSync(join(actualRoot, 'src'))
+    writeFileSync(join(actualRoot, 'src', 'source.jsx'), '// ignored alias target\n')
+    mkdirSync(join(actualRoot, '.claude'))
+    symlinkSync(join(actualRoot, 'src'), join(actualRoot, '.claude', 'source-link'), process.platform === 'win32' ? 'junction' : 'dir')
+    const aliasBase = join(baseDir, 'alias')
+    symlinkSync(actualBase, aliasBase, process.platform === 'win32' ? 'junction' : 'dir')
+    const lexicalRoot = join(aliasBase, '.claude', 'worktrees', 'project')
+    const tempStatus = mkdtempTracked('avo-dev-parity-status-')
+    const savedDir = process.env.OFFICE_STATUS_DIR
+    process.env.OFFICE_STATUS_DIR = tempStatus
+    const server = await createServer({
+      configFile: 'vite.config.mjs', root: lexicalRoot, logLevel: 'silent',
+      optimizeDeps: { noDiscovery: true, include: [] },
+      server: { port: 0, strictPort: false, host: '127.0.0.1' },
+    })
+    await server.listen()
+    if (savedDir === undefined) delete process.env.OFFICE_STATUS_DIR
+    else process.env.OFFICE_STATUS_DIR = savedDir
+    servers.push(server)
+    expect(realpathSync(server.config.root)).toBe(realpathSync(lexicalRoot))
+
+    server.watcher.emit('change', join(lexicalRoot, '.claude', 'source-link', 'source.jsx'))
+    expect(await (await fetch(`http://127.0.0.1:${server.httpServer.address().port}/api/status`)).text()).toBe('null')
+    server.watcher.emit('change', join(lexicalRoot, 'source.jsx'))
+    const merged = await (await fetch(`http://127.0.0.1:${server.httpServer.address().port}/api/status`)).json()
+    expect(merged?.agents.find((agent) => agent.role === 'dev')?.status).toBe('working')
   }, 25_000)
 })
 

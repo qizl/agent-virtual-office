@@ -818,8 +818,16 @@ function fileWatcherFallbackPlugin() {
       // then shows up in ANY project's office (scanSessions.mjs's strict pass admits a bare,
       // no-_cwd office-status.json unconditionally). Only react to edits actually inside the
       // project this dev server is serving.
-      const projectRoot = path.resolve(server.config.root)
+      const projectRoot = fs.realpathSync(server.config.root)
+      const lexicalProjectRoot = path.resolve(server.config.inlineConfig?.root ?? server.config.root)
       const projectRootLower = isWin ? projectRoot.toLowerCase() : projectRoot
+      let pathFailureReported = false
+      function reportPathFailure() {
+        if (!pathFailureReported) {
+          pathFailureReported = true
+          console.warn('[Office] file-watcher:', 'path-unavailable')
+        }
+      }
       function isUnderProjectRoot(file) {
         const resolved = path.resolve(file)
         const cmp = isWin ? resolved.toLowerCase() : resolved
@@ -827,9 +835,15 @@ function fileWatcherFallbackPlugin() {
       }
       // Also exclude STATUS_DIR explicitly, even when it happens to live INSIDE the project
       // root (e.g. a relative OFFICE_STATUS_DIR) — isUnderProjectRoot alone would admit it.
-      const statusDirResolved = path.resolve(path.dirname(statusPath))
-      const statusDirLower = isWin ? statusDirResolved.toLowerCase() : statusDirResolved
+      let statusDirResolved = fs.realpathSync(path.dirname(statusPath))
       function isUnderStatusDir(file) {
+        try { statusDirResolved = fs.realpathSync(path.dirname(statusPath)) }
+        catch (error) {
+          if (error?.code !== 'ENOENT') throw error
+          // Keep the verified boundary while writeStatus recreates a removed directory.
+          reportPathFailure()
+        }
+        const statusDirLower = isWin ? statusDirResolved.toLowerCase() : statusDirResolved
         const resolved = path.resolve(file)
         const cmp = isWin ? resolved.toLowerCase() : resolved
         return cmp === statusDirLower || cmp.startsWith(statusDirLower + path.sep)
@@ -843,14 +857,27 @@ function fileWatcherFallbackPlugin() {
       // Segment equality avoids both: only an exact path COMPONENT ('node_modules', 'dist',
       // '.git', '.claude') inside the project is skipped.
       const IGNORED_SEGMENTS = new Set(['node_modules', 'dist', '.git', '.claude'])
-      function hasIgnoredSegment(resolvedFile) {
-        return path.relative(projectRoot, resolvedFile).split(path.sep).some((seg) => IGNORED_SEGMENTS.has(seg))
+      function hasIgnoredSegment(resolvedFile, root = projectRoot) {
+        const relative = path.relative(root, resolvedFile)
+        if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return false
+        return relative.split(path.sep).some((seg) => IGNORED_SEGMENTS.has(seg))
       }
       // Watch project source files for changes (Vite's watcher covers src/)
       const onFallbackChange = (file) => {
-        if (!isUnderProjectRoot(file)) return
-        if (isUnderStatusDir(file)) return
-        if (hasIgnoredSegment(path.resolve(file))) return
+        let resolvedFile, lexicalFile
+        try {
+          // Watchers can report a symlink alias or its real target (including
+          // macOS /var and /private/var). Compare all boundaries in real paths.
+          lexicalFile = path.resolve(file)
+          resolvedFile = fs.realpathSync(lexicalFile)
+          if (!isUnderProjectRoot(resolvedFile)) return
+          if (isUnderStatusDir(resolvedFile)) return
+        } catch {
+          reportPathFailure()
+          return
+        }
+        if (hasIgnoredSegment(lexicalFile, lexicalProjectRoot)
+            || hasIgnoredSegment(lexicalFile) || hasIgnoredSegment(resolvedFile)) return
         if (file.includes('office-status')) return
         const role = fileToRole(file)
         writeStatus(role, file)
