@@ -192,6 +192,31 @@ class InteractionProjectionTest(unittest.TestCase):
         self.assertEqual(value["handoffs"], [])
         self.assertEqual(fixtures.member_by_role(value["members"], "executor")["handoff_pending"], "not-ready")
 
+    def test_unbound_task_filename_disables_handoffs_from_real_reads(self):
+        for status, review_status in (("dev-complete", "initialized"),
+                                      ("review-failed", "review-failed")):
+            for folder, seq in (("executor-1", 1), ("reviewer-1", 2)):
+                with self.subTest(status=status, folder=folder):
+                    root, original = self.snapshot(
+                        executor_tasks=[fixtures.task(1, status=status)],
+                        reviewer_tasks=[fixtures.task(2, type_="review", status=review_status,
+                                                      ref_task="executor-1/task-001")])
+                    self.assertEqual(len(original["handoffs"]), 1)
+                    directory = root / RUNTIME_REL / "maw-synth-001" / folder
+                    (directory / f"task-{seq:03d}.json").rename(directory / "task-099.json")
+
+                    observed = projection.read_snapshot(root, "maw-synth-001", now=1000)
+
+                    self.assertEqual(observed["execution_state"], "unknown")
+                    self.assertEqual(observed["assignment_state"], "unknown")
+                    self.assertEqual(observed["handoff_state"], "unavailable")
+                    self.assertEqual(observed["handoffs"], [])
+                    self.assertIsNone(fixtures.member_by_role(observed["members"],
+                                                             folder.rsplit("-", 1)[0])["current_task"])
+                    for role in ("executor", "reviewer"):
+                        self.assertEqual(fixtures.member_by_role(observed["members"], role)["status"],
+                                         fixtures.member_by_role(original["members"], role)["status"])
+
     def test_review_failure_returns_only_to_exact_author_and_not_rework_successor(self):
         dev = fixtures.task(1, status="review-failed")
         review = fixtures.task(2, type_="review", status="review-failed", ref_task="executor-1/task-001")

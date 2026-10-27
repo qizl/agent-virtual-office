@@ -713,6 +713,20 @@ def task_identity(folder, task):
             "source_ref": source, "ref_task": parent}
 
 
+def _bound_task_records(folder, role):
+    """Return task identities only when every observed filename binds its seq."""
+    tasks, filenames = role["tasks"], role.get("_task_file_names")
+    if not isinstance(filenames, list) or len(filenames) != len(tasks):
+        return None
+    records = []
+    for task, filename in zip(tasks, filenames):
+        identity = task_identity(folder, task)
+        if identity is None or filename != identity["source_ref"].split("/", 1)[1]:
+            return None
+        records.append((identity, task))
+    return records
+
+
 def _execution_state(state):
     """Project startup from complete, bound task evidence, independently of handoffs."""
     declared = (state.get("manifest") or {}).get("roles")
@@ -727,17 +741,13 @@ def _execution_state(state):
     for folder in declared:
         if folder.rsplit("-", 1)[0] not in MEMBER_ROLES:
             continue  # Manager/workflow activity is not concrete task execution.
-        role = state["roles"][folder]
-        tasks, filenames = role["tasks"], role.get("_task_file_names")
-        if not isinstance(filenames, list) or len(filenames) != len(tasks):
+        records = _bound_task_records(folder, state["roles"][folder])
+        if records is None:
             return "unknown"
-        total += len(tasks)
+        total += len(records)
         if total > MAX_TASK_FILES:
             return "unknown"
-        for task, filename in zip(tasks, filenames):
-            identity = task_identity(folder, task)
-            if identity is None or filename != identity["source_ref"].split("/", 1)[1]:
-                return "unknown"
+        for _identity, task in records:
             if task["status"] in STARTED_TASK_STATUSES:
                 started = True
     return "started" if started else "not-started"
@@ -779,9 +789,10 @@ def _interaction_fields(state, members):
             if member:
                 member.update(current_task=None, handoff_pending=None)
             continue
-        identities = [(task_identity(folder, task), task) for task in role["tasks"]]
-        if any(identity is None for identity, _task in identities):
+        identities = _bound_task_records(folder, role)
+        if identities is None:
             complete = False
+            identities = []
         for identity, task in identities:
             if identity:
                 if identity["source_ref"] in records:
