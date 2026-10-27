@@ -1,5 +1,7 @@
 import React from 'react'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+afterEach(() => vi.useRealTimers())
 
 async function renderControlPanelWithMockStore(overrides = {}) {
   vi.resetModules()
@@ -107,18 +109,36 @@ describe('ControlPanel — presence rail render contract', () => {
     expect(html).toContain('flex flex-wrap items-center justify-center')
   })
 
-  it('keeps healthy synchronization text stable and moves the sample time into its tooltip', async () => {
-    const render = async (lastValidAt) => (await renderControlPanelWithMockStore({
-      integration: 'dashboard', dashboardSync: { state: 'synced', code: null, lastValidAt, retrying: false },
-    })).html.match(/<div[^>]*data-dashboard-sync="synced"[\s\S]*?<\/div>/)[0]
-    const before = await render(10000)
-    const after = await render(12000)
-    const visible = (html) => html.replace(/<[^>]*>/g, '')
-    expect(visible(before)).toBe('synced')
-    expect(visible(after)).toBe(visible(before))
-    expect(before).toContain(`title="Last sample: ${new Date(10000).toLocaleTimeString()}"`)
-    expect(after).toContain(`title="Last sample: ${new Date(12000).toLocaleTimeString()}"`)
-    expect(after).not.toContain('<button')
+  it('renders a fixed-width local wall clock across midnight independently of sample time and scene pause', async () => {
+    vi.useFakeTimers()
+    const midnight = new Date(2026, 9, 27, 23, 59, 59).getTime()
+    const state = {
+      integration: 'dashboard', isPaused: true,
+      dashboardSync: { state: 'synced', code: null, lastValidAt: 10000, retrying: false },
+    }
+    vi.setSystemTime(midnight)
+    const before = (await renderControlPanelWithMockStore(state)).html
+    vi.setSystemTime(midnight + 1000)
+    const after = (await renderControlPanelWithMockStore(state)).html
+    const clock = (html) => html.match(/<time[^>]*data-dashboard-clock[^>]*>[\s\S]*?<\/time>/)?.[0]
+    expect(clock(before)).toContain('23:59:59</time>')
+    expect(clock(after)).toContain('00:00:00</time>')
+    expect(clock(after)).toContain('w-[8ch]')
+    expect(clock(after)).toContain('font-mono tabular-nums')
+    expect(clock(after)).toContain(`dateTime="${new Date(midnight + 1000).toISOString()}"`)
+    const live = after.match(/<div[^>]*data-dashboard-sync="synced"[\s\S]*?<\/div>/)[0]
+    expect(live).not.toContain('role="status"')
+    expect(live).not.toContain('synced</span>')
+    expect(live).not.toContain('Last sample')
+    expect(live).not.toContain('<button')
+    expect(after).not.toContain('09:05')
+  })
+
+  it.each([null, { state: 'loading', retrying: true }])('shows the live clock without initial synchronization wording (%j)', async (dashboardSync) => {
+    const { html } = await renderControlPanelWithMockStore({ integration: 'dashboard', dashboardSync })
+    expect(html).toContain('data-dashboard-clock')
+    expect(html).not.toContain('loading</span>')
+    expect(html).not.toContain('Retry</button>')
   })
 
   it.each(['loading', 'configuration-error'])('does not offer retry for %s', async (state) => {
@@ -147,6 +167,8 @@ describe('ControlPanel — presence rail render contract', () => {
     const wrapper = html.slice(0, html.indexOf('>') + 1)
     expect(wrapper).toContain('fixed bottom-0 left-0 right-0')
     expect(wrapper).not.toContain('data-dashboard-controls')
+    expect(html).toContain('09:05')
+    expect(html).not.toContain('data-dashboard-clock')
   })
 
   it('labels historical scenes and derives pause controls from the replay clock', async () => {
@@ -160,6 +182,8 @@ describe('ControlPanel — presence rail render contract', () => {
     expect(html).toContain('Recorded result')
     expect(html).toContain('aria-label="Pause"')
     expect(html).not.toContain('data-dashboard-sync')
+    expect(html).not.toContain('data-dashboard-clock')
+    expect(html).toContain('09:05')
   })
 
   it('renders the normalized external status for the rail dot and screen-reader text', async () => {
