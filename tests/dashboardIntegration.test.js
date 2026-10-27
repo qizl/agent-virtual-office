@@ -574,6 +574,60 @@ describe('Dashboard fixed binding and lifecycle', () => {
     expect(useOfficeStore.getState().agents['member1~executor'].position).toEqual(position)
   })
 
+  it('keeps healthy background polls synchronized while retaining precise freshness', async () => {
+    const pending = deferred()
+    const fetchMock = vi.fn().mockResolvedValueOnce(reply({ ok: true, data: envelope() }))
+      .mockReturnValueOnce(pending.promise)
+    vi.stubGlobal('fetch', fetchMock)
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    expect(useOfficeStore.getState().dashboardSync).toMatchObject({ state: 'loading', lastValidAt: null })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().dashboardSync).toMatchObject({ state: 'synced', lastValidAt: 10000 })
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(useOfficeStore.getState().dashboardSync).toMatchObject({ state: 'synced', lastValidAt: 10000 })
+    pending.resolve(reply({ ok: true, data: envelope(2) }))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().dashboardSync).toMatchObject({ state: 'synced', lastValidAt: 12000, retrying: false })
+  })
+
+  it.each([
+    ['error', () => Promise.reject(new Error('offline'))],
+    ['missing', () => Promise.resolve(reply({ ok: false, error: { code: 'task-not-found' } }, 404))],
+    ['stale', () => Promise.resolve(reply({ ok: true, data: envelope(1, { quality: 'stale' }) }))],
+  ])('retains %s feedback throughout a pending retry and deduplicates repeated retries', async (state, initial) => {
+    const pending = deferred()
+    const fetchMock = vi.fn().mockImplementationOnce(initial).mockReturnValueOnce(pending.promise)
+    vi.stubGlobal('fetch', fetchMock)
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().dashboardSync.state).toBe(state)
+    useOfficeStore.getState().requestDashboardSync()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().dashboardSync).toMatchObject({ state, retrying: true })
+    useOfficeStore.getState().requestDashboardSync()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    pending.resolve(reply({ ok: true, data: envelope(2) }))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().dashboardSync).toMatchObject({ state: 'synced', retrying: false })
+  })
+
+  it('clears the previous binding synchronization status while the new task first loads', async () => {
+    const old = deferred(), next = deferred()
+    vi.stubGlobal('fetch', vi.fn().mockReturnValueOnce(old.promise).mockReturnValueOnce(next.promise))
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    old.resolve(reply({ ok: true, data: envelope() }))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().dashboardSync.state).toBe('synced')
+    cleanup()
+    cleanup = startDashboardIntegration(useOfficeStore, { ...config, task: 'new-task' })
+    expect(useOfficeStore.getState().dashboardSync).toMatchObject({ state: 'loading', lastValidAt: null })
+    next.resolve(reply({ ok: true, data: envelope() }))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().dashboardSync.state).toBe('synced')
+  })
+
   it('does not fetch or discover another task when configuration is incomplete', () => {
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)

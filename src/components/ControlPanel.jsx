@@ -258,10 +258,11 @@ export default function ControlPanel({ platform = 'browser', mode = 'full' }) {
       )}
       {isDashboard && !inHistory && dashboardSync && (
         <div className="mb-1 flex flex-wrap items-center justify-center gap-2 text-[11px] text-gray-600 dark:text-gray-300" role="status" data-dashboard-sync={dashboardSync.state}>
-          <span>{t(`dashboard.${dashboardSync.state}`, dashboardSync.state)}</span>
+          <span title={dashboardSync.lastValidAt != null
+            ? `${t('maw.lastSample', 'Last sample')}: ${new Date(dashboardSync.lastValidAt).toLocaleTimeString()}`
+            : undefined}>{t(`dashboard.${dashboardSync.state}`, dashboardSync.state)}</span>
           {dashboardSync.code && <span>{t(`dashboard.${dashboardSync.code}`, dashboardSync.code)}</span>}
-          {dashboardSync.lastValidAt != null && <span>{t('maw.lastSample')}: {new Date(dashboardSync.lastValidAt).toLocaleTimeString()}</span>}
-          {dashboardSync.state !== 'configuration-error' && <button
+          {['error', 'missing', 'stale'].includes(dashboardSync.state) && <button
             onClick={() => useOfficeStore.getState().requestDashboardSync()}
             disabled={dashboardSync.retrying}
             className="rounded border border-gray-300 px-1.5 py-0.5 disabled:opacity-50"

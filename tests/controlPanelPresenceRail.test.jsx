@@ -107,6 +107,41 @@ describe('ControlPanel — presence rail render contract', () => {
     expect(html).toContain('flex flex-wrap items-center justify-center')
   })
 
+  it('keeps healthy synchronization text stable and moves the sample time into its tooltip', async () => {
+    const render = async (lastValidAt) => (await renderControlPanelWithMockStore({
+      integration: 'dashboard', dashboardSync: { state: 'synced', code: null, lastValidAt, retrying: false },
+    })).html.match(/<div[^>]*data-dashboard-sync="synced"[\s\S]*?<\/div>/)[0]
+    const before = await render(10000)
+    const after = await render(12000)
+    const visible = (html) => html.replace(/<[^>]*>/g, '')
+    expect(visible(before)).toBe('synced')
+    expect(visible(after)).toBe(visible(before))
+    expect(before).toContain(`title="Last sample: ${new Date(10000).toLocaleTimeString()}"`)
+    expect(after).toContain(`title="Last sample: ${new Date(12000).toLocaleTimeString()}"`)
+    expect(after).not.toContain('<button')
+  })
+
+  it.each(['loading', 'configuration-error'])('does not offer retry for %s', async (state) => {
+    const { html } = await renderControlPanelWithMockStore({
+      integration: 'dashboard', dashboardSync: { state, lastValidAt: null, retrying: state === 'loading' },
+    })
+    const sync = html.match(/<div[^>]*data-dashboard-sync="[^" ]+"[\s\S]*?<\/div>/)[0]
+    expect(sync).not.toContain('<button')
+  })
+
+  it.each(['error', 'missing', 'stale'])('offers retry only for the recoverable %s state and disables pending retries', async (state) => {
+    const render = async (retrying) => (await renderControlPanelWithMockStore({
+      integration: 'dashboard', dashboardSync: { state, code: 'read-failed', lastValidAt: 10000, retrying },
+    })).html.match(/<div[^>]*data-dashboard-sync="[^" ]+"[\s\S]*?<\/div>/)[0]
+    const idle = await render(false)
+    const pending = await render(true)
+    expect(idle).toContain('Retry</button>')
+    expect(idle).not.toContain('disabled=""')
+    expect(pending).toContain('disabled=""')
+    expect(pending).toMatch(new RegExp(`<span[^>]*>${state}</span>`))
+    expect(pending).toContain('read-failed')
+  })
+
   it('preserves the standalone fixed footer', async () => {
     const { html } = await renderControlPanelWithMockStore()
     const wrapper = html.slice(0, html.indexOf('>') + 1)

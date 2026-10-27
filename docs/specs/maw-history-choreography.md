@@ -40,6 +40,9 @@ During a live nonterminal workflow, CR-6 keeps the existing 90-second eligibilit
 - Fullscreen retains the same iframe, playback and task binding. Task changes and page exit cancel old timers and responses.
 - A live task that reaches a completed terminal state while this visualization remains mounted stays in live mode and keeps CR-8 free roaming; automatic history playback is eligible only when the first valid snapshot observed for the mount is already completed. Re-entering the visualization creates a new mount and may autoplay that completed history.
 
+- Live observation and pending initial history detection hide the history toggle, restart, step counter and seek range. Available historical playback restores them; unavailable/error history retains a disabled explained toggle without empty progress. Fullscreen and exact frame binding remain available.
+- Healthy background reads retain the synchronized label throughout pending requests; lastValidAt continues to advance only on accepted observations and controls stale detection. The successful observation time is a hover tooltip, not changing visible seconds. Retry means another read-only state request and is visible only for error, missing or stale states. Its pending request disables the button without replacing the actual failure label. Initial loading and configuration errors have no Retry. Each new binding resets the prior synchronization display; failures and stale observations remain explicit.
+
 ## 5. Acceptance
 
 - A recorded assignment, work, submission, review result and explicit rework chain visibly identify their recorded actors with appropriate actions. Missing intermediate evidence remains missing.

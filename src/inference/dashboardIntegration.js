@@ -43,7 +43,7 @@ function historyRosterFor(steps) {
 export function startDashboardIntegration(store, config = detectIntegrationConfig()) {
   // Every mounted binding starts with its own observation baseline, including
   // rapid task replacements that reuse this store.
-  store.setState({ agents: {}, mawMeta: null, dashboardHistoryPresentation: null })
+  store.setState({ agents: {}, mawMeta: null, dashboardHistoryPresentation: null, dashboardSync: null })
   let torn = false
   let generation = 0
   let controller = null
@@ -122,7 +122,7 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     onPause() {},
   })
 
-  function sync(state, code = null) {
+  function sync(state, code = null, retrying = state === 'loading') {
     if (torn) return
     if (['error', 'missing', 'stale'].includes(state)) {
       needsRecovery = true
@@ -136,7 +136,7 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
       console.warn('[Dashboard] synchronization:', code)
       reportedFailure = code
     } else if (state === 'synced') reportedFailure = null
-    store.getState().setDashboardSync({ state, code, lastValidAt, retrying: state === 'loading' })
+    store.getState().setDashboardSync({ state, code, lastValidAt, retrying })
   }
   function clearTeam() {
     store.getState().applyMawSnapshot({ server_epoch: lastKey?.[0] ?? 0, seq: lastKey?.[1] ?? 0, snapshot: null })
@@ -147,7 +147,7 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
       if (torn) return
       isStale = true
       store.getState().freezeMawSnapshot()
-      sync('stale', 'client-sync-timeout')
+      sync('stale', 'client-sync-timeout', inFlight != null)
     }, STALE_MS)
   }
   function accept(envelope) {
@@ -212,7 +212,11 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     const mine = ++generation
     controller = new AbortController()
     const activeController = controller
-    sync('loading')
+    const previous = store.getState().dashboardSync
+    // Background reads keep the last observed result visible until a new one
+    // arrives. A recovery request disables Retry without hiding its failure.
+    if (!previous) sync('loading')
+    else if (['error', 'missing', 'stale'].includes(previous.state)) sync(previous.state, previous.code, true)
     inFlight = Promise.resolve().then(async () => {
       if (torn || mine !== generation) return
       try {
