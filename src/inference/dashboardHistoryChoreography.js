@@ -98,6 +98,10 @@ function route(from, target) {
 }
 
 export function sampleHistoryRoute(points, ratio) {
+  if (ratio >= 1) {
+    const a = points.at(-2) || points[0], b = points.at(-1)
+    return { ...b, facing: calcFacing(a.x, a.y, b.x, b.y) }
+  }
   const lengths = points.slice(1).map((p, i) => Math.hypot(p.x - points[i].x, p.y - points[i].y))
   const total = lengths.reduce((a, b) => a + b, 0)
   let distance = clamp(ratio) * total
@@ -169,16 +173,21 @@ export function prepareHistoryTimeline(steps, agents, finalSnapshot = null) {
   const positions = {}
   const plans = [], starts = [], warnings = new Set()
   let duration_ms = 0
+  let workflowStarted = false
   for (const step of steps) {
     const cue = historyCue(step)
     const entries = {}
     const members = new Map((step.snapshot?.members || []).map((member) => [member.id, member]))
+    const hasTaskActivity = ['publication', 'work', 'delivery', 'result', 'rework'].includes(cue?.activity)
+    const hasActiveMember = [...members.values()].some((member) =>
+      ['planning', 'working', 'awaiting-approval', 'blocked', 'done'].includes(member.status))
+    workflowStarted ||= !step.snapshot?.terminal && (hasTaskActivity || hasActiveMember)
     for (const [id, agent] of Object.entries(agents)) {
       const member = members.get(agent.maw?.key)
       if (!agent.mawMember || !member) continue
       const from = point(positions[id]) ? positions[id] : agent.position
-      const resting = ['idle', 'done'].includes(member.status) || !!step.snapshot?.terminal
-      const base = resting ? (agent.maw?.restSeat || agent.position) : (agent.maw?.workSeat || agent.position)
+      const base = workflowStarted && !step.snapshot?.terminal
+        ? (agent.maw?.workSeat || agent.position) : (agent.maw?.restSeat || agent.position)
       const active = cue?.actor_member_id === member.id
       entries[id] = { from: { ...from }, base: { ...base }, active,
         related: cue?.related_member_ids.includes(member.id) || false,
@@ -258,7 +267,9 @@ export function prepareHistoryTimeline(steps, agents, finalSnapshot = null) {
 function sampleCompiledPresentation(plan, progress) {
   const elapsed = Math.max(0, Math.min(plan.duration_ms, progress.step_elapsed_ms || 0))
   const agents = {}
-  const talking = !plan.terminal && plan.handoff && elapsed >= plan.handoff.talk_start_ms && elapsed < plan.handoff.talk_end_ms
+  const returningToTerminal = Number.isFinite(plan.terminal_start_ms) && elapsed >= plan.terminal_start_ms
+  const talking = !plan.terminal && !returningToTerminal && plan.handoff
+    && elapsed >= plan.handoff.talk_start_ms && elapsed < plan.handoff.talk_end_ms
   for (const [id, entry] of Object.entries(plan.entries)) {
     const sample = plannedEntryPosition(entry, elapsed)
     let position = sample.position
@@ -274,7 +285,6 @@ function sampleCompiledPresentation(plan, progress) {
     const isMoving = locating
       ? progress.transition_elapsed_ms < 500 && routeLength(entry.seekPath) > 1
       : !plan.terminal && sample.moving
-    const returningToTerminal = Number.isFinite(plan.terminal_start_ms) && elapsed >= plan.terminal_start_ms
     const gesture = plan.terminal || returningToTerminal ? { behavior: 'idle', expression: 'normal' }
       : talking && participant && !locating ? { behavior: 'chat', expression: entry.gesture.expression } : entry.gesture
     agents[id] = { ...gesture, position, active: !plan.terminal && entry.active, related: !plan.terminal && entry.related,
@@ -287,8 +297,9 @@ function sampleCompiledPresentation(plan, progress) {
 
 export function buildHistoryPresentation(step, agents, previous = {}, context = {}) {
   if (context.plan?.compiled) {
-    const terminal = context.reason === 'end' || step.cue?.activity === 'terminal'
-    const plan = { ...context.plan, terminal, stage: terminal ? '终局记录' : context.plan.stage,
+    const terminalRecord = step.cue?.activity === 'terminal'
+    const plan = { ...context.plan, terminal: context.reason === 'end',
+      stage: terminalRecord || context.reason === 'end' ? '终局记录' : context.plan.stage,
       entries: Object.fromEntries(Object.entries(context.plan.entries).map(([id, entry]) => [id, { ...entry }])), seek: context.reason === 'seek' }
     if (plan.seek) {
       const elapsed = context.position_ms - context.step_start_ms

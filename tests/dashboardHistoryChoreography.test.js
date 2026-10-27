@@ -6,7 +6,8 @@ import { mawHandoffId } from '../src/inference/dashboardSnapshot.js'
 const members = [{ id: 'dev', role: 'executor' }, { id: 'rev', role: 'reviewer' }]
 const agents = Object.fromEntries(members.map((member, i) => [`${member.id}~${member.role}`, {
   id: `${member.id}~${member.role}`, mawMember: true, status: 'idle', position: { x: 650 + i * 45, y: 300 },
-  maw: { key: member.id, role: member.role, workSeat: { x: 340 + i * 120, y: 364 }, verdict: null },
+  maw: { key: member.id, role: member.role, workSeat: { x: 340 + i * 120, y: 364 },
+    restSeat: { x: 650 + i * 45, y: 300 }, verdict: null },
 }]))
 function step(activity = 'work', actor = 'dev', overrides = {}) {
   const task = { seq: activity === 'rework' ? 2 : 1, round: activity === 'rework' ? 2 : 1,
@@ -110,6 +111,107 @@ function handoffStep(kind = 'submission') {
 }
 
 describe('Compiled handoff timeline', () => {
+  it('holds ready records at default seats, opens the visible team together, and never roams on active idle/done records', () => {
+    const ready = step('ready', 'dev')
+    ready.id = 'ready-dev'
+    const secondReady = step('ready', 'rev')
+    secondReady.id = 'ready-reviewer'
+    const readyTimeline = prepareHistoryTimeline([ready, secondReady], agents)
+    for (const plan of readyTimeline.plans) {
+      for (const [id, entry] of Object.entries(plan.entries)) {
+        expect(entry.base).toEqual(agents[id].maw.restSeat)
+        expect(entry.segments[0].distance).toBe(0)
+      }
+    }
+
+    const work = step('work')
+    const idleAndDone = { id: 'idle-done', snapshot: { members: [
+      { id: 'dev', role: 'executor', status: 'done' },
+      { id: 'rev', role: 'reviewer', status: 'idle' },
+    ] }, cue: null }
+    const timeline = prepareHistoryTimeline([work, idleAndDone], agents)
+    const first = timeline.plans[0], next = timeline.plans[1]
+    expect(first.entries['dev~executor'].segments[0].distance).toBeGreaterThan(0)
+    expect(first.entries['rev~reviewer'].segments[0].distance).toBeGreaterThan(0)
+    const opening = sampleHistoryPresentation(first, progress(1000))
+    expect(opening.agents['dev~executor'].isMoving).toBe(true)
+    expect(opening.agents['rev~reviewer'].isMoving).toBe(true)
+    for (const [id, entry] of Object.entries(next.entries)) {
+      expect(entry.base).toEqual(agents[id].maw.workSeat)
+      expect(entry.segments[0].distance).toBe(0)
+      expect(sampleHistoryPresentation(next, progress(next.duration_ms)).agents[id].position)
+        .toMatchObject(agents[id].maw.workSeat)
+    }
+  })
+
+  it('keeps terminal return animated on the terminal record before holding the final rest scene', () => {
+    const office = structuredClone(agents)
+    office['dev~executor'].position = { ...office['dev~executor'].maw.workSeat }
+    office['rev~reviewer'].position = { ...office['rev~reviewer'].maw.workSeat }
+    office['dev~executor'].maw.restSeat = { x: 650, y: 300 }
+    office['rev~reviewer'].maw.restSeat = { x: 695, y: 300 }
+    const record = step('work')
+    const finalSnapshot = { terminal: 'completed', members: [
+      { id: 'dev', status: 'done' }, { id: 'rev', status: 'done' },
+    ] }
+    const timeline = prepareHistoryTimeline([record], office, finalSnapshot)
+    const plan = timeline.plans[0]
+    const terminalStep = { ...record, snapshot: finalSnapshot,
+      cue: { actor_member_id: null, activity: 'terminal', task: null, related_member_ids: [] } }
+    const frame = buildHistoryPresentation(terminalStep, office, {}, { reason: 'step', index: 0,
+      position_ms: timeline.duration_ms - 1000, step_start_ms: 0, plan })
+    const animated = sampleHistoryPresentation(frame, progress(plan.duration_ms - 1000))
+    expect(animated.agents['dev~executor'].isMoving).toBe(true)
+    expect(animated.agents['dev~executor'].behavior).toBe('idle')
+    expect(animated.agents['dev~executor'].position).not.toEqual(office['dev~executor'].maw.workSeat)
+    const ended = buildHistoryPresentation(terminalStep, office, {}, { reason: 'end', index: 0,
+      position_ms: timeline.duration_ms, step_start_ms: 0, plan })
+    expect(sampleHistoryPresentation(ended, progress(plan.duration_ms)).agents['dev~executor'])
+      .toMatchObject({ isMoving: false, position: office['dev~executor'].maw.restSeat })
+  })
+
+  it('reveals a late member only at its causal record without moving existing members back to rest', () => {
+    const first = step('work')
+    first.snapshot.members = first.snapshot.members.filter((member) => member.id === 'dev')
+    const late = step('ready', 'rev')
+    const timeline = prepareHistoryTimeline([first, late], agents)
+    expect(Object.keys(timeline.plans[0].entries)).toEqual(['dev~executor'])
+    const second = timeline.plans[1]
+    expect(second.entries['dev~executor'].segments[0].distance).toBe(0)
+    expect(second.entries['rev~reviewer'].from).toEqual(agents['rev~reviewer'].maw.restSeat)
+    expect(second.entries['rev~reviewer'].base).toEqual(agents['rev~reviewer'].maw.workSeat)
+  })
+
+  it('returns a failed review handoff to both work posts and holds them through neutral rework records', () => {
+    const review = handoffStep('review-result')
+    const neutral = { id: 'pending-rework', snapshot: { members: [
+      { id: 'dev', role: 'executor', status: 'idle' },
+      { id: 'rev', role: 'reviewer', status: 'done', verdict: 'fail' },
+    ] } }
+    const timeline = prepareHistoryTimeline([step('work'), review, neutral], agents)
+    const handoff = timeline.plans[1]
+    expect(handoff.handoff).toMatchObject({ sender: 'rev~reviewer', recipient: 'dev~executor' })
+    expect(handoff.handoff.talk_end_ms - handoff.handoff.talk_start_ms).toBe(3000)
+    expect(handoff.entries['rev~reviewer'].gesture).toEqual({ behavior: 'scratch-head', expression: 'confused' })
+    for (const [id, agent] of Object.entries(agents)) {
+      expect(sampleHistoryPresentation(handoff, progress(handoff.duration_ms)).agents[id].position)
+        .toMatchObject(agent.maw.workSeat)
+      expect(timeline.plans[2].entries[id].segments[0].distance).toBe(0)
+    }
+    expect(review.snapshot.members[1]).toMatchObject({ status: 'done', verdict: 'fail' })
+  })
+
+  it('returns on an explicit terminal snapshot even without a separate final snapshot, and never opens terminal-only history', () => {
+    const terminal = { id: 'global-terminal', snapshot: { terminal: 'completed', members: members.map((member) => ({ ...member, status: 'done' })) },
+      cue: { activity: 'terminal', actor_member_id: null, task: null, related_member_ids: [] } }
+    const timeline = prepareHistoryTimeline([step('work'), terminal], agents)
+    for (const [id, agent] of Object.entries(agents)) {
+      expect(timeline.plans[1].entries[id].base).toEqual(agent.maw.restSeat)
+      expect(timeline.plans[1].entries[id].segments[0].distance).toBeGreaterThan(0)
+      expect(prepareHistoryTimeline([terminal], agents).plans[0].entries[id].segments[0].distance).toBe(0)
+    }
+  })
+
   it('uses exact task owners, walks to the recipient, converses for three seconds and returns without teleporting', () => {
     const record = handoffStep()
     expect(historyCue(record)).not.toBeNull()
@@ -256,7 +358,8 @@ describe('Compiled handoff timeline', () => {
     const previous = timeline.plans.at(-2), last = timeline.plans.at(-1)
 
     expect(timeline.warnings).toContain('history-animation-incomplete')
-    expect(timeline.duration_ms).toBe(800_000)
+    expect(timeline.duration_ms).toBe(timeline.plans[0].duration_ms + 199 * 4000)
+    expect(timeline.plans[0].duration_ms).toBeGreaterThan(4000)
     expect(timeline.plans.slice(0, -1).every((plan) => plan.stage === '执行记录')).toBe(true)
     expect(last).toMatchObject({ duration_ms: 4000, stage: '记录回顾 · 动画时轴不完整', cue: null, handoff: null })
     expect(last.terminal_start_ms).toBeUndefined()
