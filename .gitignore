@@ -132,3 +132,6 @@ office-hook-capture.jsonl
 # End Agentic OS Template - Downstream Ignore Defaults
 
 .zcode
+
+# Local runtime state (machine-specific dashboard registry)
+.agents/plugins/**/.runtime/
