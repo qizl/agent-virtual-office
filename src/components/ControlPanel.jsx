@@ -7,7 +7,6 @@ import { PET_TYPES } from '../systems/petState.js'
 import { THEMES } from '../systems/theme.js'
 import { classifyMood } from '../systems/classify.js'
 import { renderDailyCard, shareOrDownloadCard, todayKey } from '../systems/dailyCard.js'
-import { useNowTick } from '../utils/useNowTick.js'
 
 const statusOptions = ['idle', 'working', 'blocked', 'done']
 
@@ -58,14 +57,6 @@ function HealthDot({ dot, reducedMotion, calm }) {
       )}
     </div>
   )
-}
-
-// Keep the one-second tick local so it does not re-render the roster or office.
-function DashboardClock() {
-  const now = new Date(useNowTick(1000))
-  const time = [now.getHours(), now.getMinutes(), now.getSeconds()]
-    .map((value) => String(value).padStart(2, '0')).join(':')
-  return <time data-dashboard-clock dateTime={now.toISOString()} className="inline-block w-[8ch] shrink-0 whitespace-nowrap font-mono tabular-nums">{time}</time>
 }
 
 export default function ControlPanel({ platform = 'browser', mode = 'full' }) {
@@ -265,10 +256,9 @@ export default function ControlPanel({ platform = 'browser', mode = 'full' }) {
           <span>动作路径与播放时长仅为记录语义展示</span>
         </div>
       )}
-      {isDashboard && !inHistory && (
-        <div className="mb-1 flex flex-wrap items-center justify-center gap-2 text-[11px] text-gray-600 dark:text-gray-300" data-dashboard-sync={dashboardSync?.state || 'loading'}>
-          <DashboardClock />
-          {dashboardSync && !['loading', 'synced'].includes(dashboardSync.state) && <span role="status" className="inline-flex flex-wrap items-center justify-center gap-2">
+      {isDashboard && !inHistory && dashboardSync && !['loading', 'synced'].includes(dashboardSync.state) && (
+        <div className="mb-1 flex flex-wrap items-center justify-center gap-2 text-[11px] text-gray-600 dark:text-gray-300" data-dashboard-sync={dashboardSync.state}>
+          <span role="status" className="inline-flex flex-wrap items-center justify-center gap-2">
             <span title={dashboardSync.lastValidAt != null
               ? `${t('maw.lastSample', 'Last sample')}: ${new Date(dashboardSync.lastValidAt).toLocaleTimeString()}`
               : undefined}>{t(`dashboard.${dashboardSync.state}`, dashboardSync.state)}</span>
@@ -278,7 +268,7 @@ export default function ControlPanel({ platform = 'browser', mode = 'full' }) {
               disabled={dashboardSync.retrying}
               className="rounded border border-gray-300 px-1.5 py-0.5 disabled:opacity-50"
             >{t('dashboard.retry', 'Retry')}</button>}
-          </span>}
+          </span>
         </div>
       )}
       {/* Onboarding popover */}

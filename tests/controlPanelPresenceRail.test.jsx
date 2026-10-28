@@ -109,44 +109,32 @@ describe('ControlPanel — presence rail render contract', () => {
     expect(html).toContain('flex flex-wrap items-center justify-center')
   })
 
-  it('renders a fixed-width local wall clock across midnight independently of sample time and scene pause', async () => {
+  it.each([null, { state: 'loading', retrying: true }, { state: 'synced', lastValidAt: 10000 }])('omits the live clock and healthy/loading row even while paused (%j)', async (dashboardSync) => {
     vi.useFakeTimers()
-    const midnight = new Date(2026, 9, 27, 23, 59, 59).getTime()
-    const state = {
-      integration: 'dashboard', isPaused: true,
-      dashboardSync: { state: 'synced', code: null, lastValidAt: 10000, retrying: false },
+    const midnight = new Date(2026, 9, 28, 23, 59, 59).getTime()
+    const state = { integration: 'dashboard', isPaused: true, dashboardSync }
+    for (const offset of [0, 1000]) {
+      vi.setSystemTime(midnight + offset)
+      const { html } = await renderControlPanelWithMockStore(state)
+      expect(html).not.toContain('data-dashboard-clock')
+      expect(html).not.toContain('data-dashboard-sync')
+      expect(html).not.toContain('09:05')
+      expect(html).not.toContain('loading</span>')
+      expect(html).not.toContain('synced</span>')
+      expect(html).not.toContain('Retry</button>')
     }
-    vi.setSystemTime(midnight)
-    const before = (await renderControlPanelWithMockStore(state)).html
-    vi.setSystemTime(midnight + 1000)
-    const after = (await renderControlPanelWithMockStore(state)).html
-    const clock = (html) => html.match(/<time[^>]*data-dashboard-clock[^>]*>[\s\S]*?<\/time>/)?.[0]
-    expect(clock(before)).toContain('23:59:59</time>')
-    expect(clock(after)).toContain('00:00:00</time>')
-    expect(clock(after)).toContain('w-[8ch]')
-    expect(clock(after)).toContain('font-mono tabular-nums')
-    expect(clock(after)).toContain(`dateTime="${new Date(midnight + 1000).toISOString()}"`)
-    const live = after.match(/<div[^>]*data-dashboard-sync="synced"[\s\S]*?<\/div>/)[0]
-    expect(live).not.toContain('role="status"')
-    expect(live).not.toContain('synced</span>')
-    expect(live).not.toContain('Last sample')
-    expect(live).not.toContain('<button')
-    expect(after).not.toContain('09:05')
   })
 
-  it.each([null, { state: 'loading', retrying: true }])('shows the live clock without initial synchronization wording (%j)', async (dashboardSync) => {
-    const { html } = await renderControlPanelWithMockStore({ integration: 'dashboard', dashboardSync })
-    expect(html).toContain('data-dashboard-clock')
-    expect(html).not.toContain('loading</span>')
-    expect(html).not.toContain('Retry</button>')
-  })
-
-  it.each(['loading', 'configuration-error'])('does not offer retry for %s', async (state) => {
+  it('preserves configuration errors without offering retry or a clock', async () => {
     const { html } = await renderControlPanelWithMockStore({
-      integration: 'dashboard', dashboardSync: { state, lastValidAt: null, retrying: state === 'loading' },
+      integration: 'dashboard', dashboardSync: { state: 'configuration-error', lastValidAt: null },
     })
-    const sync = html.match(/<div[^>]*data-dashboard-sync="[^" ]+"[\s\S]*?<\/div>/)[0]
+    const sync = html.match(/<div[^>]*data-dashboard-sync="configuration-error"[\s\S]*?<\/div>/)[0]
+    expect(sync).toContain('role="status"')
+    expect(sync).toContain('configuration-error</span>')
     expect(sync).not.toContain('<button')
+    expect(html).not.toContain('data-dashboard-clock')
+    expect(html).not.toContain('09:05')
   })
 
   it.each(['error', 'missing', 'stale'])('offers retry only for the recoverable %s state and disables pending retries', async (state) => {
@@ -160,6 +148,8 @@ describe('ControlPanel — presence rail render contract', () => {
     expect(pending).toContain('disabled=""')
     expect(pending).toMatch(new RegExp(`<span[^>]*>${state}</span>`))
     expect(pending).toContain('read-failed')
+    expect(pending).not.toContain('data-dashboard-clock')
+    expect(pending).not.toContain('09:05')
   })
 
   it('preserves the standalone fixed footer', async () => {
