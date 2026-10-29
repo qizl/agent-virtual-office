@@ -40,10 +40,19 @@ def task(seq, round_, type_, status, ref=None, node=None, logical=None):
             "session": None, "result": None, "review": None}
 
 
-def obligation(disposition):
+def attempt(n, task_file, verdict):
+    # Shape mirrors the engine's record_attempt_publication / record_verdict.
+    disposition = "pending" if verdict is None else ("failed" if verdict == "fail" else "passed")
+    return {"attempt": n, "task_file": task_file, "object_fingerprint": "sha256:" + "0" * 16,
+            "verdict": verdict, "reviewer": "reviewer-1", "comments": None,
+            "disposition": disposition}
+
+
+def obligation(disposition, attempts=(), internal_attempts=()):
     # Key and object mirror the MAW engine: obligation_key(node, "current-plan").
     return {"node": "plan", "object": "current-plan", "object_kind": "plan",
-            "disposition": disposition, "attempts": [], "internal_attempts": []}
+            "disposition": disposition, "attempts": list(attempts),
+            "internal_attempts": list(internal_attempts)}
 
 
 class PlanRevisionTests(unittest.TestCase):
@@ -85,12 +94,18 @@ class PlanRevisionTests(unittest.TestCase):
             "plan_ref": "docs/plan.md",
             "plan_digest": f"sha256:{digest or self.digest}"})
 
-    def write_workflow(self, *, blocking, disposition, policy=MUTABLE_POLICY, node_status="running"):
+    def write_workflow(self, *, blocking="plan-revision-in-progress", disposition="awaiting-rework",
+                       policy=MUTABLE_POLICY, node_status="running", attempts=None, internal_attempts=()):
+        if attempts is None:
+            # The engine's engine-shaped baseline: the root plan review (task-001)
+            # was published and failed, which is what opens the rework obligation.
+            attempts = (attempt(1, "reviewer-1/task-001.json", "fail"),)
         state = {
             "schema": "maw.workflow/1", "selection": {"title": "win r2"},
             "definition": {"nodes": WORKFLOW_NODES},
             "nodes": {"plan": {"status": node_status, "blocking": blocking}},
-            "review_obligations": {"plan:current-plan": obligation(disposition)},
+            "review_obligations": {"plan:current-plan": obligation(
+                disposition, attempts=attempts, internal_attempts=internal_attempts)},
             "finish": {}}
         if policy is not None:
             state["policy"] = policy
@@ -152,6 +167,7 @@ class PlanRevisionTests(unittest.TestCase):
                         node="plan"))
         self.write(self.runtime / "decision-maker-1" / "task-005.json",
                    task(5, 1, "dev", "in-progress", ref="reviewer-1/task-004.json", node="plan"))
+        self.write_workflow(internal_attempts=(attempt(1, "reviewer-1/task-004.json", "fail"),))
         self.assert_degraded()
 
     def test_plan_review_round_two_after_passed_revision_is_accepted(self):
@@ -161,7 +177,9 @@ class PlanRevisionTests(unittest.TestCase):
         self.write(self.runtime / "reviewer-1" / "task-006.json",
                    task(6, 2, "plan-review", "in-progress", ref="decision-maker-1/task-002.json",
                         node="plan"))
-        self.write_workflow(blocking="plan-review-in-progress", disposition="pending")
+        self.write_workflow(blocking="plan-review-in-progress", disposition="pending",
+                            attempts=(attempt(1, "reviewer-1/task-001.json", "fail"),
+                                      attempt(2, "reviewer-1/task-006.json", None)))
         self.assert_degraded()
 
     # ─── policy boundary (WIN-R2-VISR-001) ──────────────────────────────────
@@ -226,6 +244,146 @@ class PlanRevisionTests(unittest.TestCase):
                    task(2, 1, "dev", "in-progress", ref="reviewer-1/task-001.json"))
         self.assert_rejected()
 
+    # ─── attempt-binding boundaries (2026-10-29 review P2 hardening) ────────
+
+    def add_second_decision_maker(self):
+        manifest = json.loads((self.runtime / "task.json").read_text())
+        manifest["roles"].append("decision-maker-2")
+        self.write(self.runtime / "task.json", manifest)
+        self.write(self.runtime / "decision-maker-2" / "ready.json",
+                   {"schema": "maw.ready/1", "status": "confirmed"})
+
+    def test_renamed_newest_revision_file_is_rejected(self):
+        # P2: one unbound folder must refuse the exception — skipping it would
+        # let the older role's chain stand in for evidence it may hide.
+        self.drift()
+        self.add_second_decision_maker()
+        self.write(self.runtime / "decision-maker-2" / "task-005.json",
+                   task(5, 2, "dev", "in-progress", ref="reviewer-1/task-001.json", node="plan"))
+        (self.runtime / "decision-maker-2" / "task-005.json").rename(
+            self.runtime / "decision-maker-2" / "task-099.json")
+        self.assert_rejected()
+
+    def test_bound_newest_revision_in_second_role_is_accepted(self):
+        # The identical chain with intact file identity: newest selection spans
+        # roles, so the refusal above is identity-driven, not folder-driven.
+        self.drift()
+        self.add_second_decision_maker()
+        self.write(self.runtime / "decision-maker-2" / "task-005.json",
+                   task(5, 2, "dev", "in-progress", ref="reviewer-1/task-001.json", node="plan"))
+        snapshot = self.read()
+        self.assertEqual(snapshot["quality"], "degraded")
+        self.assertEqual(snapshot["quality_detail"], "plan-revision")
+        self.assertEqual(len(snapshot["members"]), len(ROLES) + 1)
+
+    def test_revision_replaying_an_older_failed_attempt_is_rejected(self):
+        # P2: the cited failure must be the engine's LATEST failed attempt; a
+        # newer failed attempt (task-007) makes the round-1 record stale.
+        self.drift()
+        self.write(self.runtime / "reviewer-1" / "task-007.json",
+                   task(7, 2, "plan-review", "review-failed", node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-002.json",
+                   task(2, 1, "dev", "review-failed", ref="reviewer-1/task-001.json", node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-005.json",
+                   task(5, 2, "dev", "in-progress", ref="reviewer-1/task-001.json", node="plan"))
+        self.write_workflow(attempts=(attempt(1, "reviewer-1/task-001.json", "fail"),
+                                      attempt(2, "reviewer-1/task-007.json", "fail")))
+        self.assert_rejected()
+
+    def test_second_attempt_rework_binds_to_latest_failed_review(self):
+        # The honest second-attempt chain cites the newest failure record.
+        self.drift()
+        self.write(self.runtime / "reviewer-1" / "task-007.json",
+                   task(7, 2, "plan-review", "review-failed", node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-002.json",
+                   task(2, 1, "dev", "review-failed", ref="reviewer-1/task-001.json", node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-005.json",
+                   task(5, 2, "dev", "in-progress", ref="reviewer-1/task-007.json", node="plan"))
+        self.write_workflow(attempts=(attempt(1, "reviewer-1/task-001.json", "fail"),
+                                      attempt(2, "reviewer-1/task-007.json", "fail")))
+        self.assert_degraded()
+
+    def test_running_review_must_be_the_current_published_attempt(self):
+        # P2: under plan-review-in-progress the running record must be the
+        # engine's published attempt file, not an unrelated review on disk.
+        self.drift()
+        self.write(self.runtime / "decision-maker-1" / "task-002.json",
+                   task(2, 1, "dev", "review-passed", ref="reviewer-1/task-001.json", node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-006.json",
+                   task(6, 2, "plan-review", "in-progress", ref="decision-maker-1/task-002.json",
+                        node="plan"))
+        self.write_workflow(blocking="plan-review-in-progress", disposition="pending",
+                            attempts=(attempt(1, "reviewer-1/task-001.json", "fail"),
+                                      attempt(2, "reviewer-1/task-008.json", None)))
+        self.assert_rejected()
+
+    def test_orphan_internal_chain_without_root_plan_review_is_rejected(self):
+        # P2: an internal-review chain must root at the failed plan review that
+        # opened the obligation; no root attempt, no exception.
+        self.drift()
+        (self.runtime / "reviewer-1" / "task-001.json").unlink()
+        self.write(self.runtime / "decision-maker-1" / "task-002.json",
+                   task(2, 1, "dev", "review-failed", ref=None, node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-004.json",
+                   task(4, 1, "review", "review-failed", ref="decision-maker-1/task-002.json",
+                        node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-005.json",
+                   task(5, 2, "dev", "in-progress", ref="reviewer-1/task-004.json", node="plan"))
+        self.write_workflow(attempts=(),
+                            internal_attempts=(attempt(1, "reviewer-1/task-004.json", "fail"),))
+        self.assert_rejected()
+
+    def test_internal_chain_with_deleted_root_record_is_rejected(self):
+        # The obligation still names the root attempt, but its record is gone
+        # from disk: the chain cannot be proven, so the exception is refused.
+        self.drift()
+        (self.runtime / "reviewer-1" / "task-001.json").unlink()
+        self.write(self.runtime / "decision-maker-1" / "task-002.json",
+                   task(2, 1, "dev", "review-failed", ref="reviewer-1/task-001.json", node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-004.json",
+                   task(4, 1, "review", "review-failed", ref="decision-maker-1/task-002.json",
+                        node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-005.json",
+                   task(5, 2, "dev", "in-progress", ref="reviewer-1/task-004.json", node="plan"))
+        self.write_workflow(internal_attempts=(attempt(1, "reviewer-1/task-004.json", "fail"),))
+        self.assert_rejected()
+
+    def test_internal_chain_with_extra_plan_attempt_is_rejected(self):
+        # A later failed plan attempt means the next rework must cite THAT
+        # record; an internal chain behind it is a stale, contaminated state.
+        self.drift()
+        self.write(self.runtime / "decision-maker-1" / "task-002.json",
+                   task(2, 1, "dev", "review-failed", ref="reviewer-1/task-001.json", node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-004.json",
+                   task(4, 1, "review", "review-failed", ref="decision-maker-1/task-002.json",
+                        node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-005.json",
+                   task(5, 2, "dev", "in-progress", ref="reviewer-1/task-004.json", node="plan"))
+        self.write_workflow(attempts=(attempt(1, "reviewer-1/task-001.json", "fail"),
+                                      attempt(2, "reviewer-1/task-006.json", "fail")),
+                            internal_attempts=(attempt(1, "reviewer-1/task-004.json", "fail"),))
+        self.assert_rejected()
+
+    def test_second_internal_round_through_checkpointed_attempts_is_accepted(self):
+        # Two internal rounds: every hop is a checkpointed failed internal
+        # attempt and the walk still roots at the failed plan review.
+        self.drift()
+        self.write(self.runtime / "decision-maker-1" / "task-002.json",
+                   task(2, 1, "dev", "review-failed", ref="reviewer-1/task-001.json", node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-004.json",
+                   task(4, 1, "review", "review-failed", ref="decision-maker-1/task-002.json",
+                        node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-005.json",
+                   task(5, 1, "dev", "review-failed", ref="reviewer-1/task-004.json", node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-007.json",
+                   task(7, 1, "review", "review-failed", ref="decision-maker-1/task-005.json",
+                        node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-009.json",
+                   task(9, 1, "dev", "in-progress", ref="reviewer-1/task-007.json", node="plan"))
+        self.write_workflow(internal_attempts=(attempt(1, "reviewer-1/task-004.json", "fail"),
+                                               attempt(2, "reviewer-1/task-007.json", "fail")))
+        self.assert_degraded()
+
     def test_finished_revision_node_is_rejected(self):
         self.drift()
         self.write_workflow(blocking="development-in-progress", node_status="completed",
@@ -235,7 +393,8 @@ class PlanRevisionTests(unittest.TestCase):
             "definition": {"nodes": WORKFLOW_NODES}, "policy": MUTABLE_POLICY,
             "nodes": {"plan": {"status": "completed"},
                       "dev": {"status": "running", "blocking": "development-in-progress"}},
-            "review_obligations": {"plan:current-plan": obligation("awaiting-rework")},
+            "review_obligations": {"plan:current-plan": obligation(
+                "awaiting-rework", attempts=(attempt(1, "reviewer-1/task-001.json", "fail"),))},
             "finish": {}})
         self.assert_rejected()
 

@@ -1134,38 +1134,66 @@ def _revision_status_matches_blocking(blocking, status):
     return blocking == "plan-review-in-progress" and status == "review-passed"
 
 
-def _plan_obligation_matches(workflow, node_id, blocking) -> bool:
-    """The frozen engine state must agree with the live blocking string."""
+def _plan_obligation(workflow, node_id):
     obligations = (workflow or {}).get("review_obligations") if isinstance(workflow, dict) else None
     if not isinstance(obligations, dict):
-        return False
+        return None
     obligation = obligations.get(f"{node_id}:{PLAN_OBJECT_ID}")
-    if not isinstance(obligation, dict):
+    return obligation if isinstance(obligation, dict) else None
+
+
+def _plan_obligation_matches(workflow, node_id, blocking) -> bool:
+    """The frozen engine state must agree with the live blocking string."""
+    obligation = _plan_obligation(workflow, node_id)
+    if obligation is None:
         return False
     expected = "pending" if blocking == "plan-review-in-progress" else "awaiting-rework"
     return obligation.get("disposition") == expected
 
 
-def _bound_records_by_ref(state: dict) -> dict:
-    """File-bound task records only: a folder whose filenames stop binding its
-    seq values cannot prove any reference identity."""
+def _bound_records_by_ref(state: dict) -> dict | None:
+    """File-bound task records only. A folder whose filenames stop binding its
+    seq values hides whatever it holds — possibly a newer revision — so one
+    unbound folder refuses the whole exception instead of letting older roles
+    stand in for evidence that cannot be proven."""
     bound = {}
     for folder, role in state["roles"].items():
         records = _bound_task_records(folder, role)
         if records is None:
-            continue
+            return None
         for identity, task in records:
             bound[identity["source_ref"]] = (folder, task)
     return bound
 
 
+def _obligation_attempts(obligation, key) -> list | None:
+    """Engine-shaped attempt entries only: every entry carries a non-empty
+    task_file and a verdict of None (published, unreviewed), "fail" or "pass".
+    A malformed or impossible shape refuses the chain."""
+    entries = obligation.get(key)
+    if not isinstance(entries, list):
+        return None
+    for attempt in entries:
+        if (not isinstance(attempt, dict) or type(attempt.get("task_file")) is not str
+                or not attempt["task_file"]
+                or attempt.get("verdict") not in (None, "fail", "pass")):
+            return None
+    return entries
+
+
 def _node_revision_chain(state: dict, workflow, node_id: str, blocking: str) -> bool:
     """Engine-equivalent evidence for one plan-review node: the single newest
     (round, seq) decision-maker revision bound to the node, whose status agrees
-    with the live blocking, and whose reference resolves to a failed review of
-    the SAME node — the plan review itself, or the internal review that failed
-    the immediately preceding revision. Historical chains cannot substitute."""
+    with the live blocking, and whose reference resolves to the engine's latest
+    failed published review attempt of the SAME node — the plan review itself,
+    or the internal review that failed the immediately preceding revision. The
+    running plan review must be the current published attempt, every internal
+    hop must be a checkpointed failed internal attempt, and the chain must root
+    at the failed plan review that opened the obligation. Historical chains,
+    orphaned internal reviews and unbound file identities cannot substitute."""
     bound = _bound_records_by_ref(state)
+    if bound is None:
+        return False
     revisions = []
     for source_ref, (folder, task) in bound.items():
         if (folder.rsplit("-", 1)[0] != "decision-maker" or task.get("type") != "dev"
@@ -1177,16 +1205,29 @@ def _node_revision_chain(state: dict, workflow, node_id: str, blocking: str) -> 
     _rank, effective_ref, effective = max(revisions, key=lambda item: item[0])
     if not _revision_status_matches_blocking(blocking, effective.get("status")):
         return False
+    obligation = _plan_obligation(workflow, node_id)
+    if obligation is None:
+        return False
+    attempts = _obligation_attempts(obligation, "attempts")
+    internal = _obligation_attempts(obligation, "internal_attempts")
+    if attempts is None or internal is None:
+        return False
     if blocking == "plan-review-in-progress":
-        # The running plan review must itself audit the effective revision.
-        if not any(task.get("type") == "plan-review"
-                   and task.get("workflow_node_id") == node_id
-                   and task.get("status") in ("initialized", "in-progress")
-                   and normalize_task_ref(task.get("ref_task")) == effective_ref
-                   for _folder, task in bound.values()):
+        # The running plan review audits the effective revision and must be the
+        # engine's current published attempt, not an unrelated file on disk.
+        if len(attempts) < 2 or attempts[-1].get("verdict") is not None:
+            return False
+        running_ref = normalize_task_ref(attempts[-1]["task_file"])
+        running = bound.get(running_ref) if running_ref else None
+        if (running is None or running[1].get("type") != "plan-review"
+                or running[1].get("workflow_node_id") != node_id
+                or running[1].get("status") not in ("initialized", "in-progress")
+                or normalize_task_ref(running[1].get("ref_task")) != effective_ref):
             return False
     ref = normalize_task_ref(effective.get("ref_task"))
-    entry = bound.get(ref) if ref else None
+    if ref is None:
+        return False
+    entry = bound.get(ref)
     if entry is None:
         return False
     folder, review = entry
@@ -1194,8 +1235,29 @@ def _node_revision_chain(state: dict, workflow, node_id: str, blocking: str) -> 
         return False
     kind = review.get("type")
     if kind == "plan-review":
+        # The failure that justifies this rework is the engine's latest failed
+        # plan-review attempt; an older round's record cannot substitute.
+        if blocking == "plan-review-in-progress":
+            latest_fail = attempts[-2] if attempts[-2].get("verdict") == "fail" else None
+        else:
+            latest_fail = attempts[-1] if (attempts and attempts[-1].get("verdict") == "fail") else None
+        if latest_fail is None or normalize_task_ref(latest_fail["task_file"]) != ref:
+            return False
         return _plan_obligation_matches(workflow, node_id, blocking)
     if kind != "review":
+        return False
+    # An internal rework chain only exists between the root plan-review failure
+    # and the next plan-review publication: any other attempt shape is a stale
+    # or cross-contaminated state.
+    if blocking == "plan-review-in-progress":
+        if len(attempts) != 2 or attempts[0].get("verdict") != "fail":
+            return False
+    elif len(attempts) != 1 or attempts[0].get("verdict") != "fail":
+        return False
+    # The cited internal review must be the engine's latest failed internal
+    # attempt for this obligation.
+    if (not internal or internal[-1].get("verdict") != "fail"
+            or normalize_task_ref(internal[-1]["task_file"]) != ref):
         return False
     previous_ref = normalize_task_ref(review.get("ref_task"))
     previous = bound.get(previous_ref) if previous_ref else None
@@ -1204,6 +1266,39 @@ def _node_revision_chain(state: dict, workflow, node_id: str, blocking: str) -> 
     _previous_folder, previous_task = previous
     if (previous_task.get("type") != "dev" or previous_task.get("workflow_node_id") != node_id
             or previous_task.get("status") != "review-failed"):
+        return False
+    # The internal rework must root at the failed plan review that opened the
+    # obligation: walk the alternating revision/review chain back through
+    # checkpointed failed internal attempts until the root record itself.
+    root_ref = normalize_task_ref(attempts[0]["task_file"])
+    failed_internal_refs = {normalize_task_ref(attempt["task_file"])
+                            for attempt in internal if attempt.get("verdict") == "fail"}
+    failed_internal_refs.discard(None)
+    chain_ref, hops = normalize_task_ref(previous_task.get("ref_task")), 0
+    while chain_ref != root_ref:
+        if chain_ref is None or hops > len(internal):
+            return False
+        link = bound.get(chain_ref)
+        if link is None or link[1] is effective:
+            return False
+        _link_folder, cited = link
+        if (cited.get("type") != "review" or cited.get("status") != "review-failed"
+                or cited.get("workflow_node_id") != node_id
+                or chain_ref not in failed_internal_refs):
+            return False
+        earlier_ref = normalize_task_ref(cited.get("ref_task"))
+        earlier = bound.get(earlier_ref) if earlier_ref else None
+        if (earlier is None or earlier[1] is effective
+                or earlier[1].get("type") != "dev"
+                or earlier[1].get("workflow_node_id") != node_id
+                or earlier[1].get("status") != "review-failed"):
+            return False
+        chain_ref = normalize_task_ref(earlier[1].get("ref_task"))
+        hops += 1
+    root = bound.get(root_ref)
+    if (root is None or root[1].get("type") != "plan-review"
+            or root[1].get("status") != "review-failed"
+            or root[1].get("workflow_node_id") != node_id):
         return False
     return _plan_obligation_matches(workflow, node_id, blocking)
 
@@ -1217,9 +1312,11 @@ def plan_revision_observable(state: dict) -> bool:
     frozen policy explicitly declares mutable source; and the frozen workflow
     proves the revision — a plan-review node running with a plan-revision
     blocking whose obligation agrees, plus the single newest decision-maker
-    revision bound to that node whose reference chain resolves to a failed
-    review of the same node. A blocking string, an unbound file identity, a
-    failed revision or a stale historical chain never qualifies; legacy tasks
+    revision bound to that node whose reference chain resolves to the engine's
+    latest failed published review attempt of the same node, rooted at the
+    failed plan review that opened the obligation. A blocking string, an
+    unbound file identity anywhere, a failed revision or a stale historical
+    chain never qualifies; legacy tasks
     without the node binding keep the stable rejection.
     """
     if state.get("_inconsistent") or state.get("degraded") != ["plan_ref:drifted"]:
