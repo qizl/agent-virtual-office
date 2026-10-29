@@ -1181,6 +1181,43 @@ def _obligation_attempts(obligation, key) -> list | None:
     return entries
 
 
+def _latest_failed_attempt(attempts):
+    """The engine's most recent failed plan attempt — the rework wave's root."""
+    for attempt in reversed(attempts):
+        if attempt.get("verdict") == "fail":
+            return attempt
+    return None
+
+
+def _internal_tail_matches(bound, internal, blocking, kind, ref, effective_ref, node_id) -> bool:
+    """The engine's newest internal event must agree with the revision phase:
+    an in-progress rework may only follow the failed internal attempt that
+    caused it, a reviewing revision is held by its open internal review, and a
+    running plan review must have been opened by the internal pass. Older
+    events stay admissible history; open contradictions do not."""
+    tail_ref = normalize_task_ref(internal[-1]["task_file"]) if internal else None
+    if blocking == "plan-revision-in-progress":
+        if kind == "review":
+            return bool(internal) and internal[-1].get("verdict") == "fail" and tail_ref == ref
+        return not (internal and internal[-1].get("verdict") is None)
+    record = bound.get(tail_ref) if tail_ref else None
+    if blocking == "plan-revision-review":
+        if not internal or internal[-1].get("verdict") is not None or record is None:
+            return False
+        held = record[1]
+        return (held.get("type") == "review" and held.get("workflow_node_id") == node_id
+                and held.get("status") in ("initialized", "in-progress")
+                and normalize_task_ref(held.get("ref_task")) == effective_ref)
+    if kind == "review":
+        if not internal or internal[-1].get("verdict") != "pass" or record is None:
+            return False
+        passed = record[1]
+        return (passed.get("type") == "review" and passed.get("workflow_node_id") == node_id
+                and passed.get("status") == "review-passed"
+                and normalize_task_ref(passed.get("ref_task")) == effective_ref)
+    return not (internal and internal[-1].get("verdict") is None)
+
+
 def _node_revision_chain(state: dict, workflow, node_id: str, blocking: str) -> bool:
     """Engine-equivalent evidence for one plan-review node: the single newest
     (round, seq) decision-maker revision bound to the node, whose status agrees
@@ -1189,8 +1226,11 @@ def _node_revision_chain(state: dict, workflow, node_id: str, blocking: str) -> 
     or the internal review that failed the immediately preceding revision. The
     running plan review must be the current published attempt, every internal
     hop must be a checkpointed failed internal attempt, and the chain must root
-    at the failed plan review that opened the obligation. Historical chains,
-    orphaned internal reviews and unbound file identities cannot substitute."""
+    at the latest failed plan attempt — the rework wave it opened — while the
+    newest internal event agrees with the revision phase (a rework follows its
+    failure, a reviewing revision holds its open review, a running plan review
+    follows the internal pass). Historical chains, orphaned internal reviews
+    and unbound file identities cannot substitute."""
     bound = _bound_records_by_ref(state)
     if bound is None:
         return False
@@ -1238,26 +1278,28 @@ def _node_revision_chain(state: dict, workflow, node_id: str, blocking: str) -> 
         # The failure that justifies this rework is the engine's latest failed
         # plan-review attempt; an older round's record cannot substitute.
         if blocking == "plan-review-in-progress":
-            latest_fail = attempts[-2] if attempts[-2].get("verdict") == "fail" else None
+            latest_fail = (attempts[-2] if len(attempts) >= 2 and attempts[-2].get("verdict") == "fail"
+                           else None)
         else:
-            latest_fail = attempts[-1] if (attempts and attempts[-1].get("verdict") == "fail") else None
+            latest_fail = _latest_failed_attempt(attempts)
         if latest_fail is None or normalize_task_ref(latest_fail["task_file"]) != ref:
+            return False
+        if not _internal_tail_matches(bound, internal, blocking, kind, ref, effective_ref, node_id):
             return False
         return _plan_obligation_matches(workflow, node_id, blocking)
     if kind != "review":
         return False
-    # An internal rework chain only exists between the root plan-review failure
-    # and the next plan-review publication: any other attempt shape is a stale
-    # or cross-contaminated state.
-    if blocking == "plan-review-in-progress":
-        if len(attempts) != 2 or attempts[0].get("verdict") != "fail":
-            return False
-    elif len(attempts) != 1 or attempts[0].get("verdict") != "fail":
+    # The cited internal review must be a checkpointed failed internal attempt,
+    # and the alternating revision/review chain must root at the engine's
+    # latest failed plan attempt — the rework wave it opened.
+    failed_internal_refs = {normalized for attempt in internal
+                            if attempt.get("verdict") == "fail"
+                            for normalized in (normalize_task_ref(attempt["task_file"]),) if normalized}
+    if ref not in failed_internal_refs:
         return False
-    # The cited internal review must be the engine's latest failed internal
-    # attempt for this obligation.
-    if (not internal or internal[-1].get("verdict") != "fail"
-            or normalize_task_ref(internal[-1]["task_file"]) != ref):
+    root_attempt = _latest_failed_attempt(attempts)
+    root_ref = normalize_task_ref(root_attempt["task_file"]) if root_attempt else None
+    if root_ref is None:
         return False
     previous_ref = normalize_task_ref(review.get("ref_task"))
     previous = bound.get(previous_ref) if previous_ref else None
@@ -1267,13 +1309,6 @@ def _node_revision_chain(state: dict, workflow, node_id: str, blocking: str) -> 
     if (previous_task.get("type") != "dev" or previous_task.get("workflow_node_id") != node_id
             or previous_task.get("status") != "review-failed"):
         return False
-    # The internal rework must root at the failed plan review that opened the
-    # obligation: walk the alternating revision/review chain back through
-    # checkpointed failed internal attempts until the root record itself.
-    root_ref = normalize_task_ref(attempts[0]["task_file"])
-    failed_internal_refs = {normalize_task_ref(attempt["task_file"])
-                            for attempt in internal if attempt.get("verdict") == "fail"}
-    failed_internal_refs.discard(None)
     chain_ref, hops = normalize_task_ref(previous_task.get("ref_task")), 0
     while chain_ref != root_ref:
         if chain_ref is None or hops > len(internal):
@@ -1300,6 +1335,8 @@ def _node_revision_chain(state: dict, workflow, node_id: str, blocking: str) -> 
             or root[1].get("status") != "review-failed"
             or root[1].get("workflow_node_id") != node_id):
         return False
+    if not _internal_tail_matches(bound, internal, blocking, kind, ref, effective_ref, node_id):
+        return False
     return _plan_obligation_matches(workflow, node_id, blocking)
 
 
@@ -1314,8 +1351,8 @@ def plan_revision_observable(state: dict) -> bool:
     blocking whose obligation agrees, plus the single newest decision-maker
     revision bound to that node whose reference chain resolves to the engine's
     latest failed published review attempt of the same node, rooted at the
-    failed plan review that opened the obligation. A blocking string, an
-    unbound file identity anywhere, a failed revision or a stale historical
+    latest failed plan attempt that opened the rework wave. A blocking string,
+    an unbound file identity anywhere, a failed revision or a stale historical
     chain never qualifies; legacy tasks
     without the node binding keep the stable rejection.
     """

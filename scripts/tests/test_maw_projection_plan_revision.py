@@ -384,6 +384,92 @@ class PlanRevisionTests(unittest.TestCase):
                                                attempt(2, "reviewer-1/task-007.json", "fail")))
         self.assert_degraded()
 
+    # ─── lifecycle boundaries (2026-10-29 follow-up review P2 hardening) ────
+
+    def test_internal_rework_after_second_plan_failure_is_accepted(self):
+        # The rework wave roots at the LATEST failed plan attempt: after plan
+        # attempt 2 fails, its internal rework still serves the degradation.
+        self.drift()
+        self.write(self.runtime / "decision-maker-1" / "task-002.json",
+                   task(2, 1, "dev", "review-passed", ref="reviewer-1/task-001.json", node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-006.json",
+                   task(6, 2, "plan-review", "review-failed", ref="decision-maker-1/task-002.json",
+                        node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-008.json",
+                   task(8, 2, "dev", "review-failed", ref="reviewer-1/task-006.json", node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-009.json",
+                   task(9, 2, "review", "review-failed", ref="decision-maker-1/task-008.json",
+                        node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-010.json",
+                   task(10, 3, "dev", "in-progress", ref="reviewer-1/task-009.json", node="plan"))
+        self.write_workflow(attempts=(attempt(1, "reviewer-1/task-001.json", "fail"),
+                                      attempt(2, "reviewer-1/task-006.json", "fail")),
+                            internal_attempts=(attempt(1, "reviewer-1/task-009.json", "fail"),))
+        self.assert_degraded()
+
+    def test_open_internal_review_holds_the_revision(self):
+        # plan-revision-review: the revision is reviewing and its open internal
+        # review (published, pending) audits it; the failed chain is history.
+        self.drift()
+        self.write(self.runtime / "decision-maker-1" / "task-002.json",
+                   task(2, 1, "dev", "review-failed", ref="reviewer-1/task-001.json", node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-004.json",
+                   task(4, 1, "review", "review-failed", ref="decision-maker-1/task-002.json",
+                        node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-005.json",
+                   task(5, 2, "dev", "reviewing", ref="reviewer-1/task-004.json", node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-007.json",
+                   task(7, 2, "review", "in-progress", ref="decision-maker-1/task-005.json",
+                        node="plan"))
+        self.write_workflow(blocking="plan-revision-review",
+                            internal_attempts=(attempt(1, "reviewer-1/task-004.json", "fail"),
+                                               attempt(2, "reviewer-1/task-007.json", None)))
+        self.assert_degraded()
+
+    def test_internal_pass_then_running_plan_review_is_accepted(self):
+        # The internal pass opened the published plan attempt: the newest
+        # internal event is that pass, auditing the effective revision.
+        self.drift()
+        self.write(self.runtime / "decision-maker-1" / "task-002.json",
+                   task(2, 1, "dev", "review-failed", ref="reviewer-1/task-001.json", node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-004.json",
+                   task(4, 1, "review", "review-failed", ref="decision-maker-1/task-002.json",
+                        node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-005.json",
+                   task(5, 2, "dev", "review-passed", ref="reviewer-1/task-004.json", node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-007.json",
+                   task(7, 2, "review", "review-passed", ref="decision-maker-1/task-005.json",
+                        node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-008.json",
+                   task(8, 2, "plan-review", "in-progress", ref="decision-maker-1/task-005.json",
+                        node="plan"))
+        self.write_workflow(blocking="plan-review-in-progress", disposition="pending",
+                            attempts=(attempt(1, "reviewer-1/task-001.json", "fail"),
+                                      attempt(2, "reviewer-1/task-008.json", None)),
+                            internal_attempts=(attempt(1, "reviewer-1/task-004.json", "fail"),
+                                               attempt(2, "reviewer-1/task-007.json", "pass")))
+        self.assert_degraded()
+
+    def test_next_wave_rework_after_passed_wave_is_accepted(self):
+        # Wave 1 ended with an internal pass; plan attempt 2 then failed. The
+        # round-start rework stands on the latest failed attempt, with the
+        # passed wave as admissible history.
+        self.drift()
+        self.write(self.runtime / "decision-maker-1" / "task-002.json",
+                   task(2, 1, "dev", "review-passed", ref="reviewer-1/task-001.json", node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-004.json",
+                   task(4, 1, "review", "review-passed", ref="decision-maker-1/task-002.json",
+                        node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-006.json",
+                   task(6, 2, "plan-review", "review-failed", ref="decision-maker-1/task-002.json",
+                        node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-008.json",
+                   task(8, 2, "dev", "in-progress", ref="reviewer-1/task-006.json", node="plan"))
+        self.write_workflow(attempts=(attempt(1, "reviewer-1/task-001.json", "fail"),
+                                      attempt(2, "reviewer-1/task-006.json", "fail")),
+                            internal_attempts=(attempt(1, "reviewer-1/task-004.json", "pass"),))
+        self.assert_degraded()
+
     def test_finished_revision_node_is_rejected(self):
         self.drift()
         self.write_workflow(blocking="development-in-progress", node_status="completed",
