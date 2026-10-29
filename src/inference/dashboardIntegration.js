@@ -2,6 +2,7 @@
 // timers, ordering cursor and choreography; no shared "current task" is consulted.
 import { detectIntegrationConfig } from '../systems/platformDetect.js'
 import { startMawChoreography, workSeatFor, restSeatFor } from '../systems/mawChoreography.js'
+import { loadWorkSeatCache, saveWorkSeatCache } from '../systems/mawWorkSeatCache.js'
 import { createDashboardHistoryController } from './dashboardHistory.js'
 import { buildHistoryPresentation, sampleHistoryPresentation, prepareHistoryTimeline } from './dashboardHistoryChoreography.js'
 import { validateDashboardEnvelope } from './dashboardSnapshot.js'
@@ -21,7 +22,9 @@ const READ_ERROR_CODES = new Set([
 
 // Compile from defaults once, independently of the currently visible live scene.
 // The roster supplies coordinates only; each frame still exposes its own members.
-function historyRosterFor(steps) {
+// CR-15: cached member↔seat bindings for this [project, task] win over a fresh
+// random scan, so replaying the same task keeps the established seating.
+export function historyRosterFor(steps, cachedSeats = null) {
   const roster = {}
   const occupied = new Set(), resting = new Set()
   for (const step of steps) {
@@ -29,7 +32,9 @@ function historyRosterFor(steps) {
       const id = `${member.id}~${member.role}`
       if (roster[id]) continue
       let workSeat
-      for (let i = 0; i < 50; i += 1) {
+      const cached = member.role === 'manager' ? null : cachedSeats?.get(member.id)
+      if (cached && !occupied.has(`${cached.x},${cached.y}`)) workSeat = { ...cached }
+      for (let i = 0; i < 50 && !workSeat; i += 1) {
         const candidate = workSeatFor(member.role, i)
         if (member.role === 'manager' || !occupied.has(`${candidate.x},${candidate.y}`)) {
           workSeat = candidate
@@ -86,7 +91,20 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     }
     return false
   }
-  let choreographyCleanup = startMawChoreography(store, { resumeCurrent: true })
+  // CR-15: one member↔seat cache per [project, task], shared by the live
+  // choreography and the history roster so reloads keep the established desks.
+  const cachedWorkSeats = loadWorkSeatCache(config.project, config.task)
+  const liveSeatBindings = new Map(cachedWorkSeats || [])
+  let seatSaveTimer = null
+  const persistSeatBindings = () => {
+    clearTimeout(seatSaveTimer)
+    seatSaveTimer = setTimeout(() => saveWorkSeatCache(config.project, config.task, Object.fromEntries(liveSeatBindings)), 300)
+  }
+  let choreographyCleanup = startMawChoreography(store, { resumeCurrent: true, workSeatCache: cachedWorkSeats,
+    onWorkSeatBound(memberKey, seat) {
+      liveSeatBindings.set(memberKey, { ...seat })
+      persistSeatBindings()
+    } })
   let historyToggleVersion = store.getState().dashboardHistoryToggle
   const originalPause = store.getState().isPaused
   let historyOwnsScene = false
@@ -96,7 +114,14 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
   const history = createDashboardHistoryController({
     config,
     prepareTimeline(steps, history) {
-      historyRoster = historyRosterFor(steps)
+      historyRoster = historyRosterFor(steps, cachedWorkSeats)
+      // CR-15: the replayed task's seating joins the same cache the live view
+      // uses, so either entry order keeps one established desk per member.
+      const rosterSeats = {}
+      for (const entry of Object.values(historyRoster)) {
+        if (entry.maw.role !== 'manager') rosterSeats[entry.maw.key] = entry.maw.workSeat
+      }
+      saveWorkSeatCache(config.project, config.task, rosterSeats)
       return prepareHistoryTimeline(steps, historyRoster, history.final_snapshot)
     },
     onStart() {

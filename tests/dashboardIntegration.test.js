@@ -429,7 +429,7 @@ describe('Dashboard fixed binding and lifecycle', () => {
     expect(Object.values(useOfficeStore.getState().agents).every((a) => a.inGroupEvent)).toBe(true)
   })
 
-  it('opens every pre-start role to its work post once, preserving the route when startup arrives', async () => {
+  it('opens every pre-start role to its work post at once, preserving routes when startup arrives', async () => {
     const idle = { ...envelope().snapshot.members[0], status: 'idle', task_kind: null, round: null }
     const members = [{ ...idle, id: 'manager1', role: 'manager' }, idle,
       { ...idle, id: 'reviewer1', role: 'reviewer' }]
@@ -447,22 +447,18 @@ describe('Dashboard fixed binding and lifecycle', () => {
     expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(1)
     expect(useOfficeStore.getState().mawMeta.dashboard_hydration).toBe(0)
     expect(first['manager1~manager'].groupTarget).toEqual({ x: 100, y: 80 })
-    expect(first['member1~executor'].inGroupEvent).toBe(false) // its 600ms slot has not fired
+    // CR-14: the whole opening launches at once — no per-member 600ms slots
+    expect(first['member1~executor'].inGroupEvent).toBe(true)
+    expect(first['reviewer1~reviewer'].inGroupEvent).toBe(true)
+    const routes = new Map(Object.values(first).map((agent) => [agent.id, agent.groupTarget]))
     for (const agent of Object.values(first)) expect(agent.position).not.toEqual(agent.maw.workSeat)
     useOfficeStore.getState().requestDashboardSync()
     await vi.advanceTimersByTimeAsync(0)
     const updated = useOfficeStore.getState().agents
+    // the startup snapshot preserves every in-flight opening route (no restart)
+    for (const agent of Object.values(updated)) expect(agent.groupTarget).toEqual(routes.get(agent.id))
     expect(updated['manager1~manager'].position).toEqual(first['manager1~manager'].position)
-    expect(updated['manager1~manager'].groupTarget).toEqual(first['manager1~manager'].groupTarget)
-    expect(updated['member1~executor'].position).toEqual(first['member1~executor'].position)
-    await vi.advanceTimersByTimeAsync(599)
-    expect(useOfficeStore.getState().agents['member1~executor'].inGroupEvent).toBe(false)
-    await vi.advanceTimersByTimeAsync(1)
-    expect(useOfficeStore.getState().agents['member1~executor'].groupTarget).toEqual(first['member1~executor'].maw.workSeat)
-    expect(useOfficeStore.getState().agents['reviewer1~reviewer'].inGroupEvent).toBe(false)
-    await vi.advanceTimersByTimeAsync(600)
-    expect(useOfficeStore.getState().agents['reviewer1~reviewer'].groupTarget).toEqual(first['reviewer1~reviewer'].maw.workSeat)
-    await vi.advanceTimersByTimeAsync(4000)
+    await vi.advanceTimersByTimeAsync(4600)
     expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(1)
     expect(useOfficeStore.getState().mawMeta.dashboard_hydration).toBe(0)
   })
