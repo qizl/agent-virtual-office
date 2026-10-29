@@ -1168,15 +1168,18 @@ def _bound_records_by_ref(state: dict) -> dict | None:
 
 def _obligation_attempts(obligation, key) -> list | None:
     """Engine-shaped attempt entries only: every entry carries a non-empty
-    task_file and a verdict of None (published, unreviewed), "fail" or "pass".
-    A malformed or impossible shape refuses the chain."""
+    task_file, a verdict of None (published, unreviewed), "fail" or "pass",
+    and the owner's len+1 sequence number. Duplicate or out-of-order numbering
+    is a history the append-only publisher cannot have produced."""
     entries = obligation.get(key)
     if not isinstance(entries, list):
         return None
-    for attempt in entries:
+    for index, attempt in enumerate(entries, start=1):
         if (not isinstance(attempt, dict) or type(attempt.get("task_file")) is not str
                 or not attempt["task_file"]
-                or attempt.get("verdict") not in (None, "fail", "pass")):
+                or attempt.get("verdict") not in (None, "fail", "pass")
+                or not _safe_integer(attempt.get("attempt"))
+                or attempt["attempt"] != index):
             return None
     return entries
 

@@ -502,6 +502,53 @@ class PlanRevisionTests(unittest.TestCase):
                                       attempt(3, "reviewer-1/task-007.json", None)))
         self.assert_rejected()
 
+    # ─── attempt numbering boundaries (2026-10-29 fourth review P2) ─────────
+
+    def test_out_of_order_attempt_numbering_is_rejected(self):
+        # P2: the owner numbers publications len+1 and appends, so [2, 1] is a
+        # history no publish could produce — the tail must not read as phase.
+        self.drift()
+        self.write(self.runtime / "reviewer-1" / "task-006.json",
+                   task(6, 2, "plan-review", "review-passed", ref="decision-maker-1/task-002.json",
+                        node="plan"))
+        self.write_workflow(attempts=(attempt(2, "reviewer-1/task-006.json", "pass"),
+                                      attempt(1, "reviewer-1/task-001.json", "fail")))
+        self.assert_rejected()
+
+    def test_duplicate_attempt_numbering_is_rejected(self):
+        # Two entries claiming the same publication number never happened.
+        self.drift()
+        self.write(self.runtime / "reviewer-1" / "task-006.json",
+                   task(6, 2, "plan-review", "review-failed", ref="decision-maker-1/task-002.json",
+                        node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-002.json",
+                   task(2, 1, "dev", "review-failed", ref="reviewer-1/task-001.json", node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-005.json",
+                   task(5, 2, "dev", "in-progress", ref="reviewer-1/task-006.json", node="plan"))
+        self.write_workflow(attempts=(attempt(1, "reviewer-1/task-001.json", "fail"),
+                                      attempt(1, "reviewer-1/task-006.json", "fail")))
+        self.assert_rejected()
+
+    def test_internal_attempt_numbering_must_also_be_sequential(self):
+        # The same len+1 contract governs internal attempts: a reordered
+        # internal list refuses the chain even with every verdict consistent.
+        self.drift()
+        self.write(self.runtime / "decision-maker-1" / "task-002.json",
+                   task(2, 1, "dev", "review-failed", ref="reviewer-1/task-001.json", node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-004.json",
+                   task(4, 1, "review", "review-failed", ref="decision-maker-1/task-002.json",
+                        node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-005.json",
+                   task(5, 1, "dev", "review-failed", ref="reviewer-1/task-004.json", node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-007.json",
+                   task(7, 1, "review", "review-failed", ref="decision-maker-1/task-005.json",
+                        node="plan"))
+        self.write(self.runtime / "decision-maker-1" / "task-009.json",
+                   task(9, 1, "dev", "in-progress", ref="reviewer-1/task-007.json", node="plan"))
+        self.write_workflow(internal_attempts=(attempt(2, "reviewer-1/task-004.json", "fail"),
+                                               attempt(1, "reviewer-1/task-007.json", "fail")))
+        self.assert_rejected()
+
     def test_finished_revision_node_is_rejected(self):
         self.drift()
         self.write_workflow(blocking="development-in-progress", node_status="completed",
