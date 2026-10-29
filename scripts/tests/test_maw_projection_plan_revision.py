@@ -470,6 +470,38 @@ class PlanRevisionTests(unittest.TestCase):
                             internal_attempts=(attempt(1, "reviewer-1/task-004.json", "pass"),))
         self.assert_degraded()
 
+    # ─── phase-tail consistency (2026-10-29 third review P2 hardening) ──────
+
+    def test_passed_newest_attempt_with_outstanding_rework_is_rejected(self):
+        # P2: a published plan attempt has PASSED while the frozen workflow
+        # still declares awaiting-rework — the state contradicts itself, and a
+        # backward root search must not resurrect the older failed chain.
+        self.drift()
+        self.write(self.runtime / "reviewer-1" / "task-006.json",
+                   task(6, 2, "plan-review", "review-passed", ref="decision-maker-1/task-002.json",
+                        node="plan"))
+        self.write_workflow(attempts=(attempt(1, "reviewer-1/task-001.json", "fail"),
+                                      attempt(2, "reviewer-1/task-006.json", "pass")))
+        self.assert_rejected()
+
+    def test_passed_attempt_before_running_review_is_rejected(self):
+        # A pass ends the obligation; a running attempt after it is an
+        # impossible engine shape and keeps the stable rejection.
+        self.drift()
+        self.write(self.runtime / "decision-maker-1" / "task-002.json",
+                   task(2, 1, "dev", "review-passed", ref="reviewer-1/task-001.json", node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-006.json",
+                   task(6, 2, "plan-review", "review-passed", ref="decision-maker-1/task-002.json",
+                        node="plan"))
+        self.write(self.runtime / "reviewer-1" / "task-007.json",
+                   task(7, 2, "plan-review", "in-progress", ref="decision-maker-1/task-002.json",
+                        node="plan"))
+        self.write_workflow(blocking="plan-review-in-progress", disposition="pending",
+                            attempts=(attempt(1, "reviewer-1/task-001.json", "fail"),
+                                      attempt(2, "reviewer-1/task-006.json", "pass"),
+                                      attempt(3, "reviewer-1/task-007.json", None)))
+        self.assert_rejected()
+
     def test_finished_revision_node_is_rejected(self):
         self.drift()
         self.write_workflow(blocking="development-in-progress", node_status="completed",
