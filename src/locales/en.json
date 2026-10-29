@@ -18,7 +18,9 @@
   },
   "maw": {
     "empty": "Waiting for MAW snapshot data — run scripts/maw-office.py --serve to bring the team on stage.",
+    "emptyDashboard": "Synchronizing with the selected MAW task — if it fails, retry here or inspect the task in the Dashboard.",
     "stale": "MAW snapshot is stale (producer lease expired) — animations paused.",
+    "planRevision": "Plan revision in progress — members are shown from observed facts; some information cannot be confirmed yet.",
     "lastSample": "last sample"
   },
   "behaviorLabels": {
@@ -484,6 +486,11 @@
       "client-sync-timeout": "No valid response for 120 seconds",
       "request-timeout": "Request timed out",
       "read-failed": "Unable to read the selected task",
+      "invalid-input": "Selected task inputs are invalid or damaged",
+      "input-inconsistent": "Task inputs changed during observation — retry",
+      "unsafe-file-type": "Task contains an unsafe filesystem link or file type",
+      "member-limit": "Task exceeds the 50 member display limit",
+      "payload-too-large": "Task snapshot exceeds the display size limit",
       "invalid-snapshot": "Invalid or out-of-order snapshot",
       "retry": "Retry"
   }

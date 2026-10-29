@@ -12,6 +12,13 @@ const POLL_MS = 2000
 const REQUEST_TIMEOUT_MS = 10_000
 const STALE_MS = 120_000
 
+// Server-owned visualization error codes (dashboard.py visualization_state).
+// The whitelist maps each to a precise localized message; unknown codes keep
+// the safe generic read-failed text, never a raw response body.
+const READ_ERROR_CODES = new Set([
+  'invalid-input', 'input-inconsistent', 'unsafe-file-type', 'member-limit', 'payload-too-large',
+])
+
 // Compile from defaults once, independently of the currently visible live scene.
 // The roster supplies coordinates only; each frame still exposes its own members.
 function historyRosterFor(steps) {
@@ -240,7 +247,10 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
             clearTeam()
             clearTimeout(staleTimer)
             sync('missing', ['project-not-found', 'project-not-registered'].includes(response.body?.error?.code) ? 'project-not-found' : 'task-not-found')
-          } else sync(isStale ? 'stale' : 'error', 'read-failed')
+          } else {
+            const code = response.body?.error?.code
+            sync(isStale ? 'stale' : 'error', READ_ERROR_CODES.has(code) ? code : 'read-failed')
+          }
           return
         }
         if (!accept(response.body.data)) sync(isStale ? 'stale' : 'error', 'invalid-snapshot')

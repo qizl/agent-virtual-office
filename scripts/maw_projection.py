@@ -612,18 +612,18 @@ def project_member_status(role_folder: str, role: dict, manifest_terminal: str |
                 elif verdict.get("verdict") == "fail" and dev is not latest:
                     current = make("blocked", f"历史返修 · round {dev.get('round')}", dev.get("round"), "dev", "fail")
                 else:
-                    current = make("working", f"{dev.get('logical_work_id') or '实现中'} · round {dev.get('round')}", dev.get("round"), "dev")
+                    current = make("working", f"🔄 {dev.get('logical_work_id') or '实现中'} · round {dev.get('round')}", dev.get("round"), "dev")
         else:
             if status_value == "initialized":
                 current = make("planning", "评审任务已派发", round_, kind)
             elif status_value == "in-progress":
-                current = make("working", f"🔍 评审进行中 · attempt", round_, kind)
+                current = make("working", "🔄 评审进行中 · attempt", round_, kind)
             elif status_value in ("review-passed", "review-failed"):
                 verdict = "pass" if status_value == "review-passed" else "fail"
                 mark = "✅" if verdict == "pass" else "❌ 需返修"
                 current = make("done", f"{mark} 评审结束 · round {round_}", round_, kind, verdict)
             else:
-                current = make("working", "评审中", round_, kind)
+                current = make("working", "🔄 评审中", round_, kind)
         if stalled and current and current["status"] in ("working", "planning"):
             current = dict(current)
             current["stalled"] = True
@@ -671,7 +671,7 @@ def project_manager(workflow: dict | None, manifest: dict, role: dict, manifest_
     if not nodes:
         if workflow is None:
             return make("planning", "未提供工作流定义")
-        return make("working", "推进中")
+        return make("working", "🔄 推进中")
     for node_id, _type, _deps in nodes:
         state = (node_states(workflow).get(node_id) or {})
         status = state.get("status")
@@ -679,12 +679,12 @@ def project_manager(workflow: dict | None, manifest: dict, role: dict, manifest_
             blocking = state.get("blocking")
             if blocking == "finish-required":
                 return make("awaiting-approval", "等待交付评估 · finish-required")
-            return make("working", f"节点 {node_id} 进行中")
+            return make("working", f"🔄 节点 {node_id} 进行中")
         if status not in ("completed", "released-at-limit"):
-            return make("working", f"推进节点 {node_id}")
+            return make("working", f"🔄 推进节点 {node_id}")
     if finish.get("requested"):
         return make("awaiting-approval", "等待交付评估")
-    return make("working", "复核工作流")
+    return make("working", "🔄 复核工作流")
 
 
 def member_identity(state, folder):
@@ -1113,13 +1113,66 @@ def validate_snapshot(snapshot: dict) -> dict:
     return snapshot
 
 
+PLAN_REVISION_BLOCKINGS = {"plan-review-in-progress", "plan-revision-in-progress", "plan-revision-review"}
+PLAN_REVISION_DETAIL = "plan-revision"
+
+
+def plan_revision_observable(state: dict) -> bool:
+    """True only when a legitimate, engine-evidenced plan revision explains the
+    sole plan_ref:drifted degradation.
+
+    Three conditions must hold together: every other input reads clean and the
+    task is not terminal; the only degraded reason is plan_ref:drifted; and the
+    frozen workflow proves the revision — a plan-review node running with a
+    plan-revision blocking plus a decision-maker dev revision task whose node
+    binding and ref_task chain resolve to a failed plan review. A blocking
+    string alone never qualifies; legacy tasks without the node binding keep
+    the stable rejection.
+    """
+    if state.get("_inconsistent") or state.get("degraded") != ["plan_ref:drifted"]:
+        return False
+    manifest = state.get("manifest")
+    if not isinstance(manifest, dict) or manifest.get("status") in TERMINAL_MANIFEST:
+        return False
+    revision_nodes = {node_id for node_id, node_type, _deps in workflow_nodes(state.get("workflow"))
+                      if node_type == "plan-review"}
+    if not revision_nodes:
+        return False
+    states = node_states(state.get("workflow"))
+    live_nodes = {node_id for node_id in revision_nodes
+                  if (states.get(node_id) or {}).get("status") == "running"
+                  and (states.get(node_id) or {}).get("blocking") in PLAN_REVISION_BLOCKINGS}
+    if not live_nodes:
+        return False
+    failed_plan_reviews = set()
+    for folder, role in state["roles"].items():
+        for task in role["tasks"]:
+            if task.get("type") == "plan-review" and task.get("status") == "review-failed":
+                failed_plan_reviews.add(normalize_task_ref(f"{folder}/task-{int(task['seq']):03d}"))
+    if not failed_plan_reviews:
+        return False
+    for folder, role in state["roles"].items():
+        if folder.rsplit("-", 1)[0] != "decision-maker":
+            continue
+        for task in role["tasks"]:
+            if task.get("type") != "dev":
+                continue
+            if task.get("workflow_node_id") not in live_nodes:
+                continue
+            if normalize_task_ref(task.get("ref_task")) not in failed_plan_reviews:
+                continue
+            return True
+    return False
+
+
 def read_snapshot(project_root: Path, task_id: str, *, now=None) -> dict:
     """Read one fixed task and return the Node channel's accepted snapshot shape.
 
     `now` is a wall-clock millisecond value or zero-argument clock for deterministic
     callers. Envelope order is owned by the Dashboard, never by this reader.
-    Missing/corrupt/inconsistent inputs fail explicitly; CLI callers may continue
-    using the lower-level degradation-aware APIs for standalone behavior.
+    Missing/corrupt/inconsistent inputs fail explicitly; a legitimate plan
+    revision in progress is the one bounded degradation that is served instead
+    of rejected, as quality=degraded with quality_detail="plan-revision".
     """
     if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id) or task_id in (".", ".."):
         raise BridgeError("invalid-task", "task identity is invalid", EXIT_USAGE)
@@ -1130,11 +1183,14 @@ def read_snapshot(project_root: Path, task_id: str, *, now=None) -> dict:
             raise BridgeError("task-not-found" if missing else "invalid-input", "task is unavailable" if missing else "task inputs are invalid", EXIT_NO_DATA)
         if state.get("_inconsistent"):
             raise BridgeError("input-inconsistent", "task inputs changed during observation", EXIT_NO_DATA)
-        if state["degraded"]:
+        plan_revision = plan_revision_observable(state)
+        if state["degraded"] and not plan_revision:
             raise BridgeError("invalid-input", "task inputs are damaged or unsupported", EXIT_NO_DATA)
         sampled_at = int((now() if callable(now) else now) if now is not None else time.time() * 1000)
         producer = "dashboard-" + hashlib.sha256(f"{Path(project_root).resolve()}|{task_id}".encode()).hexdigest()[:24]
         raw = validate_snapshot(build_snapshot(state, producer, 1, sampled_at))
+        if plan_revision:
+            raw["quality_detail"] = PLAN_REVISION_DETAIL
     except BridgeError:
         raise
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:

@@ -1553,7 +1553,7 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
         textShadow: '0 1px 0 rgba(255,255,255,0.6)',
       }}
     >
-      {t('maw.empty')}
+      {t(isDashboard ? 'maw.emptyDashboard' : 'maw.empty')}
     </div>
   ) : null
 
@@ -1576,11 +1576,26 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
     </div>
   ) : null
 
+  // Bounded degraded channel (legitimate plan revision in progress): the observed
+  // members stay visible and the scene names the one provisional fact.
+  const mawDegradedNotice = isMaw && mawMeta?.quality === 'degraded' && mawMeta?.quality_detail === 'plan-revision' ? (
+    <div
+      style={{
+        position: 'absolute', left: 0, right: 0, top: '6%', textAlign: 'center',
+        fontSize: 12, color: '#8a6a2a', pointerEvents: 'none', fontFamily: 'monospace',
+        textShadow: '0 1px 0 rgba(255,255,255,0.6)',
+      }}
+    >
+      {t('maw.planRevision')}
+    </div>
+  ) : null
+
   if (isPanel) {
     return (
       <div ref={containerRef} style={{ flex: 1, minHeight: 0, overflow: 'hidden', position: 'relative' }}>
         {mawEmptyNotice}
         {mawStaleNotice}
+        {mawDegradedNotice}
         {svgElement}
       </div>
     )
@@ -1598,6 +1613,7 @@ export default function PixelOffice({ animationQuality = 'full', mode = 'full' }
     <div ref={containerRef} className="w-full flex-1 overflow-hidden min-h-0 flex items-center justify-center" style={{ position: 'relative' }}>
       {mawEmptyNotice}
       {mawStaleNotice}
+      {mawDegradedNotice}
       {svgElement}
     </div>
   )

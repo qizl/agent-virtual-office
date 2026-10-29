@@ -18,7 +18,9 @@
   },
   "maw": {
     "empty": "等待 MAW 快照資料——執行 scripts/maw-office.py --serve 讓團隊進場。",
+    "emptyDashboard": "正在與所選 MAW 任務同步——失敗時可在此重試，或回 Dashboard 檢視任務。",
     "stale": "MAW 快照已過期（生產者租約失效）——動畫已暫停。",
+    "planRevision": "方案修訂進行中——成員依已觀察事實顯示，部分資訊暫無法確認。",
     "lastSample": "上次取樣"
   },
   "behaviorLabels": {
@@ -484,6 +486,11 @@
       "client-sync-timeout": "120 秒內未取得有效回應",
       "request-timeout": "請求逾時",
       "read-failed": "無法讀取所選任務",
+      "invalid-input": "所選任務的輸入內容無效或已損壞",
+      "input-inconsistent": "觀察期間任務輸入持續變更，請重試",
+      "unsafe-file-type": "任務包含不安全的檔案連結或類型",
+      "member-limit": "任務超過 50 位成員的顯示上限",
+      "payload-too-large": "任務快照超過顯示大小上限",
       "invalid-snapshot": "快照無效或順序已過期",
       "retry": "重試"
   }

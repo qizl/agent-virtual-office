@@ -671,6 +671,40 @@ describe('Dashboard fixed binding and lifecycle', () => {
     expect(useOfficeStore.getState().dashboardSync.state).toBe('missing')
   })
 
+  it('maps whitelisted visualization error codes and keeps unknown ones generic', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(reply({ ok: false, error: { code: 'input-inconsistent' } }, 400))
+      .mockResolvedValueOnce(reply({ ok: false, error: { code: 'member-limit' } }, 400))
+      .mockResolvedValueOnce(reply({ ok: false, error: { code: 'future-server-code' } }, 400))
+    vi.stubGlobal('fetch', fetchMock)
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().dashboardSync).toMatchObject({ state: 'error', code: 'input-inconsistent' })
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(useOfficeStore.getState().dashboardSync).toMatchObject({ state: 'error', code: 'member-limit' })
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(useOfficeStore.getState().dashboardSync).toMatchObject({ state: 'error', code: 'read-failed' })
+  })
+
+  it('serves a legitimate plan-revision degraded snapshot with visible members, then recovers after rebinding', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(reply({ ok: true, data: envelope(1, {
+        quality: 'degraded', quality_detail: 'plan-revision', execution_state: 'unknown',
+        assignment_state: 'unknown', handoff_state: 'unavailable', handoffs: [],
+        workflow: 'MAW win-r2 · plan' }) }))
+      .mockResolvedValue(reply({ ok: true, data: envelope(2) }))
+    vi.stubGlobal('fetch', fetchMock)
+    cleanup = startDashboardIntegration(useOfficeStore, config)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useOfficeStore.getState().dashboardSync.state).toBe('synced')
+    expect(useOfficeStore.getState().mawMeta).toMatchObject({ quality: 'degraded', quality_detail: 'plan-revision' })
+    expect(Object.keys(useOfficeStore.getState().agents).length).toBeGreaterThan(0)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(useOfficeStore.getState().mawMeta).toMatchObject({ quality: 'ok', quality_detail: null })
+    expect(useOfficeStore.getState().dashboardSync.state).toBe('synced')
+    expect(Object.keys(useOfficeStore.getState().agents).length).toBeGreaterThan(0)
+  })
+
   it('client-stales after exactly 120s without valid responses, freezes movement and recovers current facts', async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(reply({ ok: true, data: envelope() }))
       .mockRejectedValue(new Error('offline'))
