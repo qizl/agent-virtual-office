@@ -8,7 +8,6 @@ text, paths or session identifiers are reproduced.
 from __future__ import annotations
 
 import json
-import os
 import sys
 import tempfile
 from pathlib import Path

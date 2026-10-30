@@ -6,7 +6,7 @@
 // are neutralized by the (epoch, seq) order in envelopeIsNewer, and the store's
 // applyMawSnapshot treats every accepted snapshot as the FULL member set.
 
-import { detectProjectMode, detectIntegrationConfig } from '../systems/platformDetect'
+import { detectIntegrationConfig } from '../systems/platformDetect'
 import { startDashboardIntegration } from './dashboardIntegration.js'
 import { startMawChoreography } from '../systems/mawChoreography.js'
 import { loadWorkSeatCache, saveWorkSeatCache } from '../systems/mawWorkSeatCache.js'
@@ -140,10 +140,4 @@ export function startMawIntegration(store) {
     teardownPoll()
     if (retryTimer) clearTimeout(retryTimer)
   }
-}
-
-/** Mode gate: maw mode never touches the default channels (plan §4.1.3). */
-export function startStatusIntegrationForMode(store, mode = detectProjectMode()) {
-  if (mode === 'maw') return startMawIntegration(store)
-  return null // caller falls back to the default startStatusIntegration
 }
