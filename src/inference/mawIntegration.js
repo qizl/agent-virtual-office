@@ -9,6 +9,7 @@
 import { detectProjectMode, detectIntegrationConfig } from '../systems/platformDetect'
 import { startDashboardIntegration } from './dashboardIntegration.js'
 import { startMawChoreography } from '../systems/mawChoreography.js'
+import { loadWorkSeatCache, saveWorkSeatCache } from '../systems/mawWorkSeatCache.js'
 
 const POLL_INTERVAL_MS = 2000
 const SSE_RETRY_MS = 30_000
@@ -32,7 +33,25 @@ export function startMawIntegration(store) {
   const config = detectIntegrationConfig()
   if (config.integration === 'dashboard') return startDashboardIntegration(store, config)
   let torn = false
-  const choreographyCleanup = startMawChoreography(store)
+  // CR-15: standalone ?mode=maw keys the seat-association cache by the workflow
+  // title — the only stable task identity this mode sees. The title arrives
+  // with the first beat, so the cache is (re)injected into the store BEFORE the
+  // members are built, and every choreographer binding is persisted back under
+  // the same title.
+  let seatCacheWorkflow = null
+  let seatBindings = new Map()
+  let seatSaveTimer = null
+  const persistSeatBindings = () => {
+    if (!seatCacheWorkflow) return
+    clearTimeout(seatSaveTimer)
+    seatSaveTimer = setTimeout(() => saveWorkSeatCache('maw', seatCacheWorkflow, Object.fromEntries(seatBindings)), 300)
+  }
+  const choreographyCleanup = startMawChoreography(store, {
+    onWorkSeatBound(memberKey, seat) {
+      seatBindings.set(memberKey, { ...seat })
+      persistSeatBindings()
+    },
+  })
   let source = null // 'sse' | 'poll'
   let eventSource = null
   let pollTimer = null
@@ -44,6 +63,13 @@ export function startMawIntegration(store) {
     if (!envelopeIsNewer(envelope, lastKey)) return
     if (typeof envelope?.server_epoch === 'number' && typeof envelope?.seq === 'number') {
       lastKey = [envelope.server_epoch, envelope.seq]
+    }
+    const title = typeof envelope?.snapshot?.workflow === 'string' ? envelope.snapshot.workflow : null
+    if (title && title !== seatCacheWorkflow) {
+      seatCacheWorkflow = title
+      const cached = loadWorkSeatCache('maw', title)
+      seatBindings = new Map(cached || [])
+      store.getState().setMawWorkSeatCache?.(cached)
     }
     store.getState().applyMawSnapshot(envelope)
   }

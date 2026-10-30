@@ -91,9 +91,11 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
     }
     return false
   }
-  // CR-15: one member↔seat cache per [project, task], shared by the live
-  // choreography and the history roster so reloads keep the established desks.
+  // CR-15: one member↔seat cache per [project, task], shared by the store's
+  // build-time stamp, the live choreography and the history roster so reloads
+  // keep the established desks.
   const cachedWorkSeats = loadWorkSeatCache(config.project, config.task)
+  store.getState().setMawWorkSeatCache?.(cachedWorkSeats)
   const liveSeatBindings = new Map(cachedWorkSeats || [])
   let seatSaveTimer = null
   const persistSeatBindings = () => {
@@ -114,7 +116,9 @@ export function startDashboardIntegration(store, config = detectIntegrationConfi
   const history = createDashboardHistoryController({
     config,
     prepareTimeline(steps, history) {
-      historyRoster = historyRosterFor(steps, cachedWorkSeats)
+      // the live bindings accumulated this session are fresher than the
+      // start-of-session snapshot of the cache
+      historyRoster = historyRosterFor(steps, new Map([...(cachedWorkSeats || []), ...liveSeatBindings]))
       // CR-15: the replayed task's seating joins the same cache the live view
       // uses, so either entry order keeps one established desk per member.
       const rosterSeats = {}
