@@ -11,7 +11,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 
 export const MAW_BASE_ROLES = ['decision-maker', 'executor', 'manager', 'reviewer']
-export const MAW_MEMBER_STATUSES = ['awaiting-approval', 'blocked', 'done', 'idle', 'planning', 'working']
+const MAW_MEMBER_STATUSES = ['awaiting-approval', 'blocked', 'done', 'idle', 'planning', 'working']
 const MAW_TASK_KINDS = ['aggregate-review', 'dev', 'plan-review', 'review']
 const MAW_VERDICTS = ['fail', 'pass']
 const MAW_TERMINATE = ['confirmed', 'initialized']
@@ -21,7 +21,7 @@ const MAW_QUALITIES = ['degraded', 'ok', 'stale']
 const SCHEMA = 'avo.maw-snapshot/1'
 export const MAW_MEMBER_LIMIT = 50
 export const MAW_MAX_BODY_BYTES = 16384
-export const MAW_LEASE_TTL_MS = 120_000
+const MAW_LEASE_TTL_MS = 120_000
 const MAW_SSE_HEARTBEAT_MS = 15_000
 const MEMBER_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
 const PRODUCER_RE = /^[A-Za-z0-9_-]{8,128}$/

@@ -16,12 +16,9 @@ locks, no fabricated tool activity.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import ipaddress
 import json
 import os
-import random
-import re
 import secrets
 import socket
 import sys
