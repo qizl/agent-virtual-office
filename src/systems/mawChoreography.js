@@ -32,9 +32,10 @@ import { handoffApproachPoint } from './mawHandoff.js'
 
 export const MANAGER_GATE = { x: 100, y: 80 }
 const HANDOVER_DWELL_MS = 3000
-// Entrance launch spacing: members start in quick succession and flow through
-// the (single-occupant) door passages as a stream — the door early-release
-// keeps the queue moving, so launches overlap instead of serializing.
+// CR-14: entrances launch EVERYONE at once — the single-occupant door claims
+// (AVO-187, released on crossing) sequence the stream themselves, so an
+// artificial i×0.6s launch cadence is gone. STAGGER_MS survives only as the
+// CR-11 standby-relocation sweep spacing, which is not an entrance.
 export const STAGGER_MS = 600
 const WANDER_INTERVAL_MS = 15_000
 const WANDER_CHANCE = 0.10
@@ -302,7 +303,6 @@ export function wanderCandidates({ members, workingSince, restingSince, now = Da
  */
 export function planChoreography({ prevPhase, members, workSeatsByMember = new Map(), occupiedWorkSeats = new Set(), restSeatsByMember = new Map(), restSeatsTaken = new Set() }) {
   const actions = []
-  let staggerIndex = 0
   const assignWork = (member) => {
     const bound = workSeatsByMember.get(member.id)
     if (bound) return bound
@@ -333,15 +333,16 @@ export function planChoreography({ prevPhase, members, workSeatsByMember = new M
     if (phase === previous) continue
     if (phase === 'task') {
       const seat = assignWork(member)
-      // Delivering members (awaiting-approval) return IMMEDIATELY and wait at the
-      // work seat for the manager's handover; planning/working enter staggered.
+      // Delivering members (awaiting-approval) return at once and wait at the
+      // work seat for the manager's handover. CR-14: every entrance launches
+      // immediately — staggerMs stays 0 for plan-shape compatibility.
       const immediate = member.status === 'awaiting-approval'
       actions.push({
         id: member.id,
         agentId: `${member.id}~${member.role}`,
         target: seat,
         behavior: 'idle', // transit; restored to the status animation on arrival
-        staggerMs: immediate ? 0 : staggerIndex * STAGGER_MS,
+        staggerMs: 0,
         kind: immediate ? 'deliver' : 'enter',
       })
     } else {
@@ -351,11 +352,10 @@ export function planChoreography({ prevPhase, members, workSeatsByMember = new M
         agentId: `${member.id}~${member.role}`,
         target: seat,
         behavior: 'idle',
-        staggerMs: staggerIndex * STAGGER_MS,
+        staggerMs: 0,
         kind: 'rest',
       })
     }
-    staggerIndex += 1
     prevPhase[member.id] = phase
   }
   return actions
@@ -365,8 +365,13 @@ export function planChoreography({ prevPhase, members, workSeatsByMember = new M
  * Create the running choreography controller. Returns a cleanup function.
  * `store` is the zustand office store.
  */
-export function startMawChoreography(store, { resumeCurrent = false } = {}) {
+export function startMawChoreography(store, { resumeCurrent = false, workSeatCache = null, onWorkSeatBound = null } = {}) {
   let torn = false
+  // CR-15: cross-session member↔work-seat bindings for this [project, task].
+  // The cache only ever SEEDS an allocation; corrupted or colliding entries are
+  // skipped and everything else keeps the CR-3 random cluster flow.
+  const seatCache = workSeatCache instanceof Map ? workSeatCache : null
+  const notifyWorkSeatBound = typeof onWorkSeatBound === 'function' ? onWorkSeatBound : null
   const prevPhase = {}
   const prevHandover = new Map()
   const restSeatsByMember = new Map() // memberId -> { index, seat }
@@ -589,8 +594,15 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
     for (const [id, boundSeat] of workSeatsByMember) {
       if (store.getState().agents[id]) claimed.add(seatKey(boundSeat))
     }
-    const existingSeat = member.maw?.workSeat
-    let seat = existingSeat && !claimed.has(seatKey(existingSeat)) ? { ...existingSeat } : null
+    // CR-15: a cached binding for this member wins over the build-time random
+    // stamp (store.js workSeatFor) and the cluster scan, as long as nobody in
+    // THIS session holds the seat yet — reloads keep the established desks.
+    const cached = seatCache?.get(member.maw?.key ?? member.id)
+    let seat = cached && !claimed.has(seatKey(cached)) ? { ...cached } : null
+    if (!seat) {
+      const existingSeat = member.maw?.workSeat
+      seat = existingSeat && !claimed.has(seatKey(existingSeat)) ? { ...existingSeat } : null
+    }
     for (const candidate of [...(ROLE_WORK_CLUSTERS[role] ?? []), ...MAW_EXTRA_WORK_SEATS]) {
       if (seat) break
       if (claimed.has(seatKey(candidate))) continue
@@ -604,6 +616,7 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
     if (agent && JSON.stringify(agent.maw?.workSeat ?? {}) !== JSON.stringify(seat)) {
       store.setState({ agents: { ...store.getState().agents, [member.id]: { ...agent, maw: { ...agent.maw, workSeat: { ...seat } } } } })
     }
+    notifyWorkSeatBound?.(member.maw?.key ?? member.id, seat)
     return seat
   }
 
@@ -1085,8 +1098,17 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       choreoEpoch += 1
       for (const a of members) {
         if (!a.inGroupEvent) continue
-        if (enteringStale) s.clearAgentGroupEvent(a.id, { behavior: 'idle', expression: 'normal', bubble: a.bubble ?? null })
-        else restorePresentation(a.id)
+        if (enteringStale) {
+          s.clearAgentGroupEvent(a.id, { behavior: 'idle', expression: 'normal', bubble: a.bubble ?? null })
+          // CR-14: an entrance walk killed MID-FLIGHT must resume on recovery —
+          // with every walk launching at once, a stale boundary now freezes the
+          // whole stream, so roll the recorded phase for seat walks (bound
+          // 'member'/'meeting') and let the re-dispatch re-walk the CURRENT
+          // phase's seat from the frozen position (no teleport). Handover/gate
+          // walks (bound 'none') stay owned by the handover machinery.
+          const killedBound = walkBounds.get(a.id)
+          if (killedBound === 'member' || killedBound === 'meeting') prevPhase[a.id] = null
+        } else restorePresentation(a.id)
       }
       managerBusy = false
       handoverQueue.length = 0
@@ -1148,11 +1170,11 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       arriveThen(agentId, 0, () => restorePresentation(agentId))
     }
 
-    // member transitions — EVERY role launches in the batch sequence (CR-1):
-    // the manager takes its slot in member order (working seat = gate; the
-    // handover queue still coordinates only the manager's confirmation visits)
+    // member transitions — CR-14: EVERY entrance walk launches at once; the
+    // manager walks to the gate like everyone else launches (working seat =
+    // gate; the handover queue still coordinates only the manager's
+    // confirmation visits)
     const now = Date.now()
-    let batchStagger = 0 // i×0.6s WITHIN one migration batch (plan §5.1) — never cumulative across the session
     for (const member of members) {
       const isManager = member.maw?.role === 'manager'
       if (phaseOf(member.status) === 'task') {
@@ -1189,9 +1211,10 @@ export function startMawChoreography(store, { resumeCurrent = false } = {}) {
       const seat = forceWorkPost ? stableWorkSeat(member) : isManager
         ? (phase === 'task' ? MANAGER_GATE : stableRestSeat(member))
         : phase === 'task' || postIsDeskNow ? stableWorkSeat(member) : stableRestSeat(member)
-      // Delivering members hurry back to the work seat and wait for the manager.
-      const delay = !forceWorkPost && member.status === 'awaiting-approval' ? 0 : batchStagger * STAGGER_MS
-      batchStagger += 1
+      // CR-14: no artificial launch cadence — everyone departs at once and
+      // the door claims (AVO-187) sequence the stream. Delivering members
+      // still hurry straight to the work seat like every other launcher.
+      const delay = 0
       // The pending record is owned by ITS callback only: rapid rest/task toggles
       // stack several scheduled walks, and an older callback firing late must
       // never delete a newer pending record — the stale reap could no longer roll

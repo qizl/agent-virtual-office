@@ -619,6 +619,13 @@ function freeMawSeat(preferred, occupied, rect) {
   return nearest ?? clamped
 }
 
+// CR-15: cross-session member↔work-seat bindings injected by the integration
+// layer (dashboard [project, task] or standalone workflow title — see
+// mawWorkSeatCache.js). The build-time workSeat stamp consults this BEFORE the
+// random scan, so reloading a viewed task mounts every figure at its
+// established desk instead of a freshly randomized one.
+let mawWorkSeatCache = new Map()
+
 function buildMawMember(member, seat, stale = false) {
   const style = MAW_ROSTER_BY_ID.get(member.role) || {}
   const agentId = `${member.id}~${member.role}`
@@ -713,7 +720,12 @@ function applyMawSnapshotImpl(s, envelope) {
       let workSeat = workBindings.get(agentId)
       if (!workSeat) {
         const rect = member.role === 'manager' ? ZONE_FLOOR_RECTS.entrance : ZONE_FLOOR_RECTS.mainOffice
-        for (let index = 0; index < 50; index += 1) {
+        // CR-15: a cached binding beats the random scan — a reloaded task mounts
+        // the figure at its established desk. Manager keeps the gate
+        // (workSeatFor pins it, and the cache never stores managers).
+        const cached = member.role === 'manager' ? null : mawWorkSeatCache.get(member.id)
+        if (cached && mawSeatIsClear(cached, occupied, rect)) workSeat = { ...cached }
+        for (let index = 0; index < 50 && !workSeat; index += 1) {
           const candidate = clampToVisible(clampToFloor(workSeatFor(member.role, index)))
           if (mawSeatIsClear(candidate, occupied, rect)) {
             workSeat = candidate
@@ -1905,6 +1917,11 @@ export const useOfficeStore = create((set) => ({
   // set; a server-epoch change and a null snapshot are both full clears. Ignores the
   // legacy externalStatus pipeline entirely.
   applyMawSnapshot: (envelope) => set((s) => applyMawSnapshotImpl(s, envelope)),
+
+  // CR-15: inject the [project, task]-scoped seat association map (loaded by
+  // the integration layer from mawWorkSeatCache.js). Consumed by the build-time
+  // workSeat stamp; replaces any previous injection wholesale.
+  setMawWorkSeatCache: (map) => { mawWorkSeatCache = map instanceof Map ? map : new Map() },
 
   // ─── Mood system ───
   mood: 'normal',  // normal | rushing | frustrated | stuck | smooth | intense | idle (transient, not persisted)

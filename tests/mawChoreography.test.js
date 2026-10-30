@@ -12,7 +12,6 @@ import {
   wanderCandidates,
   planChoreography,
   startMawChoreography,
-  STAGGER_MS,
   MANAGER_GATE,
   clampToMemberZone,
 } from '../src/systems/mawChoreography.js'
@@ -153,7 +152,7 @@ describe('maw choreography planning', () => {
     expect(behaviorFor(member('m', 'executor', 'idle'))).toBe('idle')
   })
 
-  it('delivering members return immediately; group entry stays staggered', () => {
+  it('delivering members return immediately; every entrance walk launches at once (CR-14)', () => {
     const prevPhase = {}
     const members = [member('e1xxxx', 'executor', 'awaiting-approval'), member('r1xxxx', 'reviewer', 'working')]
     const actions = planChoreography({ prevPhase, members })
@@ -161,14 +160,15 @@ describe('maw choreography planning', () => {
     expect(deliver.staggerMs).toBe(0)
     expect(deliver.kind).toBe('deliver')
     expect(inRect(deliver.target, MAIN)).toBe(true)
+    expect(actions.find((a) => a.id === 'r1xxxx').staggerMs).toBe(0) // CR-14: no launch cadence at all
   })
 
-  it('plans staggered enter walks from rest to task, then rest walks back', () => {
+  it('plans simultaneous enter walks from rest to task, then rest walks back', () => {
     const prevPhase = {}
     const members = [member('e1xxxx', 'executor', 'working'), member('r1xxxx', 'reviewer', 'working'), member('m1xxxx', 'manager', 'working')]
     const actions = planChoreography({ prevPhase, members })
     expect(actions).toHaveLength(3)
-    expect(actions.map((a) => a.staggerMs)).toEqual([0, STAGGER_MS, STAGGER_MS * 2])
+    expect(actions.map((a) => a.staggerMs)).toEqual([0, 0, 0]) // CR-14: everyone departs together
     expect(actions.every((a) => inRect(a.target, MAIN) || a.id === 'm1xxxx')).toBe(true)
     // phases are now recorded — a second plan produces no actions
     expect(planChoreography({ prevPhase, members })).toHaveLength(0)
@@ -517,27 +517,37 @@ describe('startMawChoreography (controller)', () => {
       store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'idle'), mawMember('rev01', 'reviewer', 'idle')]))
       vi.advanceTimersByTime(100)
       store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'working'), mawMember('rev01', 'reviewer', 'working')], 2))
-      vi.advanceTimersByTime(100) // exe01 walked (delay 0); rev01's enter is still pending (delay 1500)
+      vi.advanceTimersByTime(100) // CR-14: both enter walks launched together
       expect(store.getState().agents['exe01~executor'].inGroupEvent).toBe(true)
-      const frozen = store.getState().agents['rev01~reviewer']
-      expect(frozen.inGroupEvent).toBe(false)
+      expect(store.getState().agents['rev01~reviewer'].inGroupEvent).toBe(true)
+      const frozenExe = store.getState().agents['exe01~executor']
+      const frozenRev = store.getState().agents['rev01~reviewer']
 
       useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, quality: 'stale' } })
       vi.advanceTimersByTime(5_000)
-      const after = store.getState().agents['rev01~reviewer']
-      expect(after.inGroupEvent).toBe(false) // the stale enter never walked
-      expect(after.groupTarget).toBeNull()
-      expect(after.position).toEqual(frozen.position)
+      // the generation boundary stops every walk where it stands — queued AND
+      // mid-flight — and the figures hold those positions
+      for (const id of ['exe01~executor', 'rev01~reviewer']) {
+        const after = store.getState().agents[id]
+        expect(after.inGroupEvent).toBe(false)
+        expect(after.groupTarget).toBeNull()
+      }
+      expect(store.getState().agents['exe01~executor'].position).toEqual(frozenExe.position)
+      expect(store.getState().agents['rev01~reviewer'].position).toEqual(frozenRev.position)
 
-      // recovery: the swallowed enter RE-dispatches (its recorded phase was rolled
-      // back when the generation died) — the reviewer does not stay stranded
+      // recovery: the swallowed enters RE-dispatch (mid-flight rolls recorded
+      // the phase back) — nobody stays stranded mid-route
       useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, quality: 'ok' } })
-      vi.advanceTimersByTime(100) // mid-flight: the re-dispatched walk owns the lock again
+      vi.advanceTimersByTime(100) // mid-flight: the re-dispatched walks own the locks again
+      expect(store.getState().agents['exe01~executor'].inGroupEvent).toBe(true)
       expect(store.getState().agents['rev01~reviewer'].inGroupEvent).toBe(true)
       vi.advanceTimersByTime(30_000)
-      const settled = store.getState().agents['rev01~reviewer']
-      expect(settled.inGroupEvent).toBe(false)
-      expect(settled.behavior).toBe('magnifier') // honest working animation restored
+      const settledExe = store.getState().agents['exe01~executor']
+      const settledRev = store.getState().agents['rev01~reviewer']
+      expect(settledExe.inGroupEvent).toBe(false)
+      expect(settledExe.behavior).toBe('typing') // honest working animation restored
+      expect(settledRev.inGroupEvent).toBe(false)
+      expect(settledRev.behavior).toBe('magnifier')
     } finally {
       cleanup()
     }
@@ -563,7 +573,7 @@ describe('startMawChoreography (controller)', () => {
     }
   })
 
-  it('stagger delays are per migration batch, never cumulative across the session', () => {
+  it('every migration batch launches its transitions at once (CR-14)', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
     installWalker(store)
@@ -575,7 +585,8 @@ describe('startMawChoreography (controller)', () => {
         mawMember('m4x', 'reviewer', 'idle'),
       ]))
       vi.advanceTimersByTime(100)
-      // batch 1: m1x launches at 0ms, m2x at STAGGER_MS
+      // batch 1: BOTH transitioned members launch at 0ms — the door claims
+      // (AVO-187) sequence the stream, not a launch cadence.
       store.getState().applyMawSnapshot(envelope([
         mawMember('m1x', 'executor', 'working'),
         mawMember('m2x', 'reviewer', 'working'),
@@ -584,10 +595,10 @@ describe('startMawChoreography (controller)', () => {
       ], 2))
       vi.advanceTimersByTime(100)
       expect(store.getState().agents['m1x~executor'].inGroupEvent).toBe(true)
-      expect(store.getState().agents['m2x~reviewer'].inGroupEvent).toBe(false) // still waiting on STAGGER_MS
+      expect(store.getState().agents['m2x~reviewer'].inGroupEvent).toBe(true) // launched at once
 
-      // batch 2 at t=200ms: with cumulative stagger m3x would owe 2×STAGGER_MS —
-      // per-batch it launches at 0ms.
+      // batch 2 at t=200ms: the still-idle pair transitions and launches at
+      // once too — batches carry no launch debt in either direction.
       store.getState().applyMawSnapshot(envelope([
         mawMember('m1x', 'executor', 'working'),
         mawMember('m2x', 'reviewer', 'working'),
@@ -595,12 +606,10 @@ describe('startMawChoreography (controller)', () => {
         mawMember('m4x', 'reviewer', 'working'),
       ], 3))
       vi.advanceTimersByTime(50)
-      expect(store.getState().agents['m3x~decision-maker'].inGroupEvent).toBe(true) // launched without the batch-1 debt
-      expect(store.getState().agents['m4x~reviewer'].inGroupEvent).toBe(false) // its own batch slot is STAGGER_MS
-      expect(store.getState().agents['m2x~reviewer'].inGroupEvent).toBe(false) // fires at t≈700ms, unchanged
+      expect(store.getState().agents['m3x~decision-maker'].inGroupEvent).toBe(true)
+      expect(store.getState().agents['m4x~reviewer'].inGroupEvent).toBe(true)
 
-      // by t=1850 all four launched at their batch slots; with the walker
-      // simulated the early launchers have already ARRIVED and released
+      // with the walker simulated the launchers have already ARRIVED and released
       vi.advanceTimersByTime(1_600)
       for (const id of ['m1x~executor', 'm2x~reviewer', 'm3x~decision-maker', 'm4x~reviewer']) {
         const a = store.getState().agents[id]
@@ -739,7 +748,7 @@ describe('startMawChoreography (controller)', () => {
     }
   })
 
-  it('launch order includes the manager: every role takes its i×STAGGER_MS slot (CR-1)', () => {
+  it('every entrance walk launches at once, manager included (CR-14)', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
     installWalker(store)
@@ -770,16 +779,9 @@ describe('startMawChoreography (controller)', () => {
         mawMember('exe02', 'executor', 'working'),
         mawMember('rev01', 'reviewer', 'working'),
       ], 2))
-      // launch slots in member order: 0 / STAGGER_MS / 2× / 3× / 4×
+      // CR-14: no stagger slots — every member launches in the same dispatch
+      // pass (member order), and the door claims decide who crosses first.
       vi.advanceTimersByTime(50)
-      expect(order).toEqual(['mgr01~manager']) // slot 0 — the manager is IN the sequence
-      vi.advanceTimersByTime(STAGGER_MS - 50)
-      expect(order).toEqual(['mgr01~manager', 'dm01~decision-maker'])
-      vi.advanceTimersByTime(STAGGER_MS)
-      expect(order).toEqual(['mgr01~manager', 'dm01~decision-maker', 'exe01~executor'])
-      vi.advanceTimersByTime(STAGGER_MS)
-      expect(order).toEqual(['mgr01~manager', 'dm01~decision-maker', 'exe01~executor', 'exe02~executor'])
-      vi.advanceTimersByTime(STAGGER_MS)
       expect(order).toEqual(['mgr01~manager', 'dm01~decision-maker', 'exe01~executor', 'exe02~executor', 'rev01~reviewer'])
       unsubscribe()
     } finally {
@@ -787,13 +789,40 @@ describe('startMawChoreography (controller)', () => {
     }
   })
 
+  it('CR-15: cached work-seat bindings seed the opening allocation (reloads keep desks)', () => {
+    const store = useOfficeStore
+    const bound = []
+    const cleanup = startMawChoreography(store, { workSeatCache: new Map([
+      ['dm01', { x: 260, y: 264 }], ['exe01', { x: 460, y: 364 }],
+    ]), onWorkSeatBound: (key, seat) => bound.push([key, seat]) })
+    installWalker(store)
+    try {
+      store.getState().applyMawSnapshot(envelope([
+        mawMember('mgr01', 'manager', 'working'),
+        mawMember('dm01', 'decision-maker', 'working'),
+        mawMember('exe01', 'executor', 'working'),
+        mawMember('exe02', 'executor', 'working'),
+      ]))
+      vi.advanceTimersByTime(100)
+      expect(store.getState().agents['dm01~decision-maker'].maw.workSeat).toEqual({ x: 260, y: 264 })
+      expect(store.getState().agents['exe01~executor'].maw.workSeat).toEqual({ x: 460, y: 364 })
+      expect(store.getState().agents['mgr01~manager'].maw.workSeat).toEqual(MANAGER_GATE) // CR-2
+      // uncached same-role member fills a free cluster seat, never a cached one
+      const exe02Seat = store.getState().agents['exe02~executor'].maw.workSeat
+      expect(JSON.stringify(exe02Seat)).not.toBe(JSON.stringify({ x: 460, y: 364 }))
+      const signatures = bound.map(([, seat]) => `${seat.x},${seat.y}`)
+      expect(new Set(signatures).size).toBe(signatures.length) // no collisions
+      expect(bound.some(([key]) => key === 'exe01')).toBe(true)
+    } finally { cleanup() }
+  })
+
   it('a pruned member re-entering binds a NEW seat — the old delayed callback cannot drag it back', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
     installWalker(store)
     try {
-      // four executors: drag01 takes the LAST launch slot (1800ms) and binds the
-      // extra pool seat far from its later re-entry binding
+      // four executors: drag01 binds an extra-pool seat far from its later
+      // re-entry binding
       store.getState().applyMawSnapshot(envelope([
         mawMember('seed0', 'reviewer', 'working'),
         mawMember('e0x', 'executor', 'working'),
@@ -817,7 +846,7 @@ describe('startMawChoreography (controller)', () => {
         mawMember('e1x', 'executor', 'working'),
         mawMember('e2x', 'executor', 'working'),
       ], 3))
-      vi.advanceTimersByTime(100) // the re-entry walk launches (batch slot 0)
+      vi.advanceTimersByTime(100) // the re-entry walk launches
       const bound = store.getState().agents['drag01~executor'].groupTarget
       expect(bound).not.toBeNull()
 
@@ -1357,7 +1386,7 @@ describe('startMawChoreography (controller)', () => {
     } finally { cleanup() }
   })
 
-  it('AVO-202 freezes remaining nine-member entry staggers and resumes their original offsets', () => {
+  it('AVO-202 freezes every in-flight entry walk during pause and resumes its original route', () => {
     const store = useOfficeStore
     store.setState({ integration: 'dashboard', isPaused: false })
     const cleanup = startMawChoreography(store, { resumeCurrent: true })
@@ -1368,27 +1397,22 @@ describe('startMawChoreography (controller)', () => {
         snapshot: { ...first.snapshot, execution_state: 'not-started' } })
       vi.advanceTimersByTime(0)
       const entering = () => Object.values(store.getState().agents).filter((agent) => agent.inGroupEvent)
-      const firstRoute = entering()[0]
-      expect(entering()).toHaveLength(1)
+      // CR-14: the whole opening launches at once — all nine walk together
+      expect(entering()).toHaveLength(9)
+      const routes = new Map(entering().map((agent) => [agent.id, agent.groupTarget]))
 
       vi.advanceTimersByTime(100)
       store.setState({ isPaused: true })
       vi.advanceTimersByTime(2_000)
-      expect(entering()).toHaveLength(1)
-      expect(store.getState().agents[firstRoute.id]).toMatchObject({ inGroupEvent: true,
-        groupTarget: firstRoute.groupTarget })
+      // the pause freezes every walk on its original route — nobody teleports
+      expect(entering()).toHaveLength(9)
+      for (const agent of entering()) expect(agent.groupTarget).toEqual(routes.get(agent.id))
 
       store.setState({ isPaused: false })
-      vi.advanceTimersByTime(499)
-      expect(entering()).toHaveLength(1)
-      vi.advanceTimersByTime(1)
-      expect(entering()).toHaveLength(2)
-      expect(entering()[0].id).toBe(firstRoute.id)
-      vi.advanceTimersByTime(599)
-      expect(entering()).toHaveLength(2)
-      vi.advanceTimersByTime(1)
-      expect(entering()).toHaveLength(3)
-      expect(entering()[0].id).toBe(firstRoute.id)
+      vi.advanceTimersByTime(500)
+      // resumed: everyone is still walking their ORIGINAL route (no relaunch)
+      expect(entering()).toHaveLength(9)
+      for (const agent of entering()) expect(agent.groupTarget).toEqual(routes.get(agent.id))
     } finally { cleanup() }
   })
 
