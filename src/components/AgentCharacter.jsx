@@ -1130,30 +1130,13 @@ function AgentCharacter({ agent }) {
     startRaf()
   }, [id, startRaf])
 
-  // CR-14 queue-at-door: the claim-free waiting spot for a door journey — the
-  // last waypoint on the walker's side of its FIRST door (the pre-crossing
-  // leg), offset deterministically per member so a queued stream reads as a
-  // huddle at the door instead of one stacked sprite.
-  const doorQueuePoint = (journey) => {
-    const clear = journey.doorClear?.[0]
-    if (!clear || clear.at < 1) return null // already at the door mouth
-    const base = journey.waypoints[clear.at - 1]
-    if (!base) return null
-    let hash = 0
-    for (let i = 0; i < id.length; i += 1) hash = (hash * 31 + id.charCodeAt(i)) >>> 0
-    const offsets = [[0, 0], [12, 6], [-12, 8], [6, -10], [-9, -12]]
-    const [ox, oy] = offsets[hash % offsets.length]
-    return {
-      x: Math.min(780, Math.max(20, base.x + ox)),
-      y: Math.min(540, Math.max(64, base.y + oy)),
-    }
-  }
-
   // AVO-187: every journey starts through one route-assignment gate. Doorless journeys keep the
-  // old behavior. A cross-zone journey whose physical-door set is not yet free walks CLAIM-FREE
-  // to the pre-door approach point and queues there (CR-14: the door stream is a physically
-  // queued line at the door, not figures frozen at their seats); a queued retry reuses its
-  // journeyId, preserving FIFO position and release fencing.
+  // old behavior. A cross-zone journey whose physical-door set is not yet free waits briefly at
+  // its departure seat for the claims (CR-14 R13: members leave their seats in random order and
+  // spacing, so a waiting walker is short-lived; door-side queuing was rejected by the owner).
+  // Per-door release frees each crossed passage mid-journey (CR-14: the manager walking
+  // meeting-room → gate must not hold the meeting-room door until it reaches the gate). A queued
+  // retry reuses its journeyId, preserving FIFO position and release fencing.
   const beginJourney = useCallback(({ destination, journey, kind, onGranted, journeyId: requestedId }) => {
     if (!journey?.waypoints?.length) return 'none'
     const store = useOfficeStore.getState()
@@ -1163,15 +1146,6 @@ function AgentCharacter({ agent }) {
       store.releaseAgentDoorClaims(id, prior.journeyId)
       pendingDoorJourneyRef.current = null
     }
-    // CR-14: a queued walker may already be standing at the door approach —
-    // restart the granted leg from WHERE IT STANDS so it never walks backwards
-    // to its original start.
-    let effectiveJourney = journey
-    if (prior?.requestKey === requestKey && prior.queuedAtDoor) {
-      const current = store.agents[id]?.position
-      if (current) effectiveJourney = calculateJourney(current, destination)
-    }
-    journey = effectiveJourney
 
     let journeyId = requestedId
     if (journey.doorIds.length > 0) {
@@ -1187,23 +1161,8 @@ function AgentCharacter({ agent }) {
           journeyId,
           requestKey,
           retryScheduled: prior?.journeyId === journeyId && prior.retryScheduled,
-          queuedAtDoor: prior?.journeyId === journeyId ? !!prior.queuedAtDoor : false,
         }
         pendingDoorJourneyRef.current = pending
-        const current = store.agents[id]?.position
-        const queueSpot = doorQueuePoint(journey)
-        if (!pending.queuedAtDoor && queueSpot && current
-            && Math.hypot(current.x - queueSpot.x, current.y - queueSpot.y) > 6) {
-          // Claim-free approach walk: no claims are held on this leg, so the
-          // passage stays free for whoever currently owns it.
-          pending.queuedAtDoor = true
-          activeDoorJourneyRef.current = null
-          claimedDoorIdsRef.current = []
-          waypointsDoneRef.current = 0
-          movingRef.current = true
-          pathRef.current = []
-          startWalkTo(queueSpot)
-        }
         if (!pending.retryScheduled) {
           pending.retryScheduled = true
           scheduleDeferred(() => {
@@ -1257,13 +1216,23 @@ function AgentCharacter({ agent }) {
         // its desk; doors not yet crossed keep their claims. Idempotent with
         // the arrival/abort release paths.
         const done = waypointsDoneRef.current
-        const lastClear = claimedDoorIdsRef.current.reduce((m, c) => Math.max(m, c.at), -1)
-        if (done > lastClear) {
-          store.releaseAgentDoorClaims(id, activeDoorJourneyRef.current)
+        // CR-14: per-door release — each crossed door frees ITS passage the
+        // moment it is cleared (the manager walking meeting-room → gate frees
+        // the meeting-room door mid-route instead of holding it until the
+        // gate), while doors not yet crossed keep their claims. The request is
+        // retired on the last crossing. Idempotent with the arrival/abort
+        // release paths.
+        const crossed = claimedDoorIdsRef.current.filter((c) => c.at < done)
+        const remaining = claimedDoorIdsRef.current.filter((c) => c.at >= done)
+        if (crossed.length) {
+          store.releaseAgentDoorClaimsDoors(id, activeDoorJourneyRef.current, crossed.map((c) => c.doorId))
+        }
+        if (remaining.length) {
+          claimedDoorIdsRef.current = remaining
+          store.renewAgentDoorClaims(id, activeDoorJourneyRef.current)
+        } else {
           claimedDoorIdsRef.current = []
           activeDoorJourneyRef.current = null
-        } else {
-          store.renewAgentDoorClaims(id, activeDoorJourneyRef.current)
         }
       }
       // Continue to next waypoint

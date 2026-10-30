@@ -20,6 +20,7 @@ import {
   createDoorClaimState,
   releaseAgentDoorClaims as releaseAllAgentDoorClaims,
   releaseDoorClaims,
+  releaseDoorClaimsDoors,
   renewDoorClaims,
   requestDoorClaims,
 } from './doorClaims.js'
@@ -1186,6 +1187,16 @@ export const useOfficeStore = create((set) => ({
       const doorTraffic = journeyId
         ? releaseDoorClaims(s.doorTraffic, { agentId, journeyId })
         : releaseAllAgentDoorClaims(s.doorTraffic, agentId)
+      return doorTraffic === s.doorTraffic ? s : { doorTraffic }
+    }),
+
+  // CR-14: per-door release — a multi-door journey (manager walking
+  // meeting-room → gate via the office door) frees each crossed passage
+  // immediately instead of holding every claimed door until its last
+  // crossing, which blocked queued members for the whole walk.
+  releaseAgentDoorClaimsDoors: (agentId, journeyId, doorIds) =>
+    set((s) => {
+      const doorTraffic = releaseDoorClaimsDoors(s.doorTraffic, { agentId, journeyId, doorIds })
       return doorTraffic === s.doorTraffic ? s : { doorTraffic }
     }),
 

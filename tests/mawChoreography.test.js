@@ -12,6 +12,7 @@ import {
   wanderCandidates,
   planChoreography,
   startMawChoreography,
+  STAGGER_MS,
   MANAGER_GATE,
   clampToMemberZone,
 } from '../src/systems/mawChoreography.js'
@@ -152,23 +153,27 @@ describe('maw choreography planning', () => {
     expect(behaviorFor(member('m', 'executor', 'idle'))).toBe('idle')
   })
 
-  it('delivering members return immediately; every entrance walk launches at once (CR-14)', () => {
+  it('delivering members return immediately; launch slots come from a shuffled deck (CR-14 R13)', () => {
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.99) // identity shuffle — slots follow member order
     const prevPhase = {}
     const members = [member('e1xxxx', 'executor', 'awaiting-approval'), member('r1xxxx', 'reviewer', 'working')]
     const actions = planChoreography({ prevPhase, members })
+    randomSpy.mockRestore()
     const deliver = actions.find((a) => a.id === 'e1xxxx')
-    expect(deliver.staggerMs).toBe(0)
+    expect(deliver.staggerMs).toBe(0) // delivering members never wait for a slot
     expect(deliver.kind).toBe('deliver')
     expect(inRect(deliver.target, MAIN)).toBe(true)
-    expect(actions.find((a) => a.id === 'r1xxxx').staggerMs).toBe(0) // CR-14: no launch cadence at all
+    expect(actions.find((a) => a.id === 'r1xxxx').staggerMs).toBe(0) // first shuffled slot
   })
 
-  it('plans simultaneous enter walks from rest to task, then rest walks back', () => {
+  it('plans shuffled-order enter walks from rest to task, then rest walks back', () => {
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.99) // identity shuffle
     const prevPhase = {}
     const members = [member('e1xxxx', 'executor', 'working'), member('r1xxxx', 'reviewer', 'working'), member('m1xxxx', 'manager', 'working')]
     const actions = planChoreography({ prevPhase, members })
+    randomSpy.mockRestore()
     expect(actions).toHaveLength(3)
-    expect(actions.map((a) => a.staggerMs)).toEqual([0, 0, 0]) // CR-14: everyone departs together
+    expect(actions.map((a) => a.staggerMs)).toEqual([0, STAGGER_MS, STAGGER_MS * 2]) // shuffled deck (identity under the spy)
     expect(actions.every((a) => inRect(a.target, MAIN) || a.id === 'm1xxxx')).toBe(true)
     // phases are now recorded — a second plan produces no actions
     expect(planChoreography({ prevPhase, members })).toHaveLength(0)
@@ -513,33 +518,34 @@ describe('startMawChoreography (controller)', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
     installWalker(store)
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.99) // identity shuffle — slots follow member order
     try {
       store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'idle'), mawMember('rev01', 'reviewer', 'idle')]))
       vi.advanceTimersByTime(100)
       store.getState().applyMawSnapshot(envelope([mawMember('exe01', 'executor', 'working'), mawMember('rev01', 'reviewer', 'working')], 2))
-      vi.advanceTimersByTime(100) // CR-14: both enter walks launched together
+      vi.advanceTimersByTime(100) // CR-14 R13: exe01 (slot 0) is mid-flight; rev01 (slot 600ms) is still pending
       expect(store.getState().agents['exe01~executor'].inGroupEvent).toBe(true)
-      expect(store.getState().agents['rev01~reviewer'].inGroupEvent).toBe(true)
       const frozenExe = store.getState().agents['exe01~executor']
       const frozenRev = store.getState().agents['rev01~reviewer']
+      expect(frozenRev.inGroupEvent).toBe(false)
 
       useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, quality: 'stale' } })
       vi.advanceTimersByTime(5_000)
-      // the generation boundary stops every walk where it stands — queued AND
-      // mid-flight — and the figures hold those positions
-      for (const id of ['exe01~executor', 'rev01~reviewer']) {
-        const after = store.getState().agents[id]
-        expect(after.inGroupEvent).toBe(false)
-        expect(after.groupTarget).toBeNull()
-      }
-      expect(store.getState().agents['exe01~executor'].position).toEqual(frozenExe.position)
-      expect(store.getState().agents['rev01~reviewer'].position).toEqual(frozenRev.position)
+      // the generation boundary stops the mid-flight walk where it stands and
+      // swallows the pending slot — both figures hold their positions
+      const afterExe = store.getState().agents['exe01~executor']
+      expect(afterExe.inGroupEvent).toBe(false)
+      expect(afterExe.groupTarget).toBeNull()
+      expect(afterExe.position).toEqual(frozenExe.position)
+      const afterRev = store.getState().agents['rev01~reviewer']
+      expect(afterRev.position).toEqual(frozenRev.position)
 
-      // recovery: the swallowed enters RE-dispatch (mid-flight rolls recorded
-      // the phase back) — nobody stays stranded mid-route
+      // recovery: both enters RE-dispatch (mid-flight rolls the recorded phase
+      // back; the swallowed slot re-draws) — nobody stays stranded
       useOfficeStore.setState({ mawMeta: { ...useOfficeStore.getState().mawMeta, quality: 'ok' } })
-      vi.advanceTimersByTime(100) // mid-flight: the re-dispatched walks own the locks again
+      vi.advanceTimersByTime(100) // mid-flight: exe01's re-dispatched walk owns the lock again
       expect(store.getState().agents['exe01~executor'].inGroupEvent).toBe(true)
+      vi.advanceTimersByTime(600) // rev01's re-dispatched walk follows (its shuffled slot)
       expect(store.getState().agents['rev01~reviewer'].inGroupEvent).toBe(true)
       vi.advanceTimersByTime(30_000)
       const settledExe = store.getState().agents['exe01~executor']
@@ -549,6 +555,7 @@ describe('startMawChoreography (controller)', () => {
       expect(settledRev.inGroupEvent).toBe(false)
       expect(settledRev.behavior).toBe('magnifier')
     } finally {
+      randomSpy.mockRestore()
       cleanup()
     }
   })
@@ -573,11 +580,12 @@ describe('startMawChoreography (controller)', () => {
     }
   })
 
-  it('every migration batch launches its transitions at once (CR-14)', () => {
+  it('launch slots reset per migration batch in shuffled-draw order (CR-14 R13)', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
     installWalker(store)
     try {
+      const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.99) // identity shuffle — slots follow member order
       store.getState().applyMawSnapshot(envelope([
         mawMember('m1x', 'executor', 'idle'),
         mawMember('m2x', 'reviewer', 'idle'),
@@ -585,8 +593,8 @@ describe('startMawChoreography (controller)', () => {
         mawMember('m4x', 'reviewer', 'idle'),
       ]))
       vi.advanceTimersByTime(100)
-      // batch 1: BOTH transitioned members launch at 0ms — the door claims
-      // (AVO-187) sequence the stream, not a launch cadence.
+      // batch 1: slots follow the identity-shuffled deck — m1x launches at 0ms,
+      // m2x at STAGGER_MS
       store.getState().applyMawSnapshot(envelope([
         mawMember('m1x', 'executor', 'working'),
         mawMember('m2x', 'reviewer', 'working'),
@@ -595,10 +603,12 @@ describe('startMawChoreography (controller)', () => {
       ], 2))
       vi.advanceTimersByTime(100)
       expect(store.getState().agents['m1x~executor'].inGroupEvent).toBe(true)
-      expect(store.getState().agents['m2x~reviewer'].inGroupEvent).toBe(true) // launched at once
+      expect(store.getState().agents['m2x~reviewer'].inGroupEvent).toBe(false) // still waiting on its slot
+      vi.advanceTimersByTime(600)
+      expect(store.getState().agents['m2x~reviewer'].inGroupEvent).toBe(true)
 
-      // batch 2 at t=200ms: the still-idle pair transitions and launches at
-      // once too — batches carry no launch debt in either direction.
+      // batch 2: the deck RESETS — m3x owes nothing from batch 1 and launches
+      // at once, m4x follows one slot later.
       store.getState().applyMawSnapshot(envelope([
         mawMember('m1x', 'executor', 'working'),
         mawMember('m2x', 'reviewer', 'working'),
@@ -606,8 +616,11 @@ describe('startMawChoreography (controller)', () => {
         mawMember('m4x', 'reviewer', 'working'),
       ], 3))
       vi.advanceTimersByTime(50)
-      expect(store.getState().agents['m3x~decision-maker'].inGroupEvent).toBe(true)
+      expect(store.getState().agents['m3x~decision-maker'].inGroupEvent).toBe(true) // slot 0 of the fresh deck
+      expect(store.getState().agents['m4x~reviewer'].inGroupEvent).toBe(false) // its own slot is STAGGER_MS
+      vi.advanceTimersByTime(600)
       expect(store.getState().agents['m4x~reviewer'].inGroupEvent).toBe(true)
+      randomSpy.mockRestore()
 
       // with the walker simulated the launchers have already ARRIVED and released
       vi.advanceTimersByTime(1_600)
@@ -748,10 +761,11 @@ describe('startMawChoreography (controller)', () => {
     }
   })
 
-  it('every entrance walk launches at once, manager included (CR-14)', () => {
+  it('opening launches in shuffled slots, manager included (CR-14 R13)', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
     installWalker(store)
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.99) // identity shuffle — slots follow member order
     try {
       store.getState().applyMawSnapshot(envelope([
         mawMember('mgr01', 'manager', 'idle'),
@@ -779,11 +793,21 @@ describe('startMawChoreography (controller)', () => {
         mawMember('exe02', 'executor', 'working'),
         mawMember('rev01', 'reviewer', 'working'),
       ], 2))
-      // CR-14: no stagger slots — every member launches in the same dispatch
-      // pass (member order), and the door claims decide who crosses first.
+      // CR-14 R13: shuffled launch slots (identity under the spy) — the manager
+      // is IN the random sequence (first as often as last), and the door claims
+      // decide who crosses first.
       vi.advanceTimersByTime(50)
+      expect(order).toEqual(['mgr01~manager']) // slot 0
+      vi.advanceTimersByTime(STAGGER_MS - 50)
+      expect(order).toEqual(['mgr01~manager', 'dm01~decision-maker'])
+      vi.advanceTimersByTime(STAGGER_MS)
+      expect(order).toEqual(['mgr01~manager', 'dm01~decision-maker', 'exe01~executor'])
+      vi.advanceTimersByTime(STAGGER_MS)
+      expect(order).toEqual(['mgr01~manager', 'dm01~decision-maker', 'exe01~executor', 'exe02~executor'])
+      vi.advanceTimersByTime(STAGGER_MS)
       expect(order).toEqual(['mgr01~manager', 'dm01~decision-maker', 'exe01~executor', 'exe02~executor', 'rev01~reviewer'])
       unsubscribe()
+      randomSpy.mockRestore()
     } finally {
       cleanup()
     }
@@ -820,6 +844,7 @@ describe('startMawChoreography (controller)', () => {
     const store = useOfficeStore
     const cleanup = startMawChoreography(store)
     installWalker(store)
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.99) // identity shuffle — deterministic slots
     try {
       // four executors: drag01 binds an extra-pool seat far from its later
       // re-entry binding
@@ -846,15 +871,16 @@ describe('startMawChoreography (controller)', () => {
         mawMember('e1x', 'executor', 'working'),
         mawMember('e2x', 'executor', 'working'),
       ], 3))
-      vi.advanceTimersByTime(100) // the re-entry walk launches
-      const bound = store.getState().agents['drag01~executor'].groupTarget
-      expect(bound).not.toBeNull()
+      vi.advanceTimersByTime(700) // the re-entry walk launches (its shuffled slot)
+      const bound = store.getState().agents['drag01~executor'].maw.workSeat
+      expect(bound).not.toBeNull() // the re-entry binds a NEW stable seat
 
       vi.advanceTimersByTime(2_500) // the re-entry completes AND the old pre-prune callback fires
       const after = store.getState().agents['drag01~executor']
-      // NOT dragged to the pruned binding — still walking to / standing at the re-entry seat
-      expect(Math.hypot(after.position.x - bound.x, after.position.y - bound.y)).toBeLessThan(60)
+      // NOT dragged to the pruned binding — settled at / still walking to the re-entry binding
+      expect(Math.hypot(after.position.x - after.maw.workSeat.x, after.position.y - after.maw.workSeat.y)).toBeLessThan(60)
     } finally {
+      randomSpy.mockRestore()
       cleanup()
     }
   })
@@ -1397,7 +1423,9 @@ describe('startMawChoreography (controller)', () => {
         snapshot: { ...first.snapshot, execution_state: 'not-started' } })
       vi.advanceTimersByTime(0)
       const entering = () => Object.values(store.getState().agents).filter((agent) => agent.inGroupEvent)
-      // CR-14: the whole opening launches at once — all nine walk together
+      // CR-14 R13: shuffled launch slots (0..8×STAGGER_MS) — the whole opening
+      // is in flight once the last slot has fired.
+      vi.advanceTimersByTime(4_900)
       expect(entering()).toHaveLength(9)
       const routes = new Map(entering().map((agent) => [agent.id, agent.groupTarget]))
 

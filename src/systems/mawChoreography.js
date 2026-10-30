@@ -32,11 +32,23 @@ import { handoffApproachPoint } from './mawHandoff.js'
 
 export const MANAGER_GATE = { x: 100, y: 80 }
 const HANDOVER_DWELL_MS = 3000
-// CR-14: entrances launch EVERYONE at once — the single-occupant door claims
-// (AVO-187, released on crossing) sequence the stream themselves, so an
-// artificial i×0.6s launch cadence is gone. STAGGER_MS survives only as the
-// CR-11 standby-relocation sweep spacing, which is not an entrance.
+// CR-14 (R13 revision): members leave their initial seats in RANDOM order and
+// spacing — each launching member draws the next slot of a shuffled deck over
+// this spacing, so departures read organic instead of a fixed role-order
+// march, and no member waits at the door (claims sequence the crossing).
+// STAGGER_MS is also the CR-11 standby-relocation sweep spacing.
 export const STAGGER_MS = 600
+
+/** Fisher–Yates shuffle of the launch-slot deck (Math.random seam, mocked in
+ * tests for deterministic order assertions). */
+function shuffledIndices(count) {
+  const order = Array.from({ length: count }, (_, i) => i)
+  for (let i = order.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[order[i], order[j]] = [order[j], order[i]]
+  }
+  return order
+}
 const WANDER_INTERVAL_MS = 15_000
 const WANDER_CHANCE = 0.10
 const LONG_WORK_MS = 90_000 // a member on the same work/rest stretch this long may take a walk
@@ -303,6 +315,11 @@ export function wanderCandidates({ members, workingSince, restingSince, now = Da
  */
 export function planChoreography({ prevPhase, members, workSeatsByMember = new Map(), occupiedWorkSeats = new Set(), restSeatsByMember = new Map(), restSeatsTaken = new Set() }) {
   const actions = []
+  let slotDeck = null
+  const takeLaunchSlot = () => {
+    if (!slotDeck) slotDeck = shuffledIndices(members.length)
+    return slotDeck.shift()
+  }
   const assignWork = (member) => {
     const bound = workSeatsByMember.get(member.id)
     if (bound) return bound
@@ -334,15 +351,15 @@ export function planChoreography({ prevPhase, members, workSeatsByMember = new M
     if (phase === 'task') {
       const seat = assignWork(member)
       // Delivering members (awaiting-approval) return at once and wait at the
-      // work seat for the manager's handover. CR-14: every entrance launches
-      // immediately — staggerMs stays 0 for plan-shape compatibility.
+      // work seat for the manager's handover; every other launcher draws a
+      // shuffled departure slot (CR-14 R13).
       const immediate = member.status === 'awaiting-approval'
       actions.push({
         id: member.id,
         agentId: `${member.id}~${member.role}`,
         target: seat,
         behavior: 'idle', // transit; restored to the status animation on arrival
-        staggerMs: 0,
+        staggerMs: immediate ? 0 : takeLaunchSlot() * STAGGER_MS,
         kind: immediate ? 'deliver' : 'enter',
       })
     } else {
@@ -352,7 +369,7 @@ export function planChoreography({ prevPhase, members, workSeatsByMember = new M
         agentId: `${member.id}~${member.role}`,
         target: seat,
         behavior: 'idle',
-        staggerMs: 0,
+        staggerMs: takeLaunchSlot() * STAGGER_MS,
         kind: 'rest',
       })
     }
@@ -1170,11 +1187,17 @@ export function startMawChoreography(store, { resumeCurrent = false, workSeatCac
       arriveThen(agentId, 0, () => restorePresentation(agentId))
     }
 
-    // member transitions — CR-14: EVERY entrance walk launches at once; the
-    // manager walks to the gate like everyone else launches (working seat =
+    // member transitions — CR-14 (R13): every launching member draws the next
+    // slot of a shuffled deck over the batch spacing, so departure order is
+    // random and the manager launches last as often as first (working seat =
     // gate; the handover queue still coordinates only the manager's
-    // confirmation visits)
+    // confirmation visits). Slots reset every batch — never cumulative.
     const now = Date.now()
+    let slotDeck = null
+    const takeLaunchSlot = () => {
+      if (!slotDeck) slotDeck = shuffledIndices(members.length)
+      return slotDeck.shift()
+    }
     for (const member of members) {
       const isManager = member.maw?.role === 'manager'
       if (phaseOf(member.status) === 'task') {
@@ -1211,10 +1234,9 @@ export function startMawChoreography(store, { resumeCurrent = false, workSeatCac
       const seat = forceWorkPost ? stableWorkSeat(member) : isManager
         ? (phase === 'task' ? MANAGER_GATE : stableRestSeat(member))
         : phase === 'task' || postIsDeskNow ? stableWorkSeat(member) : stableRestSeat(member)
-      // CR-14: no artificial launch cadence — everyone departs at once and
-      // the door claims (AVO-187) sequence the stream. Delivering members
-      // still hurry straight to the work seat like every other launcher.
-      const delay = 0
+      // CR-14 (R13): random departure slot; delivering members (awaiting-
+      // approval) still hurry straight to the work seat at once.
+      const delay = (!forceWorkPost && member.status === 'awaiting-approval') ? 0 : takeLaunchSlot() * STAGGER_MS
       // The pending record is owned by ITS callback only: rapid rest/task toggles
       // stack several scheduled walks, and an older callback firing late must
       // never delete a newer pending record — the stale reap could no longer roll

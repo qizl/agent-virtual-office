@@ -447,18 +447,29 @@ describe('Dashboard fixed binding and lifecycle', () => {
     expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(1)
     expect(useOfficeStore.getState().mawMeta.dashboard_hydration).toBe(0)
     expect(first['manager1~manager'].groupTarget).toEqual({ x: 100, y: 80 })
-    // CR-14: the whole opening launches at once — no per-member 600ms slots
-    expect(first['member1~executor'].inGroupEvent).toBe(true)
-    expect(first['reviewer1~reviewer'].inGroupEvent).toBe(true)
-    const routes = new Map(Object.values(first).map((agent) => [agent.id, agent.groupTarget]))
-    for (const agent of Object.values(first)) expect(agent.position).not.toEqual(agent.maw.workSeat)
+    // CR-14 R13: shuffled launch slots (identity under the spy) — the manager
+    // walks first, the others follow one slot apart
+    expect(first['manager1~manager'].inGroupEvent).toBe(true)
+    expect(first['member1~executor'].inGroupEvent).toBe(false) // its 600ms slot has not fired
+    const routes = new Map()
+    for (const agent of Object.values(first)) {
+      routes.set(agent.id, agent.maw.workSeat)
+      expect(agent.position).not.toEqual(agent.maw.workSeat)
+    }
     useOfficeStore.getState().requestDashboardSync()
-    await vi.advanceTimersByTimeAsync(0)
-    const updated = useOfficeStore.getState().agents
+    await vi.advanceTimersByTimeAsync(599)
+    expect(useOfficeStore.getState().agents['member1~executor'].inGroupEvent).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(useOfficeStore.getState().agents['member1~executor'].inGroupEvent).toBe(true)
+    expect(useOfficeStore.getState().agents['member1~executor'].groupTarget).toEqual(routes.get('member1~executor'))
+    expect(useOfficeStore.getState().agents['reviewer1~reviewer'].inGroupEvent).toBe(false)
+    await vi.advanceTimersByTimeAsync(600)
+    expect(useOfficeStore.getState().agents['reviewer1~reviewer'].groupTarget).toEqual(routes.get('reviewer1~reviewer'))
     // the startup snapshot preserves every in-flight opening route (no restart)
+    const updated = useOfficeStore.getState().agents
     for (const agent of Object.values(updated)) expect(agent.groupTarget).toEqual(routes.get(agent.id))
     expect(updated['manager1~manager'].position).toEqual(first['manager1~manager'].position)
-    await vi.advanceTimersByTimeAsync(4600)
+    await vi.advanceTimersByTimeAsync(4000)
     expect(useOfficeStore.getState().mawMeta.dashboard_opening).toBe(1)
     expect(useOfficeStore.getState().mawMeta.dashboard_hydration).toBe(0)
   })

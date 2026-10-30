@@ -69,6 +69,14 @@ async function travelThroughConversation() {
 
 describe('live factual handoff choreography', () => {
   beforeEach(() => {
+    // CR-14 R13: launch slots come from a shuffled deck — pin the shuffle to
+    // the identity permutation so the timed windows below stay deterministic.
+    vi.spyOn(Math, 'random').mockReturnValue(0.99)
+  })
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+  beforeEach(() => {
     while (walkerUnsubs.length) walkerUnsubs.shift()()
     vi.useFakeTimers()
     useOfficeStore.setState({ mode: 'maw', integration: 'dashboard', agents: {}, mawMeta: null, isPaused: false })

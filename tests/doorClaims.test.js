@@ -4,6 +4,7 @@ import {
   createDoorClaimState,
   releaseAgentDoorClaims,
   releaseDoorClaims,
+  releaseDoorClaimsDoors,
   renewDoorClaims,
   requestDoorClaims,
 } from '../src/systems/doorClaims.js'
@@ -13,6 +14,41 @@ const request = (state, agentId, journeyId, doorIds, now = 1000) =>
   requestDoorClaims(state, { agentId, journeyId, doorIds, now })
 
 describe('doorClaims — bounded physical-door arbitration', () => {
+  it('releases individual doors of a multi-door journey — the meeting door frees before the gate door is crossed', () => {
+    // CR-14: the manager walking meeting-room → gate claims BOTH doors; after
+    // crossing the meeting-room door its claim on that passage must free at
+    // once, so the queued members can start crossing without waiting for the
+    // manager to reach the gate.
+    let state = createDoorClaimState()
+    const mgr = request(state, 'mgr', 'mgr:1', ['mainToMeeting', 'entranceToMain'])
+    expect(mgr.status).toBe('granted')
+    const member = request(mgr.state, 'm1', 'm1:1', ['mainToMeeting'], 1001)
+    expect(member.status).toBe('queued') // the manager holds the meeting door
+
+    state = releaseDoorClaimsDoors(member.state, { agentId: 'mgr', journeyId: 'mgr:1', doorIds: ['mainToMeeting'] })
+    expect(state.ownerByDoor['entranceToMain']).toBe('mgr:1') // the gate claim survives
+    expect(state.requests['mgr:1'].doorIds).toEqual(['entranceToMain'])
+    expect(state.ownerByDoor['mainToMeeting']).toBeUndefined()
+
+    // the queued member can now take the freed meeting door
+    const retried = request(state, 'm1', 'm1:1', ['mainToMeeting'], 1002)
+    expect(retried.status).toBe('granted')
+
+    // the manager's request retires only when its LAST door is released
+    state = releaseDoorClaimsDoors(state, { agentId: 'mgr', journeyId: 'mgr:1', doorIds: ['entranceToMain'] })
+    expect(state.requests['mgr:1']).toBeUndefined()
+  })
+
+  it('a per-door release of an unknown journey or foreign agent is a no-op', () => {
+    let state = request(createDoorClaimState(), 'a', 'a:1', ['mainToMeeting']).state
+    const before = state
+    state = releaseDoorClaimsDoors(state, { agentId: 'impostor', journeyId: 'a:1', doorIds: ['mainToMeeting'] })
+    expect(state).toBe(before)
+    state = releaseDoorClaimsDoors(state, { agentId: 'a', journeyId: 'ghost:1', doorIds: ['mainToMeeting'] })
+    expect(state).toBe(before)
+    expect(state.ownerByDoor['mainToMeeting']).toBe('a:1')
+  })
+
   it('grants one physical-door owner and queues the conflicting direction', () => {
     const a = request(createDoorClaimState(), 'a', 'a:1', ['mainToLounge'])
     const b = request(a.state, 'b', 'b:1', ['mainToLounge'], 1001)

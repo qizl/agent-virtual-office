@@ -90,6 +90,28 @@ export function releaseDoorClaims(state, { agentId, journeyId }) {
   return { ...state, requests, ownerByDoor }
 }
 
+/** CR-14: per-door release for MULTI-door journeys — a walker crossing its
+ * meeting-room door frees that passage immediately instead of holding it
+ * until its last crossing (the gate door) is also cleared, which used to
+ * block every queued member for the whole multi-door walk. The request stays
+ * alive while any door remains claimed and is retired only on the last. */
+export function releaseDoorClaimsDoors(state, { agentId, journeyId, doorIds }) {
+  const request = state.requests[journeyId]
+  if (!request || request.agentId !== agentId) return state
+  const normalized = normalizeDoorIds(doorIds)
+  const remaining = request.doorIds.filter((doorId) => !normalized.includes(doorId))
+  const ownerByDoor = { ...state.ownerByDoor }
+  for (const doorId of normalized) {
+    if (ownerByDoor[doorId] === journeyId) delete ownerByDoor[doorId]
+  }
+  if (remaining.length === 0) return releaseDoorClaims(state, { agentId, journeyId })
+  return {
+    ...state,
+    ownerByDoor,
+    requests: { ...state.requests, [journeyId]: { ...request, doorIds: remaining } },
+  }
+}
+
 export function renewDoorClaims(state, {
   agentId,
   journeyId,
