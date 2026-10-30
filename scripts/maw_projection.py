@@ -1380,14 +1380,59 @@ def plan_revision_observable(state: dict) -> bool:
     return False
 
 
+PLAN_DRIFT_PASSED_DETAIL = "plan-drifted"
+
+
+def plan_drift_after_pass_observable(state: dict) -> bool:
+    """True when the ONLY degradation is plan_ref:drifted and the frozen engine
+    proves the plan review CONCLUDED: every plan-review node's obligation is
+    terminally satisfied ("passed" or the bounded "released-at-limit"), each
+    anchored by a latest published attempt whose verdict is "pass" and whose
+    durable record is a review-passed plan review of the same node. The
+    reviewed plan passed and the plan FILE has since drifted from the stamped
+    digest — the team view stays available under this honestly labeled
+    degradation instead of rejecting the whole task. Terminal manifests and
+    unbound file identities keep the stable rejection."""
+    if state.get("_inconsistent") or state.get("degraded") != ["plan_ref:drifted"]:
+        return False
+    manifest = state.get("manifest")
+    if not isinstance(manifest, dict) or manifest.get("status") in TERMINAL_MANIFEST:
+        return False
+    workflow = state.get("workflow")
+    if not isinstance(workflow, dict):
+        return False
+    revision_nodes = [node_id for node_id, node_type, _deps in workflow_nodes(workflow)
+                      if node_type == "plan-review"]
+    if not revision_nodes:
+        return False
+    bound = _bound_records_by_ref(state)
+    if bound is None:
+        return False
+    for node_id in revision_nodes:
+        obligation = _plan_obligation(workflow, node_id)
+        if obligation is None or obligation.get("disposition") not in ("passed", "released-at-limit"):
+            return False
+        attempts = _obligation_attempts(obligation, "attempts")
+        if not attempts or attempts[-1].get("verdict") != "pass":
+            return False
+        ref = normalize_task_ref(attempts[-1]["task_file"])
+        record = bound.get(ref) if ref else None
+        if (record is None or record[1].get("type") != "plan-review"
+                or record[1].get("status") != "review-passed"
+                or record[1].get("workflow_node_id") != node_id):
+            return False
+    return True
+
+
 def read_snapshot(project_root: Path, task_id: str, *, now=None) -> dict:
     """Read one fixed task and return the Node channel's accepted snapshot shape.
 
     `now` is a wall-clock millisecond value or zero-argument clock for deterministic
     callers. Envelope order is owned by the Dashboard, never by this reader.
-    Missing/corrupt/inconsistent inputs fail explicitly; a legitimate plan
-    revision in progress is the one bounded degradation that is served instead
-    of rejected, as quality=degraded with quality_detail="plan-revision".
+    Missing/corrupt/inconsistent inputs fail explicitly; two bounded degradations
+    are served instead of rejected: a legitimate plan revision in progress
+    (quality_detail="plan-revision") and a plan file that drifted AFTER the plan
+    review concluded (quality_detail="plan-drifted").
     """
     if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id) or task_id in (".", ".."):
         raise BridgeError("invalid-task", "task identity is invalid", EXIT_USAGE)
@@ -1399,13 +1444,16 @@ def read_snapshot(project_root: Path, task_id: str, *, now=None) -> dict:
         if state.get("_inconsistent"):
             raise BridgeError("input-inconsistent", "task inputs changed during observation", EXIT_NO_DATA)
         plan_revision = plan_revision_observable(state)
-        if state["degraded"] and not plan_revision:
+        plan_drift_passed = plan_drift_after_pass_observable(state)
+        if state["degraded"] and not (plan_revision or plan_drift_passed):
             raise BridgeError("invalid-input", "task inputs are damaged or unsupported", EXIT_NO_DATA)
         sampled_at = int((now() if callable(now) else now) if now is not None else time.time() * 1000)
         producer = "dashboard-" + hashlib.sha256(f"{Path(project_root).resolve()}|{task_id}".encode()).hexdigest()[:24]
         raw = validate_snapshot(build_snapshot(state, producer, 1, sampled_at))
         if plan_revision:
             raw["quality_detail"] = PLAN_REVISION_DETAIL
+        elif plan_drift_passed:
+            raw["quality_detail"] = PLAN_DRIFT_PASSED_DETAIL
     except BridgeError:
         raise
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:

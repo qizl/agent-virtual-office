@@ -196,6 +196,54 @@ class PlanRevisionTests(unittest.TestCase):
                             policy=None)
         self.assert_rejected()
 
+    # ─── plan-drift-after-pass boundaries (2026-10-30, real-runtime report) ──
+
+    def write_passed_plan_round_two(self):
+        self.write(self.runtime / 'reviewer-1' / 'task-006.json',
+                   task(6, 2, 'plan-review', 'review-passed', ref='decision-maker-1/task-002.json', node='plan'))
+        self.write(self.runtime / 'decision-maker-1' / 'task-002.json',
+                   task(2, 1, 'dev', 'review-passed', ref='reviewer-1/task-001.json', node='plan'))
+
+    def test_passed_plan_review_with_drifted_file_serves_labeled_degradation(self):
+        # The plan review CONCLUDED (attempt 2 passed) and the plan file drifted
+        # afterwards: the team view stays up under quality_detail='plan-drifted'.
+        self.drift()
+        self.write_passed_plan_round_two()
+        self.write_workflow(disposition='passed',
+                            attempts=(attempt(1, 'reviewer-1/task-001.json', 'fail'),
+                                      attempt(2, 'reviewer-1/task-006.json', 'pass')))
+        snapshot = self.read()
+        self.assertEqual(snapshot['quality'], 'degraded')
+        self.assertEqual(snapshot['quality_detail'], 'plan-drifted')
+        self.assertEqual(len(snapshot['members']), len(ROLES))
+
+    def test_released_at_limit_plan_with_drift_serves_labeled_degradation(self):
+        self.drift()
+        self.write_passed_plan_round_two()
+        self.write_workflow(disposition='released-at-limit',
+                            attempts=(attempt(1, 'reviewer-1/task-001.json', 'fail'),
+                                      attempt(2, 'reviewer-1/task-006.json', 'pass')))
+        self.assertEqual(self.read()['quality_detail'], 'plan-drifted')
+
+    def test_pending_plan_obligation_with_drift_is_rejected(self):
+        self.drift()
+        self.write_workflow(disposition='pending',
+                            attempts=(attempt(1, 'reviewer-1/task-001.json', 'fail'),))
+        self.assert_rejected()
+
+    def test_passed_obligation_without_pass_anchor_is_rejected(self):
+        self.drift()
+        self.write_workflow(disposition='passed',
+                            attempts=(attempt(1, 'reviewer-1/task-001.json', 'fail'),))
+        self.assert_rejected()
+
+    def test_unbound_pass_record_with_drift_is_rejected(self):
+        self.drift()
+        self.write_workflow(disposition='passed',
+                            attempts=(attempt(1, 'reviewer-1/task-001.json', 'fail'),
+                                      attempt(2, 'reviewer-1/task-077.json', 'pass')))
+        self.assert_rejected()
+
     # ─── chain boundaries (WIN-R2-VISR-002) ─────────────────────────────────
 
     def test_blocking_string_without_revision_task_is_rejected(self):
